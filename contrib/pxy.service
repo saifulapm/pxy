@@ -1,0 +1,19 @@
+# systemd user unit for pxy.
+# Install:
+#   cargo build --release
+#   cp target/release/pxy ~/.local/bin/
+#   cp contrib/pxy.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now pxy
+[Unit]
+Description=pxy - tiny multi-provider LLM proxy
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/pxy serve
+Restart=on-failure
+RestartSec=2
+# pass/gpg need the user keyring; user units inherit the session environment.
+Environment=RUST_LOG=pxy=info
+
+[Install]
+WantedBy=default.target

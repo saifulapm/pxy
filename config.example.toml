@@ -1,0 +1,146 @@
+# pxy example config — copy to ~/.config/pxy/config.toml and edit.
+# Secrets come from `pass` (entries under AI/, see docs/01-provider-inventory.md).
+# Model ids below are real (sampled from the OmniRoute catalog, 2026-08-24) —
+# trim/extend per provider as you like. `pxy models` lists what's exposed.
+
+[server]
+port = 4100
+api_key = "pxy-local"   # soft gate; server binds 127.0.0.1 only
+
+# ---------------------------------------------------------------------------
+# The auto chain: ordered priority. First provider with limit headroom and no
+# cooldown wins; failures/limits walk down the list.
+# ---------------------------------------------------------------------------
+[auto]
+models = [
+  "github/claude-sonnet-4.6",
+  "opencode-zen/glm-5.2",
+  "opencode-go/glm-5.2",
+  "deepseek/deepseek-v4-flash",
+  "openrouter/z-ai/glm-5.2:free",
+  "freemodel-dev/gpt-5.6-luna",
+]
+
+[launch]
+model = "auto"
+small_model = "github/gpt-5-mini"
+
+# ---------------------------------------------------------------------------
+# OAuth providers
+# ---------------------------------------------------------------------------
+
+[providers.github]
+kind = "github-copilot"
+format = "openai"
+credentials = { pass = "AI/github/main" }
+models = [
+  { id = "claude-sonnet-4.6", context_length = 200000, max_output_tokens = 64000 },
+  { id = "claude-haiku-4.5", context_length = 200000, max_output_tokens = 64000 },
+  { id = "gpt-5.4", context_length = 264000, max_output_tokens = 64000 },
+  { id = "gpt-5-mini", context_length = 264000, max_output_tokens = 32000 },
+  { id = "kimi-k2.7-code", context_length = 256000, max_output_tokens = 32000 },
+]
+[providers.github.limits]
+daily_requests = 250          # copilot premium request budgeting — tune to taste
+
+# ---------------------------------------------------------------------------
+# API-key providers (base URLs from OmniRoute registry, docs/06)
+# ---------------------------------------------------------------------------
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/chat/completions"
+api_key = { pass = "AI/deepseek/main" }
+models = [
+  { id = "deepseek-v4-flash", context_length = 128000 },
+  { id = "deepseek-v4-pro", context_length = 128000 },
+]
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1/chat/completions"
+api_key = { pass = "AI/openrouter/main" }
+headers = { HTTP-Referer = "http://localhost", X-Title = "pxy" }
+models = [
+  "z-ai/glm-5.2:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "google/gemma-4-31b-it:free",
+]
+[providers.openrouter.limits]
+rpm = 20
+daily_requests = 1000         # free-tier daily cap
+
+[providers.opencode-zen]
+base_url = "https://opencode.ai/zen/v1/chat/completions"
+api_key = { pass = "AI/opencode-zen/main" }
+models = ["glm-5.2", "kimi-k3", "grok-4.6", "gpt-5.1-codex-max"]
+
+[providers.opencode-go]
+base_url = "https://opencode.ai/zen/go/v1/chat/completions"
+api_key = { pass = "AI/opencode-go/github" }
+models = ["glm-5.2", "glm-5.2-high"]
+
+[providers.zenmux]
+base_url = "https://zenmux.ai/api/v1/chat/completions"
+api_key = { pass = "AI/zenmux/main" }
+models = ["qwen/qwen3.8-27b", "deepseek/deepseek-v4-flash-vision-exp-free"]
+
+[providers.mistral]
+base_url = "https://api.mistral.ai/v1/chat/completions"
+api_key = { pass = "AI/mistral/main" }
+models = ["devstral-latest", "devstral-medium-latest"]
+
+[providers.codestral]
+base_url = "https://codestral.mistral.ai/v1/chat/completions"
+api_key = { pass = "AI/codestral/main" }
+models = ["codestral-latest"]
+
+[providers.alibaba]
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+api_key = { pass = "AI/alibaba/global" }
+models = ["qwen3.7-plus", "qwen3.6-27b"]
+
+[providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1/chat/completions"
+api_key = { pass = "AI/fireworks/main" }
+# fireworks wants fully-qualified ids
+models = ["accounts/fireworks/models/glm-5p2", "accounts/fireworks/models/kimi-k2p7-code"]
+
+# agentrouter speaks Anthropic messages natively (docs/06)
+[providers.agentrouter]
+format = "anthropic"
+base_url = "https://agentrouter.org/v1/messages"
+auth_header = "x-api-key"
+api_key = { pass = "AI/agentrouter/main" }
+models = [
+  { id = "claude-opus-5", context_length = 200000, max_output_tokens = 64000 },
+  { id = "claude-opus-4-8", context_length = 200000, max_output_tokens = 64000 },
+]
+
+[providers.tokenrouter]
+base_url = "https://api.tokenrouter.com/v1/chat/completions"
+api_key = { pass = "AI/tokenrouter/main" }
+models = ["openai/gpt-5.6-luna", "qwen/qwen3.7-max"]
+
+[providers.openadapter]
+base_url = "https://api.openadapter.in/v1/chat/completions"
+api_key = { pass = "AI/openadapter/main" }
+models = ["0G-GLM-5.1", "0G-DeepSeek-v4-Flash"]
+
+[providers.agnes]
+base_url = "https://apihub.agnes-ai.com/v1/chat/completions"
+api_key = { pass = "AI/agnes/main" }
+models = ["agnes-2.0-flash"]
+
+[providers.bai]
+base_url = "https://api.b.ai/v1/chat/completions"
+api_key = { pass = "AI/bai/main" }
+models = ["glm-5.2", "minimax-m3"]
+
+[providers.freemodel-dev]
+base_url = "https://api.freemodel.dev/v1/chat/completions"
+api_key = { pass = "AI/freemodel-dev/main" }
+models = ["gpt-5.6-luna", "gpt-5.6-sol"]
+
+[providers.v0-vercel]
+base_url = "https://api.v0.dev/v1/chat/completions"
+api_key = { pass = "AI/v0-vercel/main" }
+models = ["v0-1.5-md"]
