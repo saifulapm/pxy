@@ -23,6 +23,7 @@ models = [
   "ollama/gpt-oss:120b",
   "openrouter/stealth/ox-alpha",
   "alibaba/qwen3.8-max",
+  "mistral/devstral-latest",
 
   "opencode-zen/big-pickle",
   "opencode-zen/hy3-free",
@@ -217,15 +218,30 @@ models = [
   { id = "inclusionai/ling-3.0-tiny", context_length = 262144 },
 ]
 
+# Mistral La Plateforme — free "Experiment" plan (phone-verified, data-training
+# opt-in). Official limits only visible in admin.mistral.ai console; community
+# figures: ~1 req/sec, generous monthly tokens. 429s handled by failover.
 [providers.mistral]
 base_url = "https://api.mistral.ai/v1/chat/completions"
 api_key = { pass = "AI/mistral/main" }
-models = ["devstral-latest", "devstral-medium-latest"]
+models = [
+  "devstral-latest",
+  "devstral-medium-latest",
+  "mistral-large-latest",
+  "magistral-medium-latest",
+  "mistral-small-latest",
+]
+[providers.mistral.limits]
+rpm = 30
 
+# Codestral dedicated endpoint — SEPARATE key from api.mistral.ai, currently
+# free (phone-verified). Aimed at IDE/FIM use; also serves chat.
 [providers.codestral]
 base_url = "https://codestral.mistral.ai/v1/chat/completions"
 api_key = { pass = "AI/codestral/main" }
-models = ["codestral-latest"]
+models = ["codestral-latest", "codestral-2508"]
+[providers.codestral.limits]
+rpm = 30
 
 # Alibaba Model Studio intl (global account; free quota ACTIVE 2026-08-24).
 # Each Qwen model has its own 1M-token free quota, valid 90 days from
