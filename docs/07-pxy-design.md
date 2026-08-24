@@ -136,3 +136,46 @@ contain slashes themselves (OmniRoute's resolver rule). `auto` is a virtual mode
 
 Web-cookie providers, MITM agent bridge, MCP/A2A servers, dashboards/web UI, multi-tenant
 quota pools, semantic routing, compression — all the OmniRoute weight pxy exists to shed.
+
+## Auto-chain design (revised 2026-08-24)
+
+Ordering rules, in priority order:
+1. **Quality × throughput first**, but never spend a scarce quota when an
+   equal-quality cheap pool exists.
+2. **Interleave providers** — consecutive entries from one provider all die
+   together when that provider rate-limits.
+3. **Every entry must do tool calling** (verified by probe; agentic coding
+   depends on it).
+4. **Renewable before finite**: daily/5-hourly pools refill; free packs expire.
+5. **Scarcest paid last**: Copilot's 300 premium requests/month is the most
+   precious resource in the stack; `github-free/gpt-5-mini` (0x multiplier,
+   unlimited) is the floor that can never run out.
+
+### opencode Go per-model allowances (from the Go dashboard, per account, ×2)
+
+| model | req/5h | note |
+|---|---:|---|
+| ox-alpha-free | ∞ | limited-time; intermittent 503s |
+| muse-spark-1.2-contributor | 45,300 | requires data-collection opt-in — skipped |
+| mimo-v2.5 | 30,100 | |
+| hy3 | 4,300 | counts 8× → ~34,400 effective |
+| longcat-2.0 | 11,400 | |
+| deepseek-v4-flash | 7,600 | |
+| qwen3.7-plus | 4,300 | |
+| minimax-m3 | 3,200 | |
+| kimi-k2.7-code | 1,350 | |
+| glm-5.2 | 880 | |
+| **glm-5.3** | **220** | too scarce for `auto` |
+| **qwen3.8-max** | **160** | too scarce for `auto` |
+| **grok-4.5** | **120** | too scarce for `auto` |
+| **kimi-k3** | **110** | too scarce for `auto` |
+
+The bottom four are configured (manual use) but deliberately excluded from
+`auto`: at 110 req/5h a single agent session would drain the window.
+
+### Cooldown scoping (implemented after a real failure)
+
+`ox-alpha-free` 503s intermittently. With provider-wide cooldowns that would
+have sidelined `hy3` on the same account. Cooldowns are now two-scoped:
+- **401/402/403 → provider-wide** (auth/credits are account problems)
+- **429/408/409/5xx → `provider/model` only** (aggregators rate-limit per model)

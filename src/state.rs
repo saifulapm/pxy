@@ -170,24 +170,48 @@ impl State {
     }
 
     // ---- cooldowns (lazy expiry on read) ----
+    //
+    // Two scopes, keyed in one map (docs/03: OmniRoute's provider-cooldown vs
+    // model-lockout separation). Auth/credit failures are account-wide, so they
+    // cool the whole provider; rate limits and upstream errors are usually
+    // per-model on aggregators, so they cool only "provider/model" — otherwise
+    // one flaky model sidelines every other model on the same account.
 
-    pub fn cooldown(&self, provider: &str) -> Option<Cooldown> {
+    pub fn cooldown_key(provider: &str, model: Option<&str>) -> String {
+        match model {
+            Some(m) => format!("{provider}/{m}"),
+            None => provider.to_string(),
+        }
+    }
+
+    /// Blocked if the provider is cooled down, or this specific model is.
+    pub fn cooldown(&self, provider: &str, model: &str) -> Option<Cooldown> {
         let map = self.cooldowns.lock().unwrap();
-        if let Some(cd) = map.get(provider) {
-            // Expired cooldowns stay in the map so backoff level escalates
-            // across repeated failures; they just stop blocking.
-            if cd.until > Instant::now() {
-                return Some(cd.clone());
+        let now = Instant::now();
+        for key in [provider.to_string(), Self::cooldown_key(provider, Some(model))] {
+            if let Some(cd) = map.get(&key) {
+                // Expired cooldowns stay in the map so backoff level escalates
+                // across repeated failures; they just stop blocking.
+                if cd.until > now {
+                    return Some(cd.clone());
+                }
             }
         }
         None
     }
 
-    /// Put a provider in cooldown. `retry_after` (from upstream) overrides
-    /// exponential backoff and resets the level (the upstream told us exactly).
-    pub fn set_cooldown(&self, provider: &str, retry_after: Option<Duration>, reason: &str) {
+    /// Put a provider (or one of its models) in cooldown. `retry_after` from
+    /// upstream overrides exponential backoff and resets the level.
+    pub fn set_cooldown(
+        &self,
+        provider: &str,
+        model: Option<&str>,
+        retry_after: Option<Duration>,
+        reason: &str,
+    ) {
+        let key = Self::cooldown_key(provider, model);
         let mut map = self.cooldowns.lock().unwrap();
-        let prev_level = map.get(provider).map(|c| c.level).unwrap_or(0);
+        let prev_level = map.get(&key).map(|c| c.level).unwrap_or(0);
         let (dur, level) = match retry_after {
             Some(d) => (d.min(Duration::from_secs(30 * 24 * 3600)), 0),
             None => {
@@ -198,13 +222,16 @@ impl State {
             }
         };
         map.insert(
-            provider.to_string(),
+            key,
             Cooldown { until: Instant::now() + dur, level, reason: reason.to_string() },
         );
     }
 
-    pub fn clear_cooldown(&self, provider: &str) {
-        self.cooldowns.lock().unwrap().remove(provider);
+    /// Success clears both scopes for this model.
+    pub fn clear_cooldown(&self, provider: &str, model: &str) {
+        let mut map = self.cooldowns.lock().unwrap();
+        map.remove(provider);
+        map.remove(&Self::cooldown_key(provider, Some(model)));
     }
 
     // ---- rpm sliding window ----
@@ -258,4 +285,42 @@ fn epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each test gets its own db path — these run in parallel and would
+    /// otherwise clobber each other's sqlite file.
+    fn state(name: &str) -> State {
+        let dir = std::env::temp_dir().join(format!("pxy-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        State::open(&dir.join("s.sqlite")).unwrap()
+    }
+
+    #[test]
+    fn model_cooldown_does_not_block_sibling_models() {
+        let s = state("sibling");
+        s.set_cooldown("go", Some("flaky"), None, "503");
+        assert!(s.cooldown("go", "flaky").is_some());
+        assert!(s.cooldown("go", "healthy").is_none(), "sibling model must stay usable");
+    }
+
+    #[test]
+    fn provider_cooldown_blocks_all_models() {
+        let s = state("provider_wide");
+        s.set_cooldown("acct", None, None, "401 auth error");
+        assert!(s.cooldown("acct", "any-model").is_some());
+        assert!(s.cooldown("acct", "other-model").is_some());
+    }
+
+    #[test]
+    fn success_clears_both_scopes() {
+        let s = state("clear_both");
+        s.set_cooldown("p", None, None, "401");
+        s.set_cooldown("p", Some("m"), None, "429");
+        s.clear_cooldown("p", "m");
+        assert!(s.cooldown("p", "m").is_none());
+    }
 }

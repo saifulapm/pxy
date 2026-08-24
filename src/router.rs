@@ -128,7 +128,7 @@ fn check_candidate(
     // single-deployment exemption): blocking your only option converts a
     // partial outage into a total one.
     if multi_candidate {
-        if let Some(cd) = app.state.cooldown(&cand.provider) {
+        if let Some(cd) = app.state.cooldown(&cand.provider, &cand.model.id) {
             return Err(format!("cooldown ({})", cd.reason));
         }
     }
@@ -272,7 +272,8 @@ async fn try_candidate(
     let resp = match req.json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
-            app.state.set_cooldown(&cand.provider, None, "network error");
+            // Network failures are our-side/transport, not model-specific.
+            app.state.set_cooldown(&cand.provider, None, None, "network error");
             return AttemptResult::Skip(format!("network: {e}"));
         }
     };
@@ -286,7 +287,7 @@ async fn try_candidate(
 
     // Success: count the request now; tokens follow when usage is known.
     record_request(app, &cand.provider);
-    app.state.clear_cooldown(&cand.provider);
+    app.state.clear_cooldown(&cand.provider, &cand.model.id);
     info!(candidate = %cand.full_id(), stream, "routed");
 
     if stream {
@@ -351,8 +352,17 @@ fn classify_error(
             429 => "rate limited",
             _ => "upstream error",
         };
-        app.state
-            .set_cooldown(&cand.provider, retry_after, &format!("{status} {reason}"));
+        // Account-wide problems cool the whole provider; rate limits and
+        // upstream errors are usually per-model on aggregators, so they must
+        // not sideline the provider's other models.
+        let account_wide = matches!(status, 401 | 402 | 403);
+        let model_scope = (!account_wide).then_some(cand.model.id.as_str());
+        app.state.set_cooldown(
+            &cand.provider,
+            model_scope,
+            retry_after,
+            &format!("{status} {reason}"),
+        );
         return AttemptResult::Skip(format!("{status}: {}", truncate(&err_body, 200)));
     }
     let body = serde_json::from_str::<Value>(&err_body)

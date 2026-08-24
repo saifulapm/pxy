@@ -12,25 +12,49 @@ api_key = "pxy-local"   # soft gate; server binds 127.0.0.1 only
 # cooldown wins; failures/limits walk down the list.
 # ---------------------------------------------------------------------------
 [auto]
+# Ordered priority. pxy skips candidates in cooldown / over limits / with too
+# small a context, then takes the first survivor. Design rules:
+#   * quality x throughput first, but never spend scarce quota when a cheap
+#     equal-quality pool is available;
+#   * providers are INTERLEAVED so one provider's 429 doesn't stall the chain;
+#   * every entry below is verified to do tool calling (agentic coding needs it);
+#   * opencode Go entries use only HIGH-ALLOWANCE models (see table below) —
+#     never kimi-k3 (110/5h), grok-4.5 (120), qwen3.8-max (160), glm-5.3 (220);
+#   * Copilot premium is LAST: 300 requests/month is the scarcest resource.
+#
+# opencode Go requests per 5h per account (x2 accounts), from the Go dashboard:
+#   ox-alpha-free INF | muse-spark 45,300 (needs data opt-in) | mimo-v2.5 30,100
+#   hy3 4,300 (8x usage => ~34,400) | longcat-2.0 11,400 | deepseek-v4-flash 7,600
+#   qwen3.7-plus 4,300 | minimax-m3 3,200 | kimi-k2.7-code 1,350 | glm-5.2 880
 models = [
-  "github/claude-sonnet-4.6",
-  "opencode-go-github/glm-5.3",
-  "opencode-go-google/glm-5.3",
-  "zenmux/z-ai/glm-5.3-free",
-  "tencent/glm-5.3",
-  "tencent/kimi-k3",
-  "tencent/hy3",
-  "ollama/gpt-oss:120b",
-  "openrouter/stealth/ox-alpha",
-  "tokenrouter/qwen/qwen3.8-max-free",
-  "agnes/agnes-2.5-flash",
-  "alibaba/qwen3.8-max",
-  "mistral/devstral-latest",
+  # --- free frontier, zero cost, renewable ---
+  "zenmux/z-ai/glm-5.3-free",                      # GLM-5.3 flagship, 1M ctx
+  "openrouter/stealth/ox-alpha",                   # frontier agentic coder, 1M ctx, 20rpm/1000day
+  "opencode-zen/hy3-free",                         # Hunyuan 3 (295B reasoning)
 
-  "opencode-zen/big-pickle",
-  "opencode-zen/hy3-free",
-  "opencode-zen/deepseek-v4-flash-free",
-  "openrouter/z-ai/glm-5.2:free",
+  # --- opencode Go subscriptions: unlimited / huge allowance models only ---
+  "opencode-go-github/ox-alpha-free",              # INFINITE requests
+  "opencode-go-google/ox-alpha-free",              # INFINITE requests
+  "opencode-go-github/hy3",                        # ~34,400 effective / 5h
+  "opencode-go-google/hy3",
+
+  # --- other free renewables ---
+  "ollama/gpt-oss:120b",                           # ollama cloud free tier
+  "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",  # 550B, 1M ctx
+  "mistral/devstral-latest",                       # free Experiment tier, agentic coder
+  "agnes/agnes-2.5-flash",                         # free flash tier
+
+  # --- deeper Go fallbacks (still very high allowance) ---
+  "opencode-go-github/deepseek-v4-flash",          # 7,600 / 5h
+  "opencode-go-google/mimo-v2.5",                  # 30,100 / 5h
+
+  # --- finite free packs (spend after renewables; alibaba expires ~Nov 2026) ---
+  "tencent/glm-5.3",
+  "alibaba/qwen3.8-max",
+
+  # --- premium last: scarce, then the 0x model that never runs out ---
+  "github/claude-sonnet-4.6",                      # 300 premium requests/month
+  "github-free/gpt-5-mini",                        # 0x multiplier, unlimited floor
 ]
 
 [launch]
@@ -181,30 +205,40 @@ models = [
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/github" }
 models = [
-  "glm-5.3",
-  "kimi-k3",
-  "kimi-k2.7-code",
-  "deepseek-v4-pro",
-  "minimax-m3",
-  "qwen3.8-max",
-  "hy3",
-  "grok-4.5",
+  # High-allowance picks only (per-5h caps in the [auto] comment above).
   "ox-alpha-free",
+  "hy3",
+  "mimo-v2.5",
+  "deepseek-v4-flash",
+  "longcat-2.0",
+  "minimax-m3",
+  "qwen3.7-plus",
+  "kimi-k2.7-code",
+  "glm-5.2",
+  # Deliberately NOT in [auto] (tiny allowances): kimi-k3 110/5h,
+  # grok-4.5 120, qwen3.8-max 160, glm-5.3 220.
+  "kimi-k3",
+  "glm-5.3",
 ]
 
 [providers.opencode-go-google]
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/google" }
 models = [
-  "glm-5.3",
-  "kimi-k3",
-  "kimi-k2.7-code",
-  "deepseek-v4-pro",
-  "minimax-m3",
-  "qwen3.8-max",
-  "hy3",
-  "grok-4.5",
+  # High-allowance picks only (per-5h caps in the [auto] comment above).
   "ox-alpha-free",
+  "hy3",
+  "mimo-v2.5",
+  "deepseek-v4-flash",
+  "longcat-2.0",
+  "minimax-m3",
+  "qwen3.7-plus",
+  "kimi-k2.7-code",
+  "glm-5.2",
+  # Deliberately NOT in [auto] (tiny allowances): kimi-k3 110/5h,
+  # grok-4.5 120, qwen3.8-max 160, glm-5.3 220.
+  "kimi-k3",
+  "glm-5.3",
 ]
 
 # ZenMux — has 8 zero-priced models (catalog probe 2026-08-24), notably
