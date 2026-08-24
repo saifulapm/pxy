@@ -117,18 +117,17 @@ models = [
   "gemma4:31b",
 ]
 
-# DeepSeek direct — balance $0.00 (checked via /user/balance, is_available
+# UNUSABLE (commented out) — DeepSeek direct: balance $0.00 (checked via /user/balance, is_available
 # false), so every call returns "Insufficient Balance". No free tier; they
 # bill pay-as-you-go. Disabled until topped up — DeepSeek models are already
 # reachable free via tencent/ollama/openrouter anyway.
-[providers.deepseek]
-enabled = false
-base_url = "https://api.deepseek.com/chat/completions"
-api_key = { pass = "AI/deepseek/main" }
-models = [
-  { id = "deepseek-v4-flash", context_length = 128000 },
-  { id = "deepseek-v4-pro", context_length = 128000 },
-]
+# [providers.deepseek]
+# base_url = "https://api.deepseek.com/chat/completions"
+# api_key = { pass = "AI/deepseek/main" }
+# models = [
+#   { id = "deepseek-v4-flash", context_length = 128000 },
+#   { id = "deepseek-v4-pro", context_length = 128000 },
+# ]
 
 # OpenRouter, FREE models only (":free" ids never consume credits — free-model
 # caps are rate limits, not credit limits). Limits verified 2026-08-24:
@@ -364,31 +363,28 @@ models = [
 [providers.agnes.limits]
 rpm = 10
 
-# b.ai — 42 models (Claude/GPT/Gemini/GLM), but ALL require a deposit:
+# UNUSABLE (commented out) — b.ai: 42 models, but ALL require a deposit:
 # "Access restricted. Deposit required to unlock premium models." Nothing is
 # callable on a zero-balance account (probed 2026-08-24). Disabled until
 # funded; re-enable by flipping enabled = true.
-[providers.bai]
-enabled = false
-base_url = "https://api.b.ai/v1/chat/completions"
-api_key = { pass = "AI/bai/main" }
-models = ["glm-5.2", "minimax-m3", "claude-sonnet-4.6", "gpt-5.6-sol"]
+# [providers.bai]
+# base_url = "https://api.b.ai/v1/chat/completions"
+# api_key = { pass = "AI/bai/main" }
+# models = ["glm-5.2", "minimax-m3", "claude-sonnet-4.6", "gpt-5.6-sol"]
 
-# freemodel.dev — 3 GPT-5.6 models, but account returns "Insufficient
+# UNUSABLE (commented out) — freemodel.dev: 3 GPT-5.6 models, account returns "Insufficient
 # balance" (probed 2026-08-24). Disabled until topped up.
-[providers.freemodel-dev]
-enabled = false
-base_url = "https://api.freemodel.dev/v1/chat/completions"
-api_key = { pass = "AI/freemodel-dev/main" }
-models = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
+# [providers.freemodel-dev]
+# base_url = "https://api.freemodel.dev/v1/chat/completions"
+# api_key = { pass = "AI/freemodel-dev/main" }
+# models = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
 
-# v0 (Vercel) — key authenticates but the API is plan-gated: both
+# UNUSABLE (commented out) — v0 (Vercel): key authenticates but API is plan-gated: both
 # /v1/chat/completions and /v1/models return 404 not_found_error, which v0
 # uses instead of 403 for un-entitled accounts (needs a paid v0 plan).
 # Disabled. NOTE for the router: a 404 here is terminal for the model, not
 # retryable (OmniRoute #6827 hit a retry storm on exactly this).
-[providers.v0-vercel]
-enabled = false
-base_url = "https://api.v0.dev/v1/chat/completions"
-api_key = { pass = "AI/v0-vercel/main" }
-models = ["v0-1.5-md", "v0-1.5-lg"]
+# [providers.v0-vercel]
+# base_url = "https://api.v0.dev/v1/chat/completions"
+# api_key = { pass = "AI/v0-vercel/main" }
+# models = ["v0-1.5-md", "v0-1.5-lg"]
