@@ -325,10 +325,25 @@ models = [
 [providers.tokenrouter.limits]
 rpm = 10
 
+# OpenAdapter — FREE plan is very restrictive (probed 2026-08-24): the whole
+# `free/*` namespace and all top-tier models are PAID-plan only; just a few
+# small models are callable. Quota is reported in response headers
+# X-Quota-5h / X-Quota-Week / X-Quota-Month (percentages) — ~8 requests moved
+# month to 13%, i.e. roughly 60 requests/month. Kept out of [auto]; the
+# allowance is too small to be a useful fallback.
 [providers.openadapter]
 base_url = "https://api.openadapter.in/v1/chat/completions"
 api_key = { pass = "AI/openadapter/main" }
-models = ["0G-GLM-5.1", "0G-DeepSeek-v4-Flash"]
+models = [
+  { id = "0GM-1.0-35B-A3B", context_length = 128000 },
+  { id = "Gemma-4-31B-TEE", context_length = 128000 },
+  { id = "GPT-20-OSS", context_length = 128000 },
+  { id = "Gemma-3-12B", context_length = 128000 },
+  { id = "Llama-3.1-8B", context_length = 128000 },
+]
+[providers.openadapter.limits]
+monthly_requests = 55
+rpm = 5
 
 [providers.agnes]
 base_url = "https://apihub.agnes-ai.com/v1/chat/completions"
