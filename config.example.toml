@@ -79,7 +79,7 @@ base_url = "https://api.deepseek.com/chat/completions"
 api_key = { pass = "AI/deepseek/main" }
 models = [
   { id = "deepseek-v4-flash", context_length = 128000 },
-  { id = "deepseek-v4-pro-0813", context_length = 128000 },
+  { id = "deepseek-v4-pro", context_length = 128000 },
 ]
 
 [providers.openrouter]
