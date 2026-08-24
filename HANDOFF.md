@@ -62,6 +62,11 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - `opencode-go-github` + `opencode-go-google` — $12/5h, $30/wk, $60/mo per account.
   **Per-model allowances vary 400×** — table in docs/07. Only high-allowance models are in
   `auto`; kimi-k3 (110/5h), grok-4.5 (120), qwen3.8-max (160), glm-5.3 (220) are excluded.
+  - `muse-spark-1.2-contributor` (45,300/5h): data-collection opt-in was enabled on both
+    accounts 2026-08-24, which cleared the `DataPolicyError` — but the model then returned
+    **HTTP 500 on every call** (both accounts, all three routes, streaming and not, while
+    `hy3` on the same key worked). That's an opencode-side outage, not our config. Retry
+    later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
 
 **Free, renewable:**
 - `zenmux` — free models incl. `z-ai/glm-5.3-free` (1M ctx). Needs balance > $0 (anti-abuse;
