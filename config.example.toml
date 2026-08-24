@@ -199,10 +199,21 @@ models = [
   "ox-alpha-free",
 ]
 
+# ZenMux — has 8 zero-priced models (catalog probe 2026-08-24), notably
+# z-ai/glm-5.3-free with 1M context. NOTE: current key returns 403 on ALL
+# generation calls (verified independently via OmniRoute too) — the account
+# needs a new key or re-verification at zenmux.ai. Kept out of [auto] until
+# the key works.
 [providers.zenmux]
 base_url = "https://zenmux.ai/api/v1/chat/completions"
 api_key = { pass = "AI/zenmux/main" }
-models = ["qwen/qwen3.8-27b", "deepseek/deepseek-v4-flash-vision-exp-free"]
+models = [
+  { id = "z-ai/glm-5.3-free", context_length = 1000000 },
+  { id = "deepseek/deepseek-v4-flash-vision-exp-free", context_length = 1000000 },
+  { id = "sapiens-ai/agnes-2.5-flash", context_length = 524288 },
+  { id = "z-ai/glm-4.7-flash-free", context_length = 200000 },
+  { id = "inclusionai/ling-3.0-tiny", context_length = 262144 },
+]
 
 [providers.mistral]
 base_url = "https://api.mistral.ai/v1/chat/completions"
