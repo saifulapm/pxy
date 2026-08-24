@@ -142,6 +142,10 @@ pub struct ProviderConfig {
     /// Request timeout in seconds (default 600)
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Extract literal <think>...</think> tags from responses into proper
+    /// reasoning (for models like MiniMax/Qwen that inline CoT as text)
+    #[serde(default)]
+    pub parse_think_tags: bool,
 }
 
 fn default_true() -> bool {

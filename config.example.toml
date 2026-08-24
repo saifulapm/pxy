@@ -62,6 +62,7 @@ daily_requests = 250          # copilot premium request budgeting — tune to ta
 base_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions"
 embeddings_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/embeddings"
 api_key = { pass = "AI/tencent/main" }
+parse_think_tags = true
 models = [
   "hy3",
   "glm-5.3",

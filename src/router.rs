@@ -16,6 +16,7 @@ use crate::config::{Config, WireFormat};
 use crate::secrets::Secrets;
 use crate::state::State;
 use crate::translate::sse::SseParser;
+use crate::translate::think::ThinkFilter;
 use crate::translate::{anthropic_to_openai, estimate_tokens, openai_to_anthropic, TokenUsage};
 use crate::usage::current_windows;
 
@@ -298,10 +299,13 @@ async fn try_candidate(
             input_estimate,
         ))
     } else {
-        let upstream_body: Value = match resp.json().await {
+        let mut upstream_body: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => return AttemptResult::Skip(format!("bad upstream json: {e}")),
         };
+        if provider_cfg.parse_think_tags && upstream_format == WireFormat::Openai {
+            extract_think_from_response(&mut upstream_body);
+        }
         let usage = match upstream_format {
             WireFormat::Openai => TokenUsage::from_openai(&upstream_body["usage"]),
             WireFormat::Anthropic => TokenUsage::from_anthropic(&upstream_body["usage"]),
@@ -386,6 +390,8 @@ enum StreamKind {
 struct StreamCtx {
     parser: SseParser,
     kind: StreamKind,
+    /// Present when the provider has parse_think_tags (openai upstreams only)
+    think: Option<ThinkFilter>,
     usage: TokenUsage,
     provider: String,
     app: SharedApp,
@@ -393,11 +399,48 @@ struct StreamCtx {
     done: bool,
 }
 
+/// Move `<think>` spans in an openai chunk's delta.content into
+/// delta.reasoning_content. Returns the rewritten chunk JSON, or the input
+/// unchanged when it isn't a parseable chunk.
+fn rewrite_chunk_think(data: &str, filter: &mut ThinkFilter) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(data) else {
+        return data.to_string();
+    };
+    let delta = &mut v["choices"][0]["delta"];
+    if let Some(text) = delta["content"].as_str() {
+        let (reasoning, content) = filter.push(text);
+        if !reasoning.is_empty() {
+            let prior = delta["reasoning_content"].as_str().unwrap_or("");
+            delta["reasoning_content"] = json!(format!("{prior}{reasoning}"));
+        }
+        delta["content"] = json!(content);
+        return v.to_string();
+    }
+    data.to_string()
+}
+
+/// Synthetic chunk carrying whatever the filter still buffered at stream end.
+fn think_flush_chunk(filter: &mut ThinkFilter) -> Option<String> {
+    let (reasoning, content) = filter.flush();
+    if reasoning.is_empty() && content.is_empty() {
+        return None;
+    }
+    let mut delta = serde_json::Map::new();
+    if !reasoning.is_empty() {
+        delta.insert("reasoning_content".into(), json!(reasoning));
+    }
+    if !content.is_empty() {
+        delta.insert("content".into(), json!(content));
+    }
+    Some(json!({"choices": [{"index": 0, "delta": delta}]}).to_string())
+}
+
 impl StreamCtx {
     /// Process one upstream chunk; returns bytes for the client.
     fn process(&mut self, bytes: &Bytes) -> Bytes {
-        let events = self.parser.feed(bytes);
-        match &mut self.kind {
+        let Self { parser, kind, think, usage, .. } = self;
+        let events = parser.feed(bytes);
+        match kind {
             StreamKind::OpenaiPass => {
                 for ev in &events {
                     if ev.data.contains("\"usage\"") {
@@ -405,28 +448,44 @@ impl StreamCtx {
                             if v["usage"].is_object() {
                                 let u = TokenUsage::from_openai(&v["usage"]);
                                 if u.input > 0 {
-                                    self.usage.input = u.input;
+                                    usage.input = u.input;
                                 }
                                 if u.output > 0 {
-                                    self.usage.output = u.output;
+                                    usage.output = u.output;
                                 }
                             }
                         }
                     }
                 }
-                bytes.clone()
+                let Some(filter) = think else {
+                    return bytes.clone();
+                };
+                // Think extraction forces chunk rewriting even in passthrough.
+                let mut out = String::new();
+                for ev in events {
+                    if ev.data.trim() == "[DONE]" {
+                        if let Some(tail) = think_flush_chunk(filter) {
+                            out.push_str(&format!("data: {tail}\n\n"));
+                        }
+                        out.push_str("data: [DONE]\n\n");
+                    } else {
+                        let data = rewrite_chunk_think(&ev.data, filter);
+                        out.push_str(&format!("data: {data}\n\n"));
+                    }
+                }
+                Bytes::from(out)
             }
             StreamKind::AnthropicPass => {
                 for ev in &events {
                     if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
                         match v["type"].as_str() {
                             Some("message_start") => {
-                                self.usage.input =
+                                usage.input =
                                     v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0);
                             }
                             Some("message_delta") => {
                                 if let Some(o) = v["usage"]["output_tokens"].as_u64() {
-                                    self.usage.output = o;
+                                    usage.output = o;
                                 }
                             }
                             _ => {}
@@ -437,10 +496,23 @@ impl StreamCtx {
             }
             StreamKind::ToAnthropic(state) => {
                 let mut out = String::new();
-                for ev in &events {
-                    out.push_str(&state.on_data(&ev.data));
+                for ev in events {
+                    match think {
+                        Some(filter) if ev.data.trim() != "[DONE]" => {
+                            // reasoning moved into delta.reasoning_content
+                            // becomes a thinking block via on_data
+                            out.push_str(&state.on_data(&rewrite_chunk_think(&ev.data, filter)));
+                        }
+                        Some(filter) => {
+                            if let Some(tail) = think_flush_chunk(filter) {
+                                out.push_str(&state.on_data(&tail));
+                            }
+                            out.push_str(&state.on_data(&ev.data));
+                        }
+                        None => out.push_str(&state.on_data(&ev.data)),
+                    }
                 }
-                self.usage = state.usage;
+                *usage = state.usage;
                 Bytes::from(out)
             }
             StreamKind::ToOpenai(state) => {
@@ -448,7 +520,7 @@ impl StreamCtx {
                 for ev in &events {
                     out.push_str(&state.on_event(ev.event.as_deref(), &ev.data));
                 }
-                self.usage = state.usage;
+                *usage = state.usage;
                 Bytes::from(out)
             }
         }
@@ -458,7 +530,13 @@ impl StreamCtx {
     fn finish(&mut self) -> Bytes {
         let out = match &mut self.kind {
             StreamKind::ToAnthropic(state) => {
-                let s = state.finish();
+                let mut s = String::new();
+                if let Some(filter) = &mut self.think {
+                    if let Some(tail) = think_flush_chunk(filter) {
+                        s.push_str(&state.on_data(&tail));
+                    }
+                }
+                s.push_str(&state.finish());
                 self.usage = state.usage;
                 Bytes::from(s)
             }
@@ -488,9 +566,17 @@ fn stream_outcome(
         }
     };
 
+    let parse_think = app
+        .cfg
+        .providers
+        .get(&cand.provider)
+        .map(|p| p.parse_think_tags)
+        .unwrap_or(false)
+        && upstream_format == WireFormat::Openai;
     let ctx = StreamCtx {
         parser: SseParser::new(),
         kind,
+        think: parse_think.then(ThinkFilter::new),
         usage: TokenUsage::default(),
         provider: cand.provider.clone(),
         app,
@@ -524,6 +610,22 @@ fn stream_outcome(
     Outcome::Stream {
         provider: cand.full_id(),
         body: axum::body::Body::from_stream(stream),
+    }
+}
+
+/// Non-streaming: move `<think>` spans in every choice's message.content
+/// into message.reasoning_content.
+fn extract_think_from_response(body: &mut Value) {
+    let Some(choices) = body["choices"].as_array_mut() else { return };
+    for choice in choices {
+        let message = &mut choice["message"];
+        let Some(text) = message["content"].as_str() else { continue };
+        let (reasoning, content) = crate::translate::think::extract(text);
+        if let Some(r) = reasoning {
+            let prior = message["reasoning_content"].as_str().unwrap_or("");
+            message["reasoning_content"] = json!(format!("{prior}{r}"));
+            message["content"] = json!(content);
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod anthropic_to_openai;
 pub mod openai_to_anthropic;
 pub mod sse;
+pub mod think;
 
 /// Token usage extracted from a response, in provider-neutral terms.
 #[derive(Debug, Clone, Copy, Default)]
