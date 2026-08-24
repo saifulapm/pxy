@@ -264,11 +264,25 @@ embedding_models = ["qwen3.7-text-embedding"]
 [providers.alibaba.limits]
 total_tokens = 5000000        # 5 chat models x 1M free quota (90-day expiry!)
 
+# Fireworks — PAID serverless (pay per token; $1 signup credit only, 10 rpm
+# without a payment method). Kept OUT of [auto] deliberately: it spends real
+# money. Cheap picks: gpt-oss-120b $0.15/$0.60 per M, deepseek-v4-flash
+# $0.14/$0.28. Fully-qualified model ids required.
 [providers.fireworks]
 base_url = "https://api.fireworks.ai/inference/v1/chat/completions"
+embeddings_url = "https://api.fireworks.ai/inference/v1/embeddings"
 api_key = { pass = "AI/fireworks/main" }
-# fireworks wants fully-qualified ids
-models = ["accounts/fireworks/models/glm-5p2", "accounts/fireworks/models/kimi-k2p7-code"]
+models = [
+  "accounts/fireworks/models/gpt-oss-120b",
+  "accounts/fireworks/models/deepseek-v4-flash-0731",
+  "accounts/fireworks/models/glm-5p2",
+  "accounts/fireworks/models/kimi-k3",
+  "accounts/fireworks/models/kimi-k2p7-code",
+  "accounts/fireworks/models/qwen3p8-max",
+]
+embedding_models = ["accounts/fireworks/models/qwen3-embedding-8b"]
+[providers.fireworks.limits]
+rpm = 10
 
 # agentrouter speaks Anthropic messages natively (docs/06)
 [providers.agentrouter]
