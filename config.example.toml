@@ -22,6 +22,7 @@ models = [
   "tencent/hy3",
   "ollama/gpt-oss:120b",
   "openrouter/stealth/ox-alpha",
+  "tokenrouter/qwen/qwen3.8-max-free",
   "alibaba/qwen3.8-max",
   "mistral/devstral-latest",
 
@@ -310,10 +311,19 @@ models = [
   { id = "deepseek-v4f", context_length = 128000 },
 ]
 
+# TokenRouter — aggregator with 128 models; only 2 are FREE (verified
+# 2026-08-24). Rate limits are undocumented and it returns no ratelimit
+# headers; concurrency probing showed sporadic 503s, so keep rpm modest and
+# rely on failover. total_usage on this account is $0 — free models only here.
 [providers.tokenrouter]
 base_url = "https://api.tokenrouter.com/v1/chat/completions"
 api_key = { pass = "AI/tokenrouter/main" }
-models = ["openai/gpt-5.6-luna", "qwen/qwen3.7-max"]
+models = [
+  { id = "qwen/qwen3.8-max-free", context_length = 262144 },
+  { id = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", context_length = 256000 },
+]
+[providers.tokenrouter.limits]
+rpm = 10
 
 [providers.openadapter]
 base_url = "https://api.openadapter.in/v1/chat/completions"
