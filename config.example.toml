@@ -20,6 +20,7 @@ models = [
   "tencent/kimi-k3",
   "tencent/hy3",
   "ollama/gpt-oss:120b",
+  "openrouter/stealth/ox-alpha",
 
   "opencode-zen/big-pickle",
   "opencode-zen/hy3-free",
@@ -128,6 +129,8 @@ base_url = "https://openrouter.ai/api/v1/chat/completions"
 api_key = { pass = "AI/openrouter/main" }
 headers = { HTTP-Referer = "http://localhost", X-Title = "pxy" }
 models = [
+  # cloaked frontier model, free while in stealth (prompts likely used for training)
+  { id = "stealth/ox-alpha", context_length = 1000000 },
   { id = "z-ai/glm-5.2:free", context_length = 256000 },
   { id = "cohere/north-mini-code:free", context_length = 256000 },
   { id = "poolside/laguna-s-2.1:free", context_length = 262144 },
