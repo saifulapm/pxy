@@ -66,7 +66,7 @@ models = [
   "hy3",
   "glm-5.3",
   "kimi-k3",
-  "deepseek-v4-pro",
+  "deepseek-v4-pro-0813",
   "minimax-m3",
 ]
 # vl-embedding models need a multimodal endpoint, not plain /v1/embeddings
@@ -79,7 +79,7 @@ base_url = "https://api.deepseek.com/chat/completions"
 api_key = { pass = "AI/deepseek/main" }
 models = [
   { id = "deepseek-v4-flash", context_length = 128000 },
-  { id = "deepseek-v4-pro", context_length = 128000 },
+  { id = "deepseek-v4-pro-0813", context_length = 128000 },
 ]
 
 [providers.openrouter]
