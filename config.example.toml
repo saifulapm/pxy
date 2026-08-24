@@ -297,6 +297,16 @@ headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
 models = [
   { id = "claude-opus-5", context_length = 200000, max_output_tokens = 64000 },
   { id = "claude-opus-4-8", context_length = 200000, max_output_tokens = 64000 },
+  { id = "deepseek-v4f", context_length = 128000 },
+]
+
+# gpt-5.6-sol only supports agentrouter's OpenAI endpoint -> sibling provider
+[providers.agentrouter-openai]
+base_url = "https://agentrouter.org/v1/chat/completions"
+api_key = { pass = "AI/agentrouter/main" }
+headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
+models = [
+  { id = "gpt-5.6-sol", context_length = 272000 },
 ]
 
 [providers.tokenrouter]
