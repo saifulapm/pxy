@@ -47,6 +47,28 @@ daily_requests = 250          # copilot premium request budgeting — tune to ta
 # API-key providers (base URLs from OmniRoute registry, docs/06)
 # ---------------------------------------------------------------------------
 
+# Tencent Cloud TokenHub (international, Singapore node) — OpenAI-compatible
+# gateway for Hunyuan (hy3), GLM, Kimi, DeepSeek, MiniMax + kinfra embeddings.
+# Key from console.tencentcloud.com TokenHub API Key page. The free resource
+# packs (1M Hunyuan LLM tokens + 1M embedding tokens, valid until 2027-08)
+# bill through this account; non-Hunyuan models draw real TokenHub credits.
+[providers.tencent]
+base_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions"
+embeddings_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/embeddings"
+api_key = { pass = "AI/tencent/main" }
+models = [
+  "hy3",
+  "glm-5.3",
+  "kimi-k3",
+  "kimi-k2.7-code",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash",
+  "minimax-m3",
+]
+embedding_models = ["kinfra-text-embedding-0.6b", "kinfra-text-embedding-4b"]
+[providers.tencent.limits]
+total_tokens = 1000000        # the free pack budget — never resets
+
 [providers.deepseek]
 base_url = "https://api.deepseek.com/chat/completions"
 api_key = { pass = "AI/deepseek/main" }

@@ -29,6 +29,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     let router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/models", get(models))
@@ -110,6 +111,93 @@ async fn messages(
     outcome_response(outcome, ClientFormat::Anthropic)
 }
 
+/// Embeddings passthrough. Model resolution: "provider/model" explicitly, or a
+/// bare id matched against providers' `embedding_models` (config order).
+async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>) -> Response {
+    let requested = payload["model"].as_str().unwrap_or("").to_string();
+    let resolved = if let Some((prov, model)) = requested.split_once('/') {
+        app.cfg
+            .providers
+            .get(prov)
+            .filter(|p| p.enabled && p.embeddings_url.is_some())
+            .map(|p| (prov.to_string(), model.to_string(), p))
+    } else {
+        app.cfg
+            .providers
+            .iter()
+            .find(|(_, p)| {
+                p.enabled
+                    && p.embeddings_url.is_some()
+                    && p.embedding_models.iter().any(|m| m == &requested)
+            })
+            .map(|(name, p)| (name.clone(), requested.clone(), p))
+    };
+    let Some((prov_name, model_id, provider_cfg)) = resolved else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": {"message": format!("embedding model '{requested}' not found"),
+                                  "type": "invalid_request_error"}})),
+        )
+            .into_response();
+    };
+
+    let prepared = match crate::providers::prepare(
+        &prov_name,
+        provider_cfg,
+        &app.secrets,
+        &app.state,
+        &app.http,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"message": format!("{e:#}"), "type": "api_error"}})),
+            )
+                .into_response();
+        }
+    };
+    let url = provider_cfg.embeddings_url.clone().unwrap();
+
+    payload["model"] = json!(model_id);
+    let mut req = app
+        .http
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(provider_cfg.timeout_secs))
+        .header("content-type", "application/json");
+    for (k, v) in &prepared.headers {
+        req = req.header(k, v);
+    }
+    let resp = match req.json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"message": format!("network: {e}"), "type": "api_error"}})),
+            )
+                .into_response();
+        }
+    };
+    let status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+
+    if status.is_success() {
+        let tokens = body["usage"]["prompt_tokens"]
+            .as_u64()
+            .or_else(|| body["usage"]["total_tokens"].as_u64())
+            .unwrap_or(0);
+        router::record_embedding_usage(&app, &prov_name, tokens);
+    }
+    let mut resp = (status, Json(body)).into_response();
+    if let Ok(v) = format!("{prov_name}/{model_id}").parse() {
+        resp.headers_mut().insert("x-pxy-provider", v);
+    }
+    resp
+}
+
 /// Local estimate over EVERY block type (docs/04: counting only text broke
 /// Claude Code auto-compaction).
 async fn count_tokens(Json(payload): Json<Value>) -> Json<Value> {
@@ -165,20 +253,12 @@ pub async fn print_status(cfg: &Config) -> Result<()> {
     let now = Timestamp::now();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let _ = writeln!(out, "{:<20} {:>10} {:>14} {:>12} {:>14}", "provider", "day reqs", "day tokens", "month reqs", "month tokens");
+    let _ = writeln!(out, "{:<20} {:>10} {:>14} {:>12} {:>14} {:>16}", "provider", "day reqs", "day tokens", "month reqs", "month tokens", "total tokens");
     for (name, p) in &cfg.providers {
         if !p.enabled {
             continue;
         }
-        let default_limits = crate::config::Limits {
-            rpm: None,
-            daily_requests: None,
-            daily_tokens: None,
-            monthly_requests: None,
-            monthly_tokens: None,
-            reset: "00:00".into(),
-            reset_tz: "UTC".into(),
-        };
+        let default_limits = crate::config::Limits::default();
         let limits = p.limits.as_ref().unwrap_or(&default_limits);
         let Ok(w) = current_windows(limits, now) else { continue };
         let day = state.usage(name, "day", w.day_start).unwrap_or_default();
@@ -187,14 +267,16 @@ pub async fn print_status(cfg: &Config) -> Result<()> {
             Some(l) => format!("{used}/{l}"),
             None => format!("{used}"),
         };
+        let total = state.usage_total(name).unwrap_or_default();
         if writeln!(
             out,
-            "{:<20} {:>10} {:>14} {:>12} {:>14}",
+            "{:<20} {:>10} {:>14} {:>12} {:>14} {:>16}",
             name,
             fmt_limit(day.requests, limits.daily_requests),
             fmt_limit(day.tokens, limits.daily_tokens),
             fmt_limit(month.requests, limits.monthly_requests),
             fmt_limit(month.tokens, limits.monthly_tokens),
+            fmt_limit(total.tokens, limits.total_tokens),
         )
         .is_err()
         {

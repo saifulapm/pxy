@@ -81,7 +81,7 @@ impl State {
         output_tokens: u64,
     ) -> Result<()> {
         let db = self.db.lock().unwrap();
-        for (window, start) in [("day", day_start), ("month", month_start)] {
+        for (window, start) in windows_for(day_start, month_start) {
             db.execute(
                 "INSERT INTO usage (provider, window, window_start, requests, input_tokens, output_tokens)
                  VALUES (?1, ?2, ?3, 1, ?4, ?5)
@@ -89,7 +89,7 @@ impl State {
                    requests = requests + 1,
                    input_tokens = input_tokens + excluded.input_tokens,
                    output_tokens = output_tokens + excluded.output_tokens",
-                rusqlite::params![provider, window, start.to_string(), input_tokens as i64, output_tokens as i64],
+                rusqlite::params![provider, window, start, input_tokens as i64, output_tokens as i64],
             )?;
         }
         Ok(())
@@ -108,26 +108,35 @@ impl State {
             return Ok(());
         }
         let db = self.db.lock().unwrap();
-        for (window, start) in [("day", day_start), ("month", month_start)] {
+        for (window, start) in windows_for(day_start, month_start) {
             db.execute(
                 "INSERT INTO usage (provider, window, window_start, requests, input_tokens, output_tokens)
                  VALUES (?1, ?2, ?3, 0, ?4, ?5)
                  ON CONFLICT(provider, window, window_start) DO UPDATE SET
                    input_tokens = input_tokens + excluded.input_tokens,
                    output_tokens = output_tokens + excluded.output_tokens",
-                rusqlite::params![provider, window, start.to_string(), input_tokens as i64, output_tokens as i64],
+                rusqlite::params![provider, window, start, input_tokens as i64, output_tokens as i64],
             )?;
         }
         Ok(())
     }
 
+    /// Lifetime totals (the "total" window, key independent of time).
+    pub fn usage_total(&self, provider: &str) -> Result<UsageRow> {
+        self.usage_keyed(provider, "total", TOTAL_WINDOW_START)
+    }
+
     pub fn usage(&self, provider: &str, window: &str, start: Timestamp) -> Result<UsageRow> {
+        self.usage_keyed(provider, window, &start.to_string())
+    }
+
+    fn usage_keyed(&self, provider: &str, window: &str, start: &str) -> Result<UsageRow> {
         let db = self.db.lock().unwrap();
         let row = db
             .query_row(
                 "SELECT requests, input_tokens + output_tokens FROM usage
                  WHERE provider = ?1 AND window = ?2 AND window_start = ?3",
-                rusqlite::params![provider, window, start.to_string()],
+                rusqlite::params![provider, window, start],
                 |r| {
                     Ok(UsageRow {
                         requests: r.get::<_, i64>(0)? as u64,
@@ -218,6 +227,17 @@ impl State {
         roll(w, idx);
         w.curr += 1.0;
     }
+}
+
+/// Fixed key for the all-time window.
+const TOTAL_WINDOW_START: &str = "epoch";
+
+fn windows_for(day_start: Timestamp, month_start: Timestamp) -> [(&'static str, String); 3] {
+    [
+        ("day", day_start.to_string()),
+        ("month", month_start.to_string()),
+        ("total", TOTAL_WINDOW_START.to_string()),
+    ]
 }
 
 fn roll(w: &mut RpmWindow, idx: u64) {

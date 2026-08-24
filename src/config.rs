@@ -46,8 +46,11 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         for (name, p) in &self.providers {
-            if p.kind == ProviderKind::OpenaiCompat && p.base_url.is_none() {
-                anyhow::bail!("provider '{name}': base_url is required");
+            if p.kind == ProviderKind::OpenaiCompat
+                && p.base_url.is_none()
+                && p.embeddings_url.is_none()
+            {
+                anyhow::bail!("provider '{name}': base_url (or embeddings_url) is required");
             }
         }
         for entry in &self.auto.models {
@@ -118,6 +121,11 @@ pub struct ProviderConfig {
     pub format: WireFormat,
     /// COMPLETE endpoint URL (e.g. https://api.deepseek.com/chat/completions)
     pub base_url: Option<String>,
+    /// COMPLETE embeddings endpoint URL, if the provider offers one
+    pub embeddings_url: Option<String>,
+    /// Embedding model ids served via embeddings_url (kept out of the chat catalog)
+    #[serde(default)]
+    pub embedding_models: Vec<String>,
     pub api_key: Option<SecretRef>,
     /// OAuth credential blob (JSON in pass) for kinds that need it
     pub credentials: Option<SecretRef>,
@@ -212,6 +220,9 @@ pub struct Limits {
     pub daily_tokens: Option<u64>,
     pub monthly_requests: Option<u64>,
     pub monthly_tokens: Option<u64>,
+    /// All-time budget (e.g. a prepaid credit pack). Never resets.
+    pub total_requests: Option<u64>,
+    pub total_tokens: Option<u64>,
     /// Daily reset time "HH:MM" in `reset_tz` (default "00:00")
     #[serde(default = "default_reset")]
     pub reset: String,
@@ -225,6 +236,22 @@ fn default_reset() -> String {
 }
 fn default_tz() -> String {
     "UTC".into()
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            rpm: None,
+            daily_requests: None,
+            daily_tokens: None,
+            monthly_requests: None,
+            monthly_tokens: None,
+            total_requests: None,
+            total_tokens: None,
+            reset: default_reset(),
+            reset_tz: default_tz(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

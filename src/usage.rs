@@ -64,15 +64,7 @@ mod tests {
     use crate::config::Limits;
 
     fn limits(reset: &str, tz: &str) -> Limits {
-        Limits {
-            rpm: None,
-            daily_requests: None,
-            daily_tokens: None,
-            monthly_requests: None,
-            monthly_tokens: None,
-            reset: reset.into(),
-            reset_tz: tz.into(),
-        }
+        Limits { reset: reset.into(), reset_tz: tz.into(), ..Default::default() }
     }
 
     #[test]

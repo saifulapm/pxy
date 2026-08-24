@@ -174,6 +174,19 @@ fn check_candidate(
                 }
             }
         }
+        if limits.total_requests.is_some() || limits.total_tokens.is_some() {
+            let total = app.state.usage_total(&cand.provider).unwrap_or_default();
+            if let Some(l) = limits.total_requests {
+                if total.requests >= l {
+                    return Err("total request budget exhausted".into());
+                }
+            }
+            if let Some(l) = limits.total_tokens {
+                if total.tokens >= l {
+                    return Err("total token budget exhausted".into());
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -536,23 +549,19 @@ fn record_tokens(app: &App, provider: &str, usage: TokenUsage) {
     record_usage_inner(app, provider, usage, false);
 }
 
+/// Embeddings count as one request + input tokens against the same windows.
+pub fn record_embedding_usage(app: &App, provider: &str, tokens: u64) {
+    record_usage_inner(app, provider, TokenUsage { input: tokens, output: 0 }, true);
+}
+
 fn record_usage_inner(app: &App, provider: &str, usage: TokenUsage, request: bool) {
-    let default_limits;
-    let limits = match app.cfg.providers.get(provider).and_then(|p| p.limits.as_ref()) {
-        Some(l) => l,
-        None => {
-            default_limits = crate::config::Limits {
-                rpm: None,
-                daily_requests: None,
-                daily_tokens: None,
-                monthly_requests: None,
-                monthly_tokens: None,
-                reset: "00:00".into(),
-                reset_tz: "UTC".into(),
-            };
-            &default_limits
-        }
-    };
+    let default_limits = crate::config::Limits::default();
+    let limits = app
+        .cfg
+        .providers
+        .get(provider)
+        .and_then(|p| p.limits.as_ref())
+        .unwrap_or(&default_limits);
     if let Ok(w) = current_windows(limits, Timestamp::now()) {
         let res = if request {
             app.state
