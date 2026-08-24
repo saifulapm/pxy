@@ -325,12 +325,11 @@ models = [
 [providers.tokenrouter.limits]
 rpm = 10
 
-# OpenAdapter — FREE plan is very restrictive (probed 2026-08-24): the whole
-# `free/*` namespace and all top-tier models are PAID-plan only; just a few
-# small models are callable. Quota is reported in response headers
-# X-Quota-5h / X-Quota-Week / X-Quota-Month (percentages) — ~8 requests moved
-# month to 13%, i.e. roughly 60 requests/month. Kept out of [auto]; the
-# allowance is too small to be a useful fallback.
+# OpenAdapter — FREE plan: 50 requests/day, 200/month (per their dashboard).
+# Quota consumed is echoed on every response as X-Quota-5h / X-Quota-Week /
+# X-Quota-Month percentages. The whole `free/*` namespace and all top-tier
+# models are PAID-plan only (their "free/" prefix means free-*experimental*,
+# not free-to-you); only these 5 small models are callable — probed 2026-08-24.
 [providers.openadapter]
 base_url = "https://api.openadapter.in/v1/chat/completions"
 api_key = { pass = "AI/openadapter/main" }
@@ -342,7 +341,8 @@ models = [
   { id = "Llama-3.1-8B", context_length = 128000 },
 ]
 [providers.openadapter.limits]
-monthly_requests = 55
+daily_requests = 50
+monthly_requests = 200
 rpm = 5
 
 [providers.agnes]
