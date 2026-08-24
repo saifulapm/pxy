@@ -20,9 +20,10 @@ models = [
   "tencent/kimi-k3",
   "tencent/hy3",
 
-  "deepseek/deepseek-v4-flash",
+  "opencode-zen/big-pickle",
+  "opencode-zen/hy3-free",
+  "opencode-zen/deepseek-v4-flash-free",
   "openrouter/z-ai/glm-5.2:free",
-  "freemodel-dev/gpt-5.6-luna",
 ]
 
 [launch]
@@ -97,10 +98,23 @@ models = [
 rpm = 20
 daily_requests = 1000         # free-tier daily cap
 
+# opencode Zen: pay-per-token gateway sharing the Go workspace key.
+# The *-free models cost nothing (limited time; NVIDIA ones are trial-only —
+# don't send personal data; muse-spark trains on prompts).
 [providers.opencode-zen]
 base_url = "https://opencode.ai/zen/v1/chat/completions"
-api_key = { pass = "AI/opencode-zen/main" }
-models = ["glm-5.2", "kimi-k3", "grok-4.6", "gpt-5.1-codex-max"]
+api_key = { pass = "AI/opencode-go/github" }
+models = [
+  "big-pickle",
+  "hy3-free",
+  "deepseek-v4-flash-free",
+  "mimo-v2.5-free",
+  "x-preview-f-free",
+  "nemotron-3-ultra-free",
+  "nemotron-3.5-lightning-free",
+  "laguna-s-2.1-free",
+  "muse-spark-1.2-contributor-free",
+]
 
 # opencode Go ($10/mo sub per account): dollar-based limits enforced
 # upstream — $12 per 5h window, $30/week, $60/month. Two accounts; pxy's

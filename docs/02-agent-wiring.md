@@ -113,3 +113,23 @@ Fast-mode check + WebFetch domain-safety go directly to api.anthropic.com (ignor
      `pi --provider pxy --model ...`.
 4. pxy needs to strip/translate Claude Code beta fields when the upstream isn't Anthropic, and
    pass through error bodies unmodified so client-side auto-retry works.
+
+## How opencode's TUI auto-shows Zen free models (researched 2026-08-24)
+
+Source: `references/opencode/packages/opencode/src/provider/provider.ts` (~line 185).
+The `opencode` (Zen) provider loader always runs, even with no account:
+
+1. Credential check: env key OR stored auth OR config `provider.opencode.options.apiKey`.
+2. **No credentials → filter the model catalog to `cost.input === 0`** (the free models;
+   catalog + costs come from models.dev metadata) and set the literal API key **`"public"`**.
+3. `autoload: true` whenever any models remain — so the free models appear in the model
+   picker for everyone, served anonymously.
+
+Verified live: `curl https://opencode.ai/zen/v1/chat/completions -H "Authorization: Bearer public"`
+answers on `big-pickle`. So Zen free models need no account at all; a workspace key just
+associates usage with your account. Also: Zen and Go accept the same workspace key.
+
+Zen free ids (live, 2026-08-24): big-pickle, hy3-free, deepseek-v4-flash-free, mimo-v2.5-free,
+x-preview-f-free, nemotron-3-ultra-free, nemotron-3.5-lightning-free, laguna-s-2.1-free,
+muse-spark-1.2-contributor-free. (NVIDIA ones trial-only — no personal data; muse-spark trains
+on prompts. big-pickle returns reasoning_content natively.)
