@@ -21,6 +21,7 @@ models = [
   "tencent/hy3",
   "ollama/gpt-oss:120b",
   "openrouter/stealth/ox-alpha",
+  "alibaba/qwen3.8-max",
 
   "opencode-zen/big-pickle",
   "opencode-zen/hy3-free",
@@ -213,10 +214,26 @@ base_url = "https://codestral.mistral.ai/v1/chat/completions"
 api_key = { pass = "AI/codestral/main" }
 models = ["codestral-latest"]
 
+# Alibaba Model Studio intl (global account; free quota ACTIVE 2026-08-24).
+# Each Qwen model has its own 1M-token free quota, valid 90 days from
+# activation — after that calls bill pay-as-you-go UNLESS "Free Quota Only"
+# is enabled in the console (recommended!). Non-Qwen models (kimi/glm/
+# deepseek) are paid — deliberately not listed here. The china account is
+# not activated (AccessDenied.Unpurchased) — parked.
 [providers.alibaba]
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+embeddings_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings"
 api_key = { pass = "AI/alibaba/global" }
-models = ["qwen3.7-plus", "qwen3.6-27b"]
+models = [
+  "qwen3.8-max",
+  "qwen3.8-2.4t-a95b",
+  "qwen3.7-plus",
+  "qwen3.7-flash",
+  "qwen3.8-27b",
+]
+embedding_models = ["qwen3.7-text-embedding"]
+[providers.alibaba.limits]
+total_tokens = 5000000        # 5 chat models x 1M free quota (90-day expiry!)
 
 [providers.fireworks]
 base_url = "https://api.fireworks.ai/inference/v1/chat/completions"
