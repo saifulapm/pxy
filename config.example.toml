@@ -14,11 +14,12 @@ api_key = "pxy-local"   # soft gate; server binds 127.0.0.1 only
 [auto]
 models = [
   "github/claude-sonnet-4.6",
+  "opencode-go-github/glm-5.3",
+  "opencode-go-google/glm-5.3",
   "tencent/glm-5.3",
   "tencent/kimi-k3",
   "tencent/hy3",
-  "opencode-zen/glm-5.2",
-  "opencode-go/glm-5.2",
+
   "deepseek/deepseek-v4-flash",
   "openrouter/z-ai/glm-5.2:free",
   "freemodel-dev/gpt-5.6-luna",
@@ -101,10 +102,38 @@ base_url = "https://opencode.ai/zen/v1/chat/completions"
 api_key = { pass = "AI/opencode-zen/main" }
 models = ["glm-5.2", "kimi-k3", "grok-4.6", "gpt-5.1-codex-max"]
 
-[providers.opencode-go]
+# opencode Go ($10/mo sub per account): dollar-based limits enforced
+# upstream — $12 per 5h window, $30/week, $60/month. Two accounts; pxy's
+# 429+Retry-After cooldown rotates between them automatically.
+[providers.opencode-go-github]
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/github" }
-models = ["glm-5.2", "glm-5.2-high"]
+models = [
+  "glm-5.3",
+  "kimi-k3",
+  "kimi-k2.7-code",
+  "deepseek-v4-pro",
+  "minimax-m3",
+  "qwen3.8-max",
+  "hy3",
+  "grok-4.5",
+  "ox-alpha-free",
+]
+
+[providers.opencode-go-google]
+base_url = "https://opencode.ai/zen/go/v1/chat/completions"
+api_key = { pass = "AI/opencode-go/google" }
+models = [
+  "glm-5.3",
+  "kimi-k3",
+  "kimi-k2.7-code",
+  "deepseek-v4-pro",
+  "minimax-m3",
+  "qwen3.8-max",
+  "hy3",
+  "grok-4.5",
+  "ox-alpha-free",
+]
 
 [providers.zenmux]
 base_url = "https://zenmux.ai/api/v1/chat/completions"
