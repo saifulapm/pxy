@@ -16,6 +16,7 @@ models = [
   "github/claude-sonnet-4.6",
   "opencode-go-github/glm-5.3",
   "opencode-go-google/glm-5.3",
+  "zenmux/z-ai/glm-5.3-free",
   "tencent/glm-5.3",
   "tencent/kimi-k3",
   "tencent/hy3",
@@ -204,6 +205,7 @@ models = [
 # generation calls (verified independently via OmniRoute too) — the account
 # needs a new key or re-verification at zenmux.ai. Kept out of [auto] until
 # the key works.
+# UPDATE 2026-08-24: new key + $5 balance -> all free models verified working.
 [providers.zenmux]
 base_url = "https://zenmux.ai/api/v1/chat/completions"
 api_key = { pass = "AI/zenmux/main" }
