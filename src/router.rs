@@ -341,10 +341,13 @@ fn classify_error(
     retry_after: Option<Duration>,
     err_body: String,
 ) -> AttemptResult {
-    let skip = matches!(status, 401 | 403 | 408 | 409 | 429) || status >= 500;
+    // 402 included: aggregators (ZenMux, OpenRouter, DeepSeek) use it for
+    // exhausted quota/credits — an account problem, not a request problem.
+    let skip = matches!(status, 401 | 402 | 403 | 408 | 409 | 429) || status >= 500;
     if skip {
         let reason = match status {
             401 | 403 => "auth error",
+            402 => "quota/credits exhausted",
             429 => "rate limited",
             _ => "upstream error",
         };
