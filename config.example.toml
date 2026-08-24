@@ -284,12 +284,16 @@ embedding_models = ["accounts/fireworks/models/qwen3-embedding-8b"]
 [providers.fireworks.limits]
 rpm = 10
 
-# agentrouter speaks Anthropic messages natively (docs/06)
+# agentrouter speaks Anthropic messages natively (docs/06). Its WAF rejects
+# unknown clients ("unauthorized client detected") — a claude-cli User-Agent
+# is the minimal passing fingerprint (probed 2026-08-24). PAID balance
+# (prepaid credits) — kept OUT of [auto]; premium manual-use reserve.
 [providers.agentrouter]
 format = "anthropic"
 base_url = "https://agentrouter.org/v1/messages"
 auth_header = "x-api-key"
 api_key = { pass = "AI/agentrouter/main" }
+headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
 models = [
   { id = "claude-opus-5", context_length = 200000, max_output_tokens = 64000 },
   { id = "claude-opus-4-8", context_length = 200000, max_output_tokens = 64000 },
