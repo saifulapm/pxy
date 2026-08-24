@@ -28,25 +28,42 @@ models = [
 
 [launch]
 model = "auto"
-small_model = "github/gpt-5-mini"
+small_model = "github-free/gpt-5-mini"
 
 # ---------------------------------------------------------------------------
 # OAuth providers
 # ---------------------------------------------------------------------------
 
+# Copilot Pro (yearly): 300 premium requests/month, resets 1st 00:00 UTC, no
+# rollover. Multipliers: sonnet 1x, haiku 0.33x, gpt-5-mini 0x (see
+# github-free below). pxy counts plain requests, so 300 = sonnet-equivalents
+# (haiku slightly overcounted). Context lengths from the live /models API
+# (max_prompt_tokens governs what fits).
 [providers.github]
 kind = "github-copilot"
 format = "openai"
 credentials = { pass = "AI/github/main" }
 models = [
   { id = "claude-sonnet-4.6", context_length = 200000, max_output_tokens = 64000 },
-  { id = "claude-haiku-4.5", context_length = 200000, max_output_tokens = 64000 },
-  { id = "gpt-5.4", context_length = 264000, max_output_tokens = 64000 },
-  { id = "gpt-5-mini", context_length = 264000, max_output_tokens = 32000 },
+  { id = "claude-haiku-4.5", context_length = 128000, max_output_tokens = 32000 },
+  { id = "gpt-5.4", context_length = 272000, max_output_tokens = 128000 },
   { id = "kimi-k2.7-code", context_length = 256000, max_output_tokens = 32000 },
 ]
 [providers.github.limits]
-daily_requests = 250          # copilot premium request budgeting — tune to taste
+monthly_requests = 300        # premium request allowance (Pro)
+reset = "00:00"
+reset_tz = "UTC"
+
+# 0x-multiplier Copilot models: unlimited on paid plans, keep working even
+# after the 300 premium requests are spent. Separate provider so their heavy
+# background use never eats the premium budget in pxy's accounting.
+[providers.github-free]
+kind = "github-copilot"
+format = "openai"
+credentials = { pass = "AI/github/main" }
+models = [
+  { id = "gpt-5-mini", context_length = 128000, max_output_tokens = 64000 },
+]
 
 # ---------------------------------------------------------------------------
 # API-key providers (base URLs from OmniRoute registry, docs/06)
@@ -85,18 +102,30 @@ models = [
   { id = "deepseek-v4-pro", context_length = 128000 },
 ]
 
+# OpenRouter, FREE models only (":free" ids never consume credits — free-model
+# caps are rate limits, not credit limits). Limits verified 2026-08-24:
+# 20 req/min; 1000 free requests/day because >=$10 credits were purchased
+# (accounts under $10 lifetime get only 50/day).
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1/chat/completions"
 api_key = { pass = "AI/openrouter/main" }
 headers = { HTTP-Referer = "http://localhost", X-Title = "pxy" }
 models = [
-  "z-ai/glm-5.2:free",
-  "nvidia/nemotron-3-super-120b-a12b:free",
-  "google/gemma-4-31b-it:free",
+  { id = "z-ai/glm-5.2:free", context_length = 256000 },
+  { id = "cohere/north-mini-code:free", context_length = 256000 },
+  { id = "poolside/laguna-s-2.1:free", context_length = 262144 },
+  { id = "thinkingmachines/inkling:free", context_length = 262144 },
+  { id = "nvidia/nemotron-3-super-120b-a12b:free", context_length = 262144 },
+  { id = "nvidia/nemotron-3.5-lightning:free", context_length = 1000000 },
+  { id = "nvidia/nemotron-3-ultra-550b-a55b:free", context_length = 1000000 },
+  { id = "dots-studio/dots-3-note-preview:free", context_length = 512000 },
+  { id = "google/gemma-4-31b-it:free", context_length = 262144 },
 ]
 [providers.openrouter.limits]
 rpm = 20
-daily_requests = 1000         # free-tier daily cap
+daily_requests = 1000
+reset = "00:00"
+reset_tz = "UTC"
 
 # opencode Zen: pay-per-token gateway sharing the Go workspace key.
 # The *-free models cost nothing (limited time; NVIDIA ones are trial-only —
