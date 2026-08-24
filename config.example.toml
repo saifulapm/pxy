@@ -427,3 +427,108 @@ rpm = 2
 # base_url = "https://api.v0.dev/v1/chat/completions"
 # api_key = { pass = "AI/v0-vercel/main" }
 # models = ["v0-1.5-md", "v0-1.5-lg"]
+
+# ---------------------------------------------------------------------------
+# STAGED — free-tier providers researched 2026-08-24 (docs/08). Each needs a
+# signup + `pass insert -m -f AI/<id>/main`, then uncomment and restart pxy.
+# Ranked by value; see docs/08 for quotas, gotchas and ToS notes.
+# ---------------------------------------------------------------------------
+
+# 1) Z.AI — permanently FREE glm-4.7-flash (59.2 SWE-bench, agentic-coding tuned).
+#    Signup: z.ai (email, no card). Use the /api/paas/v4 endpoint for general keys
+#    (Coding-Plan keys use /api/coding/paas/v4 — mixing them is the #1 auth error).
+#    Free tier allows ONE concurrent request, hence rpm = 5.
+# [providers.zai]
+# base_url = "https://api.z.ai/api/paas/v4/chat/completions"
+# api_key = { pass = "AI/zai/main" }
+# models = [
+#   { id = "glm-4.7-flash", context_length = 200000 },
+#   { id = "glm-4.5-flash", context_length = 128000 },
+#   { id = "glm-4.6v-flash", context_length = 200000 },
+# ]
+# [providers.zai.limits]
+# rpm = 5
+
+# 2) Inception Labs — 100M free tokens on signup, no card. Diffusion LLM, >1000 tok/s.
+#    Flip the training opt-out in Account Settings after signup.
+# [providers.inception]
+# base_url = "https://api.inceptionlabs.ai/v1/chat/completions"
+# api_key = { pass = "AI/inception/main" }
+# models = ["mercury-2", "mercury-coder"]
+# [providers.inception.limits]
+# total_tokens = 100000000
+
+# 3) NVIDIA NIM — ~40 RPM free, 100+ models, no card. ToS: prototyping/dev only.
+#    Note openai/gpt-oss-* here does NOT support tool calling.
+# [providers.nvidia]
+# base_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+# api_key = { pass = "AI/nvidia/main" }
+# models = [
+#   "zai/glm-5.2",
+#   "moonshotai/kimi-k2.6",
+#   "qwen/qwen3.5-397b-a17b",
+#   "mistralai/devstral-2-123b-instruct-2512",
+#   "nvidia/nemotron-3-ultra-550b",
+# ]
+# [providers.nvidia.limits]
+# rpm = 40
+
+# 4) Vercel AI Gateway — $5/month RECURRING credit, 0% markup, frontier models.
+#    WARNING: buying any credits permanently kills the monthly free grant.
+# [providers.vercel-gateway]
+# base_url = "https://ai-gateway.vercel.sh/v1/chat/completions"
+# api_key = { pass = "AI/vercel-gateway/main" }
+# models = ["anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-flash"]
+
+# 5) Groq — 30 RPM / 1K RPD but only 8K TPM (the real ceiling). Org-wide limits.
+#    groq/compound has built-in web search + code execution.
+# [providers.groq]
+# base_url = "https://api.groq.com/openai/v1/chat/completions"
+# api_key = { pass = "AI/groq/main" }
+# models = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "groq/compound"]
+# [providers.groq.limits]
+# rpm = 30
+# daily_requests = 1000
+
+# 6) Ant Ling — 500K tokens/day recurring (resets 02:00 UTC+8). Signup may need a
+#    Chinese phone/ID — unverified.
+# [providers.ant-ling]
+# base_url = "https://api.ant-ling.com/v1/chat/completions"
+# api_key = { pass = "AI/ant-ling/main" }
+# models = ["Ling-3.0-flash", "Ring-2.6-1T"]
+# [providers.ant-ling.limits]
+# daily_tokens = 500000
+# reset = "02:00"
+# reset_tz = "Asia/Shanghai"
+
+# 7) Scaleway — 1M free tokens one-time, ~60 RPM, cleanest ToS. EU-hosted (latency).
+# [providers.scaleway]
+# base_url = "https://api.scaleway.ai/v1/chat/completions"
+# api_key = { pass = "AI/scaleway/main" }
+# models = ["qwen3-235b-a22b-instruct-2507", "gpt-oss-120b", "deepseek-v3-0324"]
+# [providers.scaleway.limits]
+# rpm = 60
+# total_tokens = 1000000
+
+# 8) Cerebras — ~3000 tok/s but free tier is capped at 8K CONTEXT and 5 RPM.
+#    Use for commit messages / classification only. NEVER put in [auto].
+# [providers.cerebras]
+# base_url = "https://api.cerebras.ai/v1/chat/completions"
+# api_key = { pass = "AI/cerebras/main" }
+# models = [
+#   { id = "gpt-oss-120b", context_length = 8192 },
+#   { id = "gemma-4-31b", context_length = 8192 },
+# ]
+# [providers.cerebras.limits]
+# rpm = 5
+
+# 9) Morph — fast-apply edit merging (not a chat model): a weak model sketches the
+#    diff, morph applies it at ~10,500 tok/s. 250K credits / ~200 req per month.
+# [providers.morph]
+# base_url = "https://api.morphllm.com/v1/chat/completions"
+# api_key = { pass = "AI/morph/main" }
+# models = [{ id = "auto", context_length = 262144 }]
+
+# Google AI Studio (Gemini): free gemini-3-flash etc. with tool calling, but the
+# wire format is Gemini-native and the auth header is x-goog-api-key — pxy needs a
+# Gemini translator first (see HANDOFF next steps).

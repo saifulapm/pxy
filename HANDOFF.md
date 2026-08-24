@@ -98,10 +98,23 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 
 ## Where we left off — NEXT STEPS
 
-1. **Add more free providers** — research was in flight when this handoff was written; check
-   the session summary/`docs/` for `08-*` if it landed. Candidates to verify: Cerebras, Groq,
-   Google AI Studio (Gemini free tier), NVIDIA NIM, SambaNova, Chutes, Hyperbolic, Together.
-   Add as plain `[providers.*]` entries; test tool calling before putting anything in `auto`.
+1. **Add more free providers** — research is DONE: see `docs/08-free-provider-candidates.md`.
+   Ready-to-use config blocks are already staged (commented) at the bottom of
+   `config.example.toml` / `~/.config/pxy/config.toml`. Each needs a signup + a pass entry,
+   then uncomment + restart. Signup order by value:
+   1. **Z.AI** (`api.z.ai/api/paas/v4`) — permanently free `glm-4.7-flash`, 59.2 SWE-bench,
+      agentic-coding tuned, clean ToS. Caveat: ONE concurrent request on free tier.
+   2. **Inception Labs** — 100M free tokens on signup, no card.
+   3. **NVIDIA NIM** — ~40 RPM, 100+ models incl. devstral-2-123b.
+   4. **Vercel AI Gateway** — $5/month RECURRING on frontier models (never top up: buying
+      credits permanently ends the free grant).
+   5. **Groq / Scaleway / Ant Ling / Morph / Cerebras** — see docs/08 for the trade-offs.
+   Verified DEAD, don't chase: Chutes, Targon, Together, OVHcloud, Hyperbolic, Nebius,
+   DeepInfra, Predibase, MonsterAPI, Phind, HuggingFace. **SambaNova is 20 requests/DAY.**
+   **Cerebras free tier caps context at 8,192 tokens at 5 RPM** — fatal for agents, so it's
+   staged as a short-call-only provider and must never go in `auto`.
+   Always test tool calling before putting anything in `auto`.
+   Note: Pollinations' keyless tier is gone (401 as of 2026-08-24); it needs a free key now.
 2. **Phase 2 — non-chat endpoints** (design already validated; these are simple pass-through
    handlers, architecturally separate): images generations/edits, audio transcription + TTS,
    video generation, web search, rerank. Credentials already in pass for: `voyage-ai`,
