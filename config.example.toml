@@ -19,6 +19,7 @@ models = [
   "tencent/glm-5.3",
   "tencent/kimi-k3",
   "tencent/hy3",
+  "ollama/gpt-oss:120b",
 
   "opencode-zen/big-pickle",
   "opencode-zen/hy3-free",
@@ -93,6 +94,22 @@ models = [
 embedding_models = ["kinfra-text-embedding-0.6b", "kinfra-text-embedding-4b"]
 [providers.tencent.limits]
 total_tokens = 5000000        # 5 activated models x 1M free quota
+
+# Ollama Cloud — free plan ("light usage" rate limits, enforced upstream;
+# 429s trigger pxy cooldown+failover). Key from ollama.com/settings/keys.
+[providers.ollama]
+base_url = "https://ollama.com/v1/chat/completions"
+api_key = { pass = "AI/ollama/main" }
+# Free plan includes ONLY these (probed 2026-08-24); glm/kimi/deepseek/
+# minimax/qwen on ollama cloud need a paid subscription (403 otherwise).
+models = [
+  "gpt-oss:120b",
+  "gpt-oss:20b",
+  "nemotron-3-ultra",
+  "nemotron-3-super",
+  "nemotron-3-nano:30b",
+  "gemma4:31b",
+]
 
 [providers.deepseek]
 base_url = "https://api.deepseek.com/chat/completions"
