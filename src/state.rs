@@ -56,6 +56,10 @@ impl State {
             std::fs::create_dir_all(dir)?;
         }
         let db = Connection::open(path).context("opening state db")?;
+        // The CLI (explain/doctor/status) opens the daemon's live db; without
+        // a busy timeout a concurrent daemon write turns into an instant
+        // "database is locked" abort instead of a few-ms wait.
+        db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS usage (

@@ -14,7 +14,11 @@ the feature deleted.
 `small` and `tiny` at the same mock route and only asserts the final provider +
 no cooldown — without the peer-skip, `tiny` would 400 identically and the test
 still lands on `big` and passes. First instance: the cooldown-persistence test
-documented in [[state-cooldown-mirror]].
+documented in [[state-cooldown-mirror]]. Third instance (2026-08-26): the
+catalog "claude/" alias test used a config where every model id has a single
+owner, so the strip-precedence hijack ([[catalog-bare-id-order]]) was
+invisible — sparse test *configs* are the same trap as shared mock routes:
+give colliding ids to two providers when testing resolution precedence.
 
 **How to apply:** Any test claiming "candidate X was skipped / not called"
 must assert on a per-route call counter (the `drop_params` test's `Mutex`

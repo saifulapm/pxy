@@ -57,8 +57,14 @@ pub async fn prepare(
 
     if needs_refresh(&creds) {
         let _guard = REFRESH_LOCK.lock().await;
-        // Staleness re-read inside the lock: Claude Code (or a parallel pxy
-        // request) may have refreshed while we waited.
+        // Cross-process advisory lock on a sibling .lock file (the credential
+        // file itself gets replaced by rename, so locking its inode would be
+        // useless). Fully closes the rotation race against any other locker
+        // (a second pxy, future tooling); the CLI itself may not lock, so
+        // the staleness re-read below stays load-bearing.
+        let _flock = FileLock::acquire(path.with_extension("json.lock")).await?;
+        // Staleness re-read inside both locks: Claude Code (or a parallel
+        // pxy request) may have refreshed while we waited.
         creds = read_credentials(&path)?;
         if needs_refresh(&creds) {
             creds = refresh(name, http, &path, creds).await?;
@@ -104,6 +110,30 @@ pub fn ensure_sentinel(body: &mut Value) {
     };
     blocks.insert(0, json!({"type": "text", "text": SENTINEL}));
     body["system"] = Value::Array(blocks);
+}
+
+/// Exclusive advisory lock, released when dropped (fd close). Acquired on a
+/// blocking thread so a contended lock never stalls a runtime worker.
+struct FileLock(#[allow(dead_code)] std::fs::File);
+
+impl FileLock {
+    async fn acquire(path: std::path::PathBuf) -> Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("opening lock file {}", path.display()))?;
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+            anyhow::ensure!(rc == 0, "flock failed: {}", std::io::Error::last_os_error());
+            Ok(Self(f))
+        })
+        .await
+        .context("lock task panicked")?
+    }
 }
 
 fn credentials_path(cfg: &ProviderConfig) -> std::path::PathBuf {

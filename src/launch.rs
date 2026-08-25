@@ -88,6 +88,9 @@ fn launch_claude(
     let small = cfg.launch.small_model.clone().unwrap_or_else(|| model.to_string());
     cmd.env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &small);
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    // In-session /model switching across every pxy provider: the picker
+    // reads /v1/models, which mirrors all ids under a "claude/" prefix.
+    cmd.env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");
 
     // Claude Code assumes a 200K context for model ids it doesn't recognize;
     // if our resolved chain has a smaller window, lower the auto-compact bound.

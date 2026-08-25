@@ -23,6 +23,8 @@ pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi|codex # spawn an agent wired to pxy (--dry-run shows the plan)
 pxy models                    # 146 models exposed
 pxy status [--remote]         # per-provider usage vs limits; --remote adds live balances
+pxy doctor                    # config/daemon/credentials/agents health, exit 1 on FAIL
+pxy explain <model>           # why each candidate would (not) be routed right now
 pxy refresh [--write]         # discover catalogs; report drift / regenerate generated.toml
 pxy search "query" [-n N]     # web search (brave -> jina -> firecrawl)
 pxy fetch <url>               # URL -> markdown (jina-reader -> firecrawl)
@@ -110,11 +112,20 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 128 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
+- 129 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
   tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
+- **DX round (2026-08-26)**: `pxy doctor`, `pxy explain <model>`, and Claude Code
+  discovery aliases — /v1/models mirrors every id as `claude/<id>` (stripped in
+  catalog.resolve, ONLY when the rest contains a slash or is "auto": a slashless rest
+  is a REAL claude-provider model and stripping it would hand the subscription's ids
+  to whichever provider sorts first). `pxy launch claude` sets
+  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 → in-session /model switching across
+  all providers. claude-oauth refresh now also takes an flock on a sibling .lock file
+  (libc dep, approved); sqlite opens carry a 5s busy_timeout so CLI reads never abort
+  on a busy daemon. From inside any agent: "@@usage" for quota.
 - **Feature round from docs/09 audit (2026-08-26)**:
   - **`claude` provider** (`kind = "claude-oauth"`, providers/claude.rs): real Anthropic
     subscription inference via the Claude Code CLI's own OAuth credential at

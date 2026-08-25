@@ -1,5 +1,6 @@
 mod catalog;
 mod config;
+mod diagnose;
 mod launch;
 mod media;
 mod providers;
@@ -45,6 +46,13 @@ enum Command {
     },
     /// List available models
     Models,
+    /// Diagnose the installation: config, daemon, credentials, agent binaries
+    Doctor,
+    /// Explain how a model id resolves and why candidates would be skipped
+    Explain {
+        /// Model id ("auto", "provider/model", or a bare id)
+        model: String,
+    },
     /// Show provider status (cooldowns, usage)
     Status {
         /// Also query providers' remote billing endpoints (balance_url)
@@ -153,6 +161,11 @@ fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Doctor => block_on_current(diagnose::doctor(&cfg_path)),
+        Command::Explain { model } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            diagnose::explain(&cfg, &model)
         }
         Command::Refresh { write } => {
             // Baseline only: generation must never consume its own output.
