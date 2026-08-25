@@ -8,6 +8,18 @@ Gemini duplicates).
 Each of these needs **you to sign up and put a key in pass** — none can be added unattended.
 Config blocks are staged (commented) in `config.example.toml` and `~/.config/pxy/config.toml`.
 
+## ⚠️ CORRECTIONS (2026-08-25) — this doc has been wrong twice; re-verify before acting
+
+- **§6 Vercel AI Gateway: WRONG.** The $5/month grant requires the Vercel **Pro plan
+  ($20/mo)** — a Hobby account with a valid key 403s ("customer_verification_required")
+  on every call, even `-free` models. Rejected.
+- **§8 Scaleway: WRONG.** Signup **required a card**, and the billing API shows **zero
+  discounts** on the fresh account — no "1M free tokens" tier exists; every generative-API
+  call bills the card. Disabled the same day it was added.
+- Lesson: for any remaining candidate (Ant Ling, Morph, NVIDIA, Groq), verify the free
+  grant **from the account itself** (billing/credits endpoint or a $0-balance test call)
+  before wiring it into pxy — don't trust this doc's quota claims.
+
 ## Ranked adds
 
 ### 1. Z.AI — GLM free models  ★ highest value

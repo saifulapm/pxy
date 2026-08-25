@@ -1,11 +1,11 @@
-# pxy — handoff (as of 2026-08-24)
+# pxy — handoff (as of 2026-08-25)
 
 Read this first in a new session, then `docs/07-pxy-design.md` for design rationale.
 
 ## What pxy is
 
 A tiny Rust proxy replacing OmniRoute (a heavy Node router that used ~800 MB RAM).
-**pxy uses ~12.5 MB.** One local endpoint over 19 providers, an `auto` model that routes by
+**pxy uses ~12.5 MB.** One local endpoint over 25 providers, an `auto` model that routes by
 priority + quota with automatic failover, and `pxy launch claude|opencode|pi` to wire coding
 agents to it. Repo: `github.com/saifulapm/pxy` (private).
 
@@ -21,7 +21,7 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 ```sh
 pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
-pxy models                    # 95 models exposed
+pxy models                    # 122 models exposed
 pxy status                    # per-provider usage vs limits
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
@@ -50,11 +50,15 @@ Both chat protocols translate in both directions, streaming included.
 Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - **Cooldown scopes**: 401/402/403 → provider-wide; 429/408/409/5xx → `provider/model` only.
   One flaky model must never sideline an account's other models.
+- **404s fail over on multi-candidate walks only** (added 2026-08-25 after zenmux delisted
+  glm-5.3-free and its 404 killed the whole `auto` chain): in `auto`, an upstream 404 skips
+  the candidate with a model-scoped cooldown + failover log; an explicit single-model
+  request still passes the raw 404 through (Claude Code needs the unmodified body).
 - **Token accounting** comes only from real `usage` fields; never guess.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
 - 24 unit tests: `cargo test`.
 
-## Provider catalog (19 active)
+## Provider catalog (25 active)
 
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
@@ -69,21 +73,53 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
 
 **Free, renewable:**
-- `zenmux` — free models incl. `z-ai/glm-5.3-free` (1M ctx). Needs balance > $0 (anti-abuse;
+- `zai` — Z.AI direct (added 2026-08-25): permanently free `glm-4.7-flash` (59.2 SWE-bench,
+  agentic-tuned, tool calling verified), `glm-4.5-flash`, `glm-4.6v-flash` (vision).
+  ONE concurrent request on the free tier (rpm = 5 in config). Key: `AI/zai/main`.
+- `zenmux` — free models; `z-ai/glm-5.3-free` was DELISTED ~2026-08-25 (their free list
+  churns — a stale id breaks `auto` because their 404 passes through non-retryably).
+  Current: `deepseek/deepseek-v4-flash-vision-exp-free` (1M ctx, in `auto`),
+  `z-ai/glm-4.7-flash-free`, `z-ai/glm-4.6v-flash-free`. Needs balance > $0 (anti-abuse;
   never deducted). $5 topped up.
 - `openrouter` — `:free` models + `stealth/ox-alpha`; 20 rpm, 1000/day (because ≥$10 lifetime
-  credits purchased). Free models never touch the credit balance.
+  credits purchased). ⏰ **GMI Cloud promo until Sep 6 2026**: `minimax/minimax-m3:free`
+  (1M ctx, in `auto`) + `minimax-m2.7:free` (196k) — unlimited, tool calling verified,
+  $0 cost confirmed per-request. **Remove both + the `auto` entry after Sep 6** (they go paid).
+  Free models never touch the credit balance.
+- `aihubmix` — aggregator, free catalog opened ~2026-08 (added 2026-08-25): 50 `-free`
+  models on one key, no card. In `auto`: `gemini-3.7-flash-free` (only Gemini in the stack,
+  1M ctx), `minimax-m3-free`, `ox-alpha` (plain id, free while in stealth). Kim-series free
+  pool usually exhausted ("insufficient promotional resources" — retry); `gpt-5.5-free`
+  doesn't route. No published rate limits. Key: `AI/aihubmix/main`.
 - `opencode-zen` — 9 free models, served anonymously (`Bearer public` works!). Shares the Go key.
 - `ollama` — free plan: gpt-oss:120b/20b, nemotron-3-*, gemma4:31b only. Flagships need Pro.
 - `mistral` (free Experiment tier, phone-verified, opts into data training) + `codestral`
   (separate free key/endpoint).
 - `agnes` — flash tier free at $0 balance. Also has image/video models (Phase 2).
 - `tokenrouter` — 2 free models of 128. No rate-limit headers; throttles with 503s.
+  ⏳ Plus a **50M-token Kimi K3 grant** (2026-08-25 promo): plain `moonshotai/kimi-k3`
+  is free-routed on this $0-balance account, in `auto`'s finite tier. No remaining-grant
+  readout — when it quota-errors, remove it from `auto`.
 - `bai` — exactly 1 free model (`mimo-v2.5`), heavily throttled; other 41 need a deposit.
 - `openadapter` — 50/day, 200/month; only 5 small models on the free plan. Counts *failed*
   requests against quota too.
+- `cloudflare` — Workers AI on the PAID Workers plan (added 2026-08-25): 10k neurons/day
+  free, **overage bills automatically with no block switch**, so pxy enforces
+  `daily_tokens = 50000` over cheap models only (worst case ~6k neurons ≈ 60% of free).
+  5 tool-verified models incl. deepseek-v4-flash (1.3M ctx). kimi-k2.7-code/glm-5.2
+  excluded ($4+/M output). **NEVER put in `auto`** — the cap dies instantly under agentic
+  load, and past it, real money. Account id (in base_url) came from the old OmniRoute db.
 
 **Free but finite (use before expiry):**
+- `inception` — Mercury 2 diffusion LLM (>1000 tok/s), 100M-token signup grant (added
+  2026-08-25), tool calling verified, in `auto`'s finite tier. `mercury-coder` is gated
+  to pre-2026-02 accounts. TODO: flip the training opt-out in Account Settings.
+- ~~`scaleway`~~ — DISABLED same day it was added (2026-08-25): docs/08 was WRONG about
+  the "1M free tokens, no card" claim. Signup REQUIRED a card, and the billing API shows
+  zero discounts — no free tier exists; every call bills. Key verified working and kept
+  in `AI/scaleway/main` (secret key = Bearer); block commented out in config. Re-enable
+  only deliberately as paid. ⚠️ docs/08 has now been wrong twice (Vercel, Scaleway) —
+  re-verify its remaining claims (Ant Ling, Morph, NVIDIA) against reality before use.
 - `tencent` — TokenHub intl; 5 activated models × 1M tokens, expire **2027-08**.
 - `alibaba` — Model Studio; ~5M tokens across Qwen models, expire **~Nov 2026** (90-day).
   ⚠️ Enable "Free Quota Only" in the console or it silently switches to pay-as-you-go.
@@ -91,6 +127,13 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 **Paid reserves (deliberately NOT in `auto`):**
 - `agentrouter` / `agentrouter-openai` — $125 balance, Opus 5 / Opus 4.8 / gpt-5.6-sol /
   deepseek-v4f. WAF requires the `claude-cli/...` User-Agent (already set).
+- `tabitoken` — $120 referral credits (added 2026-08-25), Opus 5 / 4.8 (+ `-thinking`
+  variants). Same claude-cli UA WAF; speaks Anthropic natively; fronts Kiro/Amazon-Q
+  accounts (usage leaks `kiro_credits`). ⚠️ injects ~7k hidden prompt tokens per call,
+  billed to us — use for real sessions, not one-liners. No remote balance endpoint.
+- `gorouter` — $70 referral credits (added 2026-08-25). Same operator as tabitoken
+  (identical WAF, models, injection, `kiro_credits`) — same caveats. Combined Opus
+  reserve across both: ~$190.
 - `fireworks` — pay-per-token, $1 signup credit only.
 
 **Commented out (dead):** `deepseek` ($0 balance, no free tier), `v0-vercel` (API plan-gated,
@@ -102,12 +145,14 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    Ready-to-use config blocks are already staged (commented) at the bottom of
    `config.example.toml` / `~/.config/pxy/config.toml`. Each needs a signup + a pass entry,
    then uncomment + restart. Signup order by value:
-   1. **Z.AI** (`api.z.ai/api/paas/v4`) — permanently free `glm-4.7-flash`, 59.2 SWE-bench,
-      agentic-coding tuned, clean ToS. Caveat: ONE concurrent request on free tier.
-   2. **Inception Labs** — 100M free tokens on signup, no card.
+   1. ~~**Z.AI**~~ — DONE 2026-08-25, active as `zai` (see catalog above).
+   2. ~~**Inception Labs**~~ — DONE 2026-08-25, active as `inception` (see catalog above).
    3. **NVIDIA NIM** — ~40 RPM, 100+ models incl. devstral-2-123b.
-   4. **Vercel AI Gateway** — $5/month RECURRING on frontier models (never top up: buying
-      credits permanently ends the free grant).
+   4. ~~**Vercel AI Gateway**~~ — REJECTED 2026-08-25: docs/08 was wrong. The $5/month
+      grant requires the **Vercel Pro plan ($20/mo)**, not just a card (verified: Hobby
+      account with valid key 403s "customer_verification_required" on every call,
+      including `-free` models). $20/mo for $5 of credits is a non-starter. Key kept
+      in `AI/vercel-gateway/main` in case the account ever goes Pro for other reasons.
    5. **Groq / Scaleway / Ant Ling / Morph / Cerebras** — see docs/08 for the trade-offs.
    Verified DEAD, don't chase: Chutes, Targon, Together, OVHcloud, Hyperbolic, Nebius,
    DeepInfra, Predibase, MonsterAPI, Phind, HuggingFace. **SambaNova is 20 requests/DAY.**
