@@ -231,7 +231,13 @@ async fn ai_language_model(
                                 (upstream, parser, state, false),
                             ))
                         }
-                        _ => {
+                        other => {
+                            // A mid-stream transport error is NOT a clean
+                            // end: finishing with "stop" would make fx render
+                            // a truncated turn as a success.
+                            if matches!(other, Some(Err(_))) {
+                                state.fail();
+                            }
                             let tail = bytes::Bytes::from(state.finish());
                             Some((Ok(tail), (upstream, parser, state, true)))
                         }

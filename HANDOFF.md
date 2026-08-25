@@ -20,7 +20,7 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 ### Commands
 ```sh
 pxy serve                     # daemon (systemd runs this)
-pxy launch claude|opencode|pi|codex # spawn an agent wired to pxy (--dry-run shows the plan)
+pxy launch claude|opencode|pi|codex|fx # spawn an agent wired to pxy (--dry-run shows the plan)
 pxy models                    # 146 models exposed
 pxy status [--remote]         # per-provider usage vs limits; --remote adds live balances
 pxy doctor                    # config/daemon/credentials/agents health, exit 1 on FAIL
@@ -112,11 +112,30 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 129 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
+- 140 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
   tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
+- **fx agent support (2026-08-26)**: `pxy launch fx` (vercel-labs/fx). fx speaks a THIRD
+  dialect — the Vercel AI SDK LanguageModel spec v4 — at `POST /v3/ai/language-model`:
+  `prompt[]` not `messages[]`, model id + streaming as HEADERS, typed SSE parts. pxy
+  impersonates the gateway (translate/aisdk.rs wraps the OpenAI path like responses.rs
+  does for codex) and also serves `/coding-agent/v1/{models,credits}`. fx source is
+  cloned to gitignored `references/fx` (Zig) — verify protocol claims there.
+  Launch needs BOTH `FX_GATEWAY_BASE_URL` (catalog/credits) and `FX_GATEWAY_CHAT_URL`
+  (generation — its own var; a base-URL-only override still sends the real token to
+  Vercel), plus `AI_GATEWAY_API_KEY` which short-circuits fx's credential chain: no
+  login, no refresh, no team lookup, zero traffic off the machine. Overrides are
+  loopback-http-with-port only.
+  Rules fx's parser enforces (violating any kills the turn): `data: ` needs the space;
+  `finishReason` is an OBJECT with `unified` from a closed set; stop/other/error
+  TOGETHER WITH tool calls is an invalid completion, so finish reasons are forced to
+  `tool-calls` when calls were emitted; usage is nested (`inputTokens.total`);
+  duplicate toolCallIds wedge the next turn (ids carry the call index).
+  Known gap: pxy's catalog advertises only the `tool-use` tag because ModelSpec has no
+  vision/reasoning metadata — so fx never sends image parts or reasoning options
+  through pxy (the file-part mapping in aisdk.rs is currently unreachable via fx).
 - **DX round (2026-08-26)**: `pxy doctor`, `pxy explain <model>`, and Claude Code
   discovery aliases — /v1/models mirrors every id as `claude/<id>` (stripped in
   catalog.resolve, ONLY when the rest contains a slash or is "auto": a slashless rest

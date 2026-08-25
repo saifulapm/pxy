@@ -190,35 +190,76 @@ pub fn request(body: &Value, model: &str, stream: bool) -> Value {
 
 /// OpenAI finish_reason -> the CLOSED set fx accepts. An unrecognized value
 /// aborts fx's stream entirely, so anything unknown maps to "other".
-fn unified_finish(reason: Option<&str>) -> &'static str {
-    match reason {
+///
+/// `has_tool_calls` is load-bearing, not cosmetic: fx's
+/// classifyProviderCompletion treats stop/other TOGETHER WITH tool calls as
+/// an invalid completion and kills the agentic turn. Providers that emit
+/// native tool_calls with finish_reason "stop" (common on free pools) would
+/// wedge every tool-using turn without this.
+fn unified_finish(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
+    let mapped = match reason {
         Some("stop") => "stop",
         Some("length") => "length",
         Some("content_filter") => "content-filter",
         Some("tool_calls") | Some("function_call") => "tool-calls",
+        Some("error") => "error",
         None => "stop",
         _ => "other",
+    };
+    // length/content-filter are truthful about truncation; everything else
+    // must agree with the tool calls actually emitted.
+    if has_tool_calls && matches!(mapped, "stop" | "other" | "error") {
+        return "tool-calls";
     }
+    mapped
 }
 
 // ---------------------------------------------------------------------------
 // Non-streaming response: OpenAI -> AI SDK
 // ---------------------------------------------------------------------------
 
-/// fx's non-streaming path parses a plain OpenAI body, so this is a
-/// passthrough with one guarantee: `arguments` must be a JSON *string* or fx
-/// errors with InvalidGatewayResponse.
+/// fx's non-streaming path parses a plain OpenAI body, with two hard
+/// requirements: `arguments` must be a JSON *string*, and `finish_reason`
+/// must be in fx's legacy closed set — anything else and fx rejects the
+/// whole response as malformed.
+///
+/// Indexing is fallible throughout: a 200 body with no `choices` is a real
+/// shape in the free-provider pool, and serde_json's mut-index PANICS on it.
 pub fn response(openai: &Value) -> Value {
     let mut out = openai.clone();
-    if let Some(calls) = out["choices"][0]["message"]["tool_calls"].as_array_mut() {
+    let Some(choice) = out.get_mut("choices").and_then(|c| c.get_mut(0)) else {
+        return out;
+    };
+    let mut has_calls = false;
+    if let Some(calls) = choice
+        .get_mut("message")
+        .and_then(|m| m.get_mut("tool_calls"))
+        .and_then(Value::as_array_mut)
+    {
+        has_calls = !calls.is_empty();
         for call in calls {
-            let args = &call["function"]["arguments"];
-            if !args.is_string() {
-                call["function"]["arguments"] = json!(args.to_string());
+            if let Some(args) = call.get_mut("function").and_then(|f| f.get_mut("arguments"))
+                && !args.is_string()
+            {
+                *args = json!(args.to_string());
             }
         }
     }
+    // Same closed-set normalization the streaming path does, and the same
+    // tool-call coherence rule (fx errors on stop+tool_calls).
+    let reason = choice["finish_reason"].as_str().map(String::from);
+    choice["finish_reason"] = json!(legacy_finish(reason.as_deref(), has_calls));
     out
+}
+
+/// fx's non-streaming parser accepts only {stop, length, content_filter,
+/// content-filter, tool_calls, tool-calls, error, other}.
+fn legacy_finish(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
+    match unified_finish(reason, has_tool_calls) {
+        "content-filter" => "content_filter",
+        "tool-calls" => "tool_calls",
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +276,10 @@ pub struct StreamState {
     output_tokens: u64,
     started: bool,
     finished: bool,
+    /// An upstream error event or a broken transport. Must surface as
+    /// `unified: "error"`, not a clean "stop" — fx retries on the former and
+    /// silently renders an empty successful turn on the latter.
+    failed: bool,
 }
 
 impl StreamState {
@@ -265,6 +310,7 @@ impl StreamState {
 
         // Upstream error surfaced inside a 200 stream.
         if !v["error"].is_null() {
+            self.failed = true;
             out.push_str(&format_data(&json!({
                 "type": "error",
                 "error": v["error"].clone(),
@@ -283,20 +329,20 @@ impl StreamState {
 
         let choice = &v["choices"][0];
         let delta = &choice["delta"];
-        if let Some(text) = delta["content"].as_str() {
-            if !text.is_empty() {
-                out.push_str(&format_data(&json!({
-                    "type": "text-delta", "id": "text", "delta": text,
-                })));
-            }
+        if let Some(text) = delta["content"].as_str()
+            && !text.is_empty()
+        {
+            out.push_str(&format_data(&json!({
+                "type": "text-delta", "id": "text", "delta": text,
+            })));
         }
         for key in ["reasoning_content", "reasoning"] {
-            if let Some(text) = delta[key].as_str() {
-                if !text.is_empty() {
-                    out.push_str(&format_data(&json!({
-                        "type": "reasoning-delta", "id": "reasoning", "delta": text,
-                    })));
-                }
+            if let Some(text) = delta[key].as_str()
+                && !text.is_empty()
+            {
+                out.push_str(&format_data(&json!({
+                    "type": "reasoning-delta", "id": "reasoning", "delta": text,
+                })));
             }
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
@@ -309,15 +355,15 @@ impl StreamState {
                         self.tools.len() - 1
                     }
                 };
-                if let Some(id) = call["id"].as_str() {
-                    if !id.is_empty() {
-                        self.tools[slot].1 = id.to_string();
-                    }
+                if let Some(id) = call["id"].as_str()
+                    && !id.is_empty()
+                {
+                    self.tools[slot].1 = id.to_string();
                 }
-                if let Some(name) = call["function"]["name"].as_str() {
-                    if !name.is_empty() {
-                        self.tools[slot].2 = name.to_string();
-                    }
+                if let Some(name) = call["function"]["name"].as_str()
+                    && !name.is_empty()
+                {
+                    self.tools[slot].2 = name.to_string();
                 }
                 if let Some(args) = call["function"]["arguments"].as_str() {
                     self.tools[slot].3.push_str(args);
@@ -330,6 +376,12 @@ impl StreamState {
         out
     }
 
+    /// Mark the stream as failed (transport died mid-stream): the finish
+    /// event must say so rather than claim a clean stop.
+    pub fn fail(&mut self) {
+        self.failed = true;
+    }
+
     /// Emit buffered tool calls, the finish event and the terminator. fx also
     /// accepts a bare EOF, but an explicit finish carries usage.
     pub fn finish(&mut self) -> String {
@@ -338,23 +390,32 @@ impl StreamState {
         }
         self.finished = true;
         let mut out = String::new();
-        for (_, id, name, args) in std::mem::take(&mut self.tools) {
+        let mut emitted_calls = false;
+        for (idx, id, name, args) in std::mem::take(&mut self.tools) {
             if name.is_empty() {
                 continue;
             }
+            emitted_calls = true;
             // fx accepts `input` as raw JSON or as a JSON string; send parsed
             // when possible so a malformed fragment can't break the turn.
             let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
             out.push_str(&format_data(&json!({
                 "type": "tool-call",
-                "toolCallId": if id.is_empty() { format!("call_{name}") } else { id },
+                // The index keeps parallel calls to the SAME tool distinct:
+                // duplicate ids make fx reject the next turn's history.
+                "toolCallId": if id.is_empty() { format!("call_{idx}_{name}") } else { id },
                 "toolName": name,
                 "input": input,
             })));
         }
+        let unified = if self.failed && !emitted_calls {
+            "error"
+        } else {
+            unified_finish(self.finish_reason.as_deref(), emitted_calls)
+        };
         out.push_str(&format_data(&json!({
             "type": "finish",
-            "finishReason": {"unified": unified_finish(self.finish_reason.as_deref())},
+            "finishReason": {"unified": unified},
             "usage": {
                 "inputTokens": {"total": self.input_tokens},
                 "outputTokens": {"total": self.output_tokens},
@@ -457,14 +518,83 @@ mod tests {
 
     #[test]
     fn finish_reasons_stay_in_the_closed_set() {
-        assert_eq!(unified_finish(Some("stop")), "stop");
-        assert_eq!(unified_finish(Some("length")), "length");
-        assert_eq!(unified_finish(Some("content_filter")), "content-filter");
-        assert_eq!(unified_finish(Some("tool_calls")), "tool-calls");
-        assert_eq!(unified_finish(None), "stop");
+        assert_eq!(unified_finish(Some("stop"), false), "stop");
+        assert_eq!(unified_finish(Some("length"), false), "length");
+        assert_eq!(unified_finish(Some("content_filter"), false), "content-filter");
+        assert_eq!(unified_finish(Some("tool_calls"), false), "tool-calls");
+        assert_eq!(unified_finish(None, false), "stop");
         // An unknown upstream value must NOT be passed through: fx aborts the
         // whole stream on an unrecognized unified value.
-        assert_eq!(unified_finish(Some("eos_token")), "other");
+        assert_eq!(unified_finish(Some("eos_token"), false), "other");
+    }
+
+    #[test]
+    fn finish_reason_agrees_with_emitted_tool_calls() {
+        // fx's classifyProviderCompletion rejects stop/other/error WITH tool
+        // calls as an invalid completion and kills the agentic turn. Free
+        // providers really do send tool_calls + finish_reason "stop".
+        assert_eq!(unified_finish(Some("stop"), true), "tool-calls");
+        assert_eq!(unified_finish(Some("eos_token"), true), "tool-calls");
+        assert_eq!(unified_finish(None, true), "tool-calls");
+        // Truncation stays truthful — the turn really was cut short.
+        assert_eq!(unified_finish(Some("length"), true), "length");
+        assert_eq!(unified_finish(Some("content_filter"), true), "content-filter");
+    }
+
+    #[test]
+    fn native_tool_calls_with_stop_reason_finish_as_tool_calls() {
+        let mut st = StreamState::new("m");
+        st.on_data(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Bash","arguments":"{}"}}]}}]}"#,
+        );
+        st.on_data(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
+        let tail = st.finish();
+        assert!(tail.contains("\"unified\":\"tool-calls\""), "{tail}");
+    }
+
+    #[test]
+    fn transport_failure_finishes_as_error_not_stop() {
+        let mut st = StreamState::new("m");
+        st.on_data(r#"{"choices":[{"index":0,"delta":{"content":"partial"}}]}"#);
+        st.fail(); // mid-stream transport death
+        let tail = st.finish();
+        assert!(tail.contains("\"unified\":\"error\""), "truncation must not read as success: {tail}");
+
+        // An in-stream error event marks the same way.
+        let mut st2 = StreamState::new("m");
+        let out = st2.on_data(r#"{"error":{"message":"upstream exploded"}}"#);
+        assert!(out.contains("\"type\":\"error\""));
+        assert!(st2.finish().contains("\"unified\":\"error\""));
+    }
+
+    #[test]
+    fn idless_parallel_calls_to_one_tool_get_distinct_ids() {
+        let mut st = StreamState::new("m");
+        st.on_data(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"name":"Read","arguments":"{\"p\":\"a\"}"}},
+                {"index":1,"function":{"name":"Read","arguments":"{\"p\":\"b\"}"}}]}}]}"#,
+        );
+        let tail = st.finish();
+        // Duplicate toolCallIds make fx reject the NEXT turn's history.
+        assert!(tail.contains("\"toolCallId\":\"call_0_Read\""), "{tail}");
+        assert!(tail.contains("\"toolCallId\":\"call_1_Read\""), "{tail}");
+    }
+
+    #[test]
+    fn response_survives_bodies_without_choices() {
+        // 200-with-no-choices is a real free-provider shape; serde_json's
+        // mut-index would PANIC on it.
+        assert_eq!(response(&json!({"choices": []})), json!({"choices": []}));
+        assert_eq!(response(&json!({})), json!({}));
+        // finish_reason is normalized into fx's legacy closed set.
+        let out = response(&json!({"choices": [{"finish_reason": "eos",
+            "message": {"role": "assistant", "content": "hi"}}]}));
+        assert_eq!(out["choices"][0]["finish_reason"], "other");
+        let out = response(&json!({"choices": [{"finish_reason": "stop", "message":
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+             "function": {"name": "B", "arguments": "{}"}}]}}]}));
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls", "must agree with the calls");
     }
 
     #[test]

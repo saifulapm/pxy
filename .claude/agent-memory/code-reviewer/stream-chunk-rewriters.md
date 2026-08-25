@@ -22,3 +22,13 @@ Two confirmed panic patterns in pxy's per-chunk stream rewriters (both reproduce
 be checked against (a) the `{"choices":[]}` usage chunk and (b) multi-byte
 content at every slice point. Same hand-copy-drift family as
 [[media-mirrors-chat]].
+
+Pattern 1 recurred in the fx round (2026-08-26): `translate/aisdk.rs
+response()` used `out["choices"][0][..].as_array_mut()` — panics on a 200
+body with empty OR missing `choices` (probe-verified: "cannot access index 0
+of JSON null"). It hits NON-streaming passthroughs too, not just chunk
+rewriters. Also check every new dialect's finish-reason mapping in BOTH
+directions: fx/codex-style clients enforce closed sets and
+consistency rules (fx: `stop`/`other` + tool_calls = invalid_completion
+hard error), so a passthrough that skips normalization on the non-streaming
+path is a latent turn-killer even when the streaming path normalizes.
