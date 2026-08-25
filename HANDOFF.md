@@ -87,6 +87,15 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   the account has NO claude-sonnet-5/gpt-5.6 despite OmniRoute's registry listing them.
   Not in `auto` (scarcest free pool). Usage is ESTIMATED (kiro sends no token counts,
   only contextUsagePercentage + a credit figure).
+  - **`amazon-q` deliberately NOT added** (checked 2026-08-25): its archived credential is
+    byte-identical to kiro's — same refresh token, same `profileArn`, so the same AWS
+    account and the SAME 50-credit pool. A second provider entry would add zero quota and
+    would actively break accounting by splitting one pool across two counters. Only worth
+    adding if a genuinely separate AWS account is connected.
+  - Kiro's SOCIAL refresh tokens do **not** rotate (verified: the endpoint returns the
+    presented token unchanged, and the pre-existing one still worked after a refresh).
+    The one-time-use warning in docs/06 applies to the AWS SSO-OIDC builder-id path, not
+    this one — so this credential is durable and shouldn't need re-login.
 - `kimi-coding` — Moonshot Kimi coding tier (added 2026-08-25, **Phase 3 #2**, real Rust:
   `providers/kimi.rs`). Rotating refresh tokens (serialized, persisted to kv BEFORE use —
   losing one kills the session), 900s access tokens, X-Msh-* device identity, Anthropic
