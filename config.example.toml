@@ -448,6 +448,12 @@ headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
 models = [
   { id = "claude-opus-5", context_length = 200000, max_output_tokens = 64000 },
   { id = "claude-opus-4-8", context_length = 200000, max_output_tokens = 64000 },
+  # Their Anthropic route rejects deepseek-v4f unless stream=true;
+  # force_stream = true streams upstream regardless of what the client asked
+  # for and re-assembles the JSON response. Verified live 2026-08-25 on both
+  # wire formats (as of the same day agentrouter has no deepseek-v4f channel
+  # on EITHER route — upstream churn, retry later).
+  { id = "deepseek-v4f", context_length = 128000, force_stream = true },
 ]
 
 # gpt-5.6-sol is OpenAI-endpoint-only; deepseek-v4f also lives here because

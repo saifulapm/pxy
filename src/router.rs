@@ -239,7 +239,17 @@ async fn try_candidate(
     if upstream_format != WireFormat::Kiro {
         body["model"] = json!(cand.model.id);
     }
-    if stream && upstream_format == WireFormat::Openai && body.get("stream_options").is_none() {
+    // force_stream: the upstream misbehaves without `stream: true` on this
+    // model, so stream upstream regardless and re-assemble JSON for a
+    // non-streaming client. (Kiro always streams; nothing to force.)
+    let force_stream = !stream && cand.model.force_stream && upstream_format != WireFormat::Kiro;
+    if force_stream {
+        body["stream"] = json!(true);
+    }
+    if (stream || force_stream)
+        && upstream_format == WireFormat::Openai
+        && body.get("stream_options").is_none()
+    {
         // Ask OpenAI upstreams to report usage in the final chunk.
         body["stream_options"] = json!({"include_usage": true});
     }
@@ -349,9 +359,27 @@ async fn try_candidate(
             provider: Some(cand.full_id()),
         })
     } else {
-        let mut upstream_body: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => return AttemptResult::Skip(format!("bad upstream json: {e}")),
+        let mut upstream_body: Value = if force_stream {
+            // Collect the whole upstream stream, then re-assemble the JSON
+            // response the client actually asked for.
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => return AttemptResult::Skip(format!("stream read: {e}")),
+            };
+            let mut parser = SseParser::new();
+            let mut events = parser.feed(&bytes);
+            // Flush a final event the upstream didn't terminate with \n\n.
+            events.extend(parser.feed(b"\n\n"));
+            match upstream_format {
+                WireFormat::Openai => crate::translate::aggregate::openai(&events),
+                WireFormat::Anthropic => crate::translate::aggregate::anthropic(&events),
+                WireFormat::Kiro => unreachable!("kiro handled above"),
+            }
+        } else {
+            match resp.json().await {
+                Ok(v) => v,
+                Err(e) => return AttemptResult::Skip(format!("bad upstream json: {e}")),
+            }
         };
         if provider_cfg.parse_think_tags && upstream_format == WireFormat::Openai {
             extract_think_from_response(&mut upstream_body);

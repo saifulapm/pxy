@@ -125,11 +125,26 @@ impl Config {
     /// hand-curated (credentials, limits, headers, quirks) can be clobbered.
     /// A generated block for an unknown provider is ignored rather than
     /// creating a half-configured provider with no credentials.
+    ///
+    /// The generated list decides WHICH models exist; for a model the
+    /// hand-written config also lists, the hand-written spec wins wholesale.
+    /// generated.toml only carries id/context/tool_call, so taking its entry
+    /// for a curated model silently dropped max_output_tokens, per-model
+    /// format overrides, and pinned context lengths (groq's 8192).
     fn apply_generated(&mut self, generated: Generated) {
         for (name, g) in generated.providers {
             if let Some(p) = self.providers.get_mut(&name) {
                 if !g.models.is_empty() {
-                    p.models = g.models;
+                    let curated: BTreeMap<String, ModelEntry> = p
+                        .models
+                        .iter()
+                        .map(|m| (m.spec().id, m.clone()))
+                        .collect();
+                    p.models = g
+                        .models
+                        .into_iter()
+                        .map(|m| curated.get(&m.spec().id).cloned().unwrap_or(m))
+                        .collect();
                 }
             }
         }
@@ -333,6 +348,53 @@ impl ProviderConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_preserves_curated_model_specs() {
+        let mut cfg_provider = ProviderConfig::test_default();
+        cfg_provider.models = vec![ModelEntry::Full(ModelSpec {
+            id: "m1".into(),
+            name: None,
+            context_length: 8192, // pinned by hand (groq-style)
+            max_output_tokens: 64000,
+            format: Some(WireFormat::Anthropic),
+            tool_call: Some(true),
+            force_stream: true,
+        })];
+        let mut cfg = Config {
+            server: ServerConfig { port: 1, api_key: "k".into() },
+            providers: BTreeMap::from([("p".to_string(), cfg_provider)]),
+            auto: AutoConfig::default(),
+            launch: LaunchConfig::default(),
+            preferences: Preferences::default(),
+        };
+        let generated: Generated = toml::from_str(
+            r#"
+            [providers.p]
+            models = [
+              { id = "m1", context_length = 131072 },
+              { id = "m2", context_length = 32768 },
+            ]
+            "#,
+        )
+        .unwrap();
+        cfg.apply_generated(generated);
+        let models: Vec<ModelSpec> =
+            cfg.providers["p"].models.iter().map(|m| m.spec()).collect();
+        // Curated spec wins wholesale for m1…
+        assert_eq!(models[0].context_length, 8192);
+        assert_eq!(models[0].max_output_tokens, 64000);
+        assert_eq!(models[0].format, Some(WireFormat::Anthropic));
+        assert!(models[0].force_stream);
+        // …and discovered m2 still comes through.
+        assert_eq!(models[1].id, "m2");
+        assert_eq!(models[1].context_length, 32768);
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -381,6 +443,12 @@ pub struct ModelSpec {
     /// some models (Z.AI allows one concurrent request, so a refresh sweep
     /// gets 429s and would exclude a model that works).
     pub tool_call: Option<bool>,
+    /// Always request streaming upstream, even for a non-streaming client
+    /// call; pxy collects the stream and returns ordinary JSON. For upstreams
+    /// that error or time out without `stream: true` on some models
+    /// (agentrouter's deepseek-v4f on its Anthropic route).
+    #[serde(default)]
+    pub force_stream: bool,
 }
 
 pub fn default_context() -> u64 {
@@ -400,6 +468,7 @@ impl ModelEntry {
                 max_output_tokens: default_max_output(),
                 format: None,
                 tool_call: None,
+                force_stream: false,
             },
             ModelEntry::Full(s) => s.clone(),
         }
