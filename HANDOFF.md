@@ -220,10 +220,23 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    rotation-safe refresh persisted to kv, X-Msh-* identity profile, Anthropic endpoint.
    The archived refresh token was dead; re-logged-in via curl device flow. ⚠️ Account
    credits currently EXHAUSTED — Kimi masks this as bare 500s on chat/models; auth verified,
-   retest for quota reset before adding k3 to [auto]) → antigravity/agy
-   (Google auth-code + Cloud Code envelope) → kiro/amazon-q (AWS eventstream binary parser).
-   Credentials are archived in `pass`, but expect the kiro/antigravity refresh tokens to
-   need re-login too (the kimi one had rotated dead).
+   retest for quota reset before adding k3 to [auto]) → ~~antigravity/agy~~
+   (**DEAD — verified 2026-08-25, do not build**). **Phase 3 is COMPLETE.**
+
+   **antigravity/agy — dead, no code written.** Both archived credentials
+   (`AI/antigravity/saifulapm@gmail.com`, `AI/agy/…`, same project `avid-rex-p83hx`, both
+   labelled "Antigravity Starter Quota" / free-tier) still REFRESH fine — Google refresh
+   tokens don't rotate, so auth was never the problem. The account has simply lost access:
+   - `POST cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` now lists `free-tier`
+     under **ineligibleTiers** with `UNSUPPORTED_CLIENT`: *"This client is no longer
+     supported for Gemini Code Assist for individuals. To continue using Gemini, please
+     migrate to the Antigravity suite of products."* Only paid `standard-tier` is allowed.
+   - `POST …:streamGenerateContent?alt=sse` → **403 SUBSCRIPTION_REQUIRED** ("You do not
+     have a valid license of this product") on BOTH the `ide` and `cli` profiles.
+   Google retired this OAuth client's free path, so the Cloud Code envelope translator
+   (the last hard piece of work in Phase 3) would buy nothing. Re-verify with those two
+   calls BEFORE writing any code if Antigravity ships a new client/API. Free Gemini is
+   already covered by the `google` (AI Studio) provider in `auto`.
 4. **Nice-to-haves identified but not built**:
    - Read upstream quota headers (`X-Quota-5h/Week/Month` on openadapter, Copilot's, etc.) and
      cool a provider down when it self-reports exhaustion.
