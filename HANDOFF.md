@@ -73,6 +73,13 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
   the 0x-multiplier model: unlimited, never consumes premium requests.
+  Live quota in `pxy status --remote` via `GET api.github.com/copilot_internal/user`
+  (needs the LONG-LIVED GitHub token, `token <gh>` — not the minted Copilot bearer).
+  ⚠️ pxy's local 300-counter only sees pxy traffic — GitHub's number is authoritative
+  (2026-08-25: GitHub said 89 used vs pxy's 14, the rest was VS Code / pre-pxy).
+  ⚠️ `overage_permitted: true` on the account — premium requests past 300 BILL
+  ($0.04 each); the status line flags it. Disable in github.com → Settings → Copilot
+  if surprise billing is unwanted.
 - `opencode-go-github` + `opencode-go-google` — $10/mo Go plan per account; usage-dollar
   limits $12/5h (rolling), $30/wk, $60/mo, enforced upstream (429 → pxy cooldown +
   account rotation; pxy does no dollar accounting itself). Live utilization:

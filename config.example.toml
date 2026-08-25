@@ -115,6 +115,10 @@ small_model = "github-free/gpt-5-mini"
 tier = "subscription"
 kind = "github-copilot"
 format = "openai"
+# Premium-request quota for `pxy status --remote` (github-free shares the
+# account, so it is declared once here). The fetcher uses the long-lived
+# GitHub token, not the minted Copilot one — the URL is fixed in code.
+balance_url = "https://api.github.com/copilot_internal/user"
 credentials = { pass = "AI/github/main" }
 models = [
   { id = "claude-sonnet-4.6", context_length = 200000, max_output_tokens = 64000 },

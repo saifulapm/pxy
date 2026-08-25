@@ -15,6 +15,7 @@ use crate::state::State;
 use super::PreparedRequest;
 
 const TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const USER_URL: &str = "https://api.github.com/copilot_internal/user";
 const DEFAULT_CHAT_URL: &str = "https://api.githubcopilot.com/chat/completions";
 const EDITOR_VERSION: &str = "vscode/1.126.0";
 const CHAT_PLUGIN_VERSION: &str = "copilot-chat/0.54.0";
@@ -57,6 +58,41 @@ pub async fn prepare(
         .clone()
         .unwrap_or_else(|| DEFAULT_CHAT_URL.to_string());
     Ok(PreparedRequest { url, headers, body_patch: None })
+}
+
+/// Quota snapshots for `pxy status --remote`. copilot_internal/user requires
+/// the LONG-LIVED GitHub token (`token <gh>`), not the minted Copilot bearer —
+/// which is why the generic balance_url fetcher can't serve this provider.
+pub async fn fetch_quota(
+    name: &str,
+    cfg: &ProviderConfig,
+    secrets: &Secrets,
+    http: &reqwest::Client,
+) -> Result<Value> {
+    let cred_ref = cfg
+        .credentials
+        .as_ref()
+        .or(cfg.api_key.as_ref())
+        .with_context(|| format!("provider {name}: credentials required"))?;
+    let blob = secrets.resolve(cred_ref)?;
+    let gh_token = github_access_token(&blob)?;
+    let resp = http
+        .get(USER_URL)
+        .header("authorization", format!("token {gh_token}"))
+        .header("accept", "application/json")
+        .header("x-github-api-version", API_VERSION)
+        .header("user-agent", CHAT_USER_AGENT)
+        .header("editor-version", EDITOR_VERSION)
+        .header("editor-plugin-version", CHAT_PLUGIN_VERSION)
+        .send()
+        .await
+        .context("copilot quota request")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("copilot quota fetch failed ({status})");
+    }
+    serde_json::from_str(&body).context("copilot quota response")
 }
 
 async fn current_token(

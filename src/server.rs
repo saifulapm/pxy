@@ -390,6 +390,34 @@ async fn fetch_balance(
     state: &PxyState,
     http: &reqwest::Client,
 ) -> String {
+    // Copilot's quota endpoint wants the long-lived GitHub token, not the
+    // minted Copilot bearer the generic prepare() path would send.
+    if p.kind == crate::config::ProviderKind::GithubCopilot {
+        return match crate::providers::copilot::fetch_quota(name, p, secrets, http).await {
+            Ok(v) => {
+                let prem = &v["quota_snapshots"]["premium_interactions"];
+                if !prem.is_object() {
+                    return format!(
+                        "no premium quota (plan: {})",
+                        v["copilot_plan"].as_str().unwrap_or("?")
+                    );
+                }
+                format!(
+                    "premium {:.1}/{} left ({:.0}%) · resets {}{}",
+                    prem["quota_remaining"].as_f64().unwrap_or(0.0),
+                    prem["entitlement"].as_u64().unwrap_or(0),
+                    prem["percent_remaining"].as_f64().unwrap_or(0.0),
+                    v["quota_reset_date"].as_str().unwrap_or("?"),
+                    if prem["overage_permitted"].as_bool().unwrap_or(false) {
+                        " · ⚠ overage billing ON"
+                    } else {
+                        ""
+                    },
+                )
+            }
+            Err(e) => format!("{e:#}"),
+        };
+    }
     let prepared = match crate::providers::prepare(name, p, secrets, state, http).await {
         Ok(pr) => pr,
         Err(e) => return format!("credential error: {e:#}"),
