@@ -357,6 +357,11 @@ pub struct ProviderConfig {
     /// reasoning (for models like MiniMax/Qwen that inline CoT as text)
     #[serde(default)]
     pub parse_think_tags: bool,
+    /// Top-level request-body keys this upstream 400s on (e.g.
+    /// `reasoning_effort`, `top_k`, `stream_options`); removed after
+    /// translation, just before the wire. Per-model `drop_params` adds to it.
+    #[serde(default)]
+    pub drop_params: Vec<String>,
 
     // ---- `pxy refresh` (discovery) ----
     /// Include this provider in catalog discovery. Default ON: an opt-in
@@ -480,6 +485,7 @@ impl ProviderConfig {
             enabled: true,
             timeout_secs: default_timeout(),
             parse_think_tags: false,
+            drop_params: Vec::new(),
             discover: true,
             models_url: None,
             id_field: None,
@@ -506,6 +512,7 @@ mod tests {
             format: Some(WireFormat::Anthropic),
             tool_call: Some(true),
             force_stream: true,
+            drop_params: Vec::new(),
         })];
         let mut cfg = Config {
             server: ServerConfig { port: 1, api_key: "k".into() },
@@ -597,6 +604,11 @@ pub struct ModelSpec {
     /// (agentrouter's deepseek-v4f on its Anthropic route).
     #[serde(default)]
     pub force_stream: bool,
+    /// Top-level request-body keys THIS model's upstream 400s on; removed
+    /// after translation, just before the wire. Adds to the provider-level
+    /// list.
+    #[serde(default)]
+    pub drop_params: Vec<String>,
 }
 
 pub fn default_context() -> u64 {
@@ -617,6 +629,7 @@ impl ModelEntry {
                 format: None,
                 tool_call: None,
                 force_stream: false,
+                drop_params: Vec::new(),
             },
             ModelEntry::Full(s) => s.clone(),
         }

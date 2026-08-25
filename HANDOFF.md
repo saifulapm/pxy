@@ -110,9 +110,21 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 95 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
+- 97 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
   tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
-  fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover).
+  fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
+  cooldown persistence, drop_params).
+- **Cooldowns persist across restarts (added 2026-08-25)**: the in-memory map stays
+  authoritative at runtime, but every set/clear is mirrored to a sqlite `cooldowns`
+  table; `State::open` prunes expired rows and rehydrates the rest (remaining wait,
+  level, retryable flag). A deploy mid-day no longer re-probes providers sitting on a
+  six-hour quota cooldown. Media/search keys (`p#media`, `search#name`) ride along.
+- **`drop_params` (added 2026-08-25)**: per-provider and/or per-model list of top-level
+  request-body keys the upstream 400s on (`reasoning_effort`, `top_k`, …), removed after
+  translation just before the wire — a picky new free provider needs config, not code.
+  `model`/`stream` are pxy's own keys and are ignored if listed; kiro's body_patch
+  merges later and can't be stripped. Curated `drop_params` survives the generated
+  overlay like tool_call/force_stream.
 
 ## Provider catalog (30 active)
 

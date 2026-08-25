@@ -307,6 +307,24 @@ async fn try_candidate(
         body["stream_options"] = json!({"include_usage": true});
     }
 
+    // Keys this upstream 400s on, dropped LAST so they win over anything the
+    // translation or the stream_options default put in the body. `model` and
+    // `stream` are pxy's own routing keys — dropping them wouldn't disable a
+    // param, it would corrupt the request pxy itself built, so they're
+    // ignored here. (A provider body_patch — kiro's profileArn — merges
+    // later and also can't be stripped.)
+    if (!provider_cfg.drop_params.is_empty() || !cand.model.drop_params.is_empty())
+        && let Some(obj) = body.as_object_mut()
+    {
+        for key in provider_cfg.drop_params.iter().chain(&cand.model.drop_params) {
+            if key == "model" || key == "stream" {
+                warn!(candidate = %cand.full_id(), key, "drop_params ignores pxy's own key");
+                continue;
+            }
+            obj.remove(key);
+        }
+    }
+
     let prepared = match crate::providers::prepare(
         &cand.provider,
         provider_cfg,
@@ -1485,6 +1503,55 @@ mod tests {
         }
         assert_eq!(seen.load(Ordering::SeqCst), 1, "a dead key must not be re-fired");
         assert!(started.elapsed() < Duration::from_millis(500), "must fail fast, not back off");
+    }
+
+    #[tokio::test]
+    async fn drop_params_stripped_before_the_wire() {
+        use std::sync::Mutex;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    axum::Json(json!({
+                        "id": "x",
+                        "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }))
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.g]
+                base_url = "{base}/c"
+                drop_params = ["reasoning_effort"]
+                models = [{{ id = "m", drop_params = ["top_k"] }}]
+                "#
+            ),
+            "drop_params",
+        );
+
+        let payload = json!({"model": "g/m", "reasoning_effort": "high", "top_k": 40,
+            "temperature": 0.5, "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => assert_eq!(status, 200, "got {body}"),
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        let body = seen.lock().unwrap().take().expect("upstream was called");
+        assert!(body.get("reasoning_effort").is_none(), "provider-level drop must strip");
+        assert!(body.get("top_k").is_none(), "model-level drop must strip");
+        assert_eq!(body["temperature"], 0.5, "unlisted params must survive");
     }
 
     #[tokio::test]

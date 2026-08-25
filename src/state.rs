@@ -8,9 +8,13 @@ use rusqlite::Connection;
 
 /// Persistent + in-memory runtime state.
 ///
-/// sqlite holds usage counters (surviving restarts) and small KV (minted
-/// copilot tokens). Cooldowns and rpm windows are in-memory: they are
-/// short-lived by design (lazy expiry on read, no background timers).
+/// sqlite holds usage counters (surviving restarts), small KV (minted
+/// copilot tokens), and a mirror of the cooldown map — a restart must not
+/// forget a six-hour "monthly quota exhausted" cooldown and re-probe every
+/// dead provider (deploys happen mid-day). The map stays authoritative at
+/// runtime (lazy expiry on read, no background timers); sqlite is only read
+/// at startup. rpm windows are memory-only: a 60s window never outlives a
+/// restart meaningfully.
 pub struct State {
     db: Mutex<Connection>,
     cooldowns: Mutex<HashMap<String, Cooldown>>,
@@ -66,11 +70,51 @@ impl State {
             CREATE TABLE IF NOT EXISTS kv (
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cooldowns (
+                key TEXT PRIMARY KEY,
+                until_ms INTEGER NOT NULL,
+                level INTEGER NOT NULL,
+                retryable INTEGER NOT NULL,
+                reason TEXT NOT NULL
             );",
         )?;
+
+        // Rehydrate cooldowns that outlived the restart; drop the expired
+        // ones (their escalation level restarting at zero is acceptable).
+        let now = epoch_ms();
+        db.execute("DELETE FROM cooldowns WHERE until_ms <= ?1", [now as i64])?;
+        let mut cooldowns = HashMap::new();
+        {
+            let mut stmt =
+                db.prepare("SELECT key, until_ms, level, retryable, reason FROM cooldowns")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (key, until_ms, level, retryable, reason) = row?;
+                let remaining = Duration::from_millis((until_ms as u64).saturating_sub(now));
+                cooldowns.insert(
+                    key,
+                    Cooldown {
+                        until: Instant::now() + remaining,
+                        level: level as u32,
+                        retryable: retryable != 0,
+                        reason,
+                    },
+                );
+            }
+        }
+
         Ok(Self {
             db: Mutex::new(db),
-            cooldowns: Mutex::new(HashMap::new()),
+            cooldowns: Mutex::new(cooldowns),
             rpm: Mutex::new(HashMap::new()),
         })
     }
@@ -228,9 +272,27 @@ impl State {
             }
         };
         map.insert(
-            key,
+            key.clone(),
             Cooldown { until: Instant::now() + dur, level, retryable, reason: reason.to_string() },
         );
+        drop(map); // never hold two locks
+
+        // Mirror to sqlite so restarts don't forget it. Best-effort: a write
+        // failure must never block routing.
+        let until_ms = epoch_ms() + dur.as_millis() as u64;
+        let db = self.db.lock().unwrap();
+        if let Err(e) = db.execute(
+            "INSERT INTO cooldowns (key, until_ms, level, retryable, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(key) DO UPDATE SET
+               until_ms = excluded.until_ms,
+               level = excluded.level,
+               retryable = excluded.retryable,
+               reason = excluded.reason",
+            rusqlite::params![key, until_ms as i64, level as i64, retryable as i64, reason],
+        ) {
+            tracing::warn!(key, error = %e, "persisting cooldown failed");
+        }
     }
 
     /// How long until this (provider, model) pair could become eligible again,
@@ -258,9 +320,18 @@ impl State {
 
     /// Success clears both scopes for this model.
     pub fn clear_cooldown(&self, provider: &str, model: &str) {
+        let model_key = Self::cooldown_key(provider, Some(model));
         let mut map = self.cooldowns.lock().unwrap();
         map.remove(provider);
-        map.remove(&Self::cooldown_key(provider, Some(model)));
+        map.remove(&model_key);
+        drop(map);
+        let db = self.db.lock().unwrap();
+        if let Err(e) = db.execute(
+            "DELETE FROM cooldowns WHERE key IN (?1, ?2)",
+            rusqlite::params![provider, model_key],
+        ) {
+            tracing::warn!(provider, error = %e, "clearing persisted cooldown failed");
+        }
     }
 
     // ---- rpm sliding window ----
@@ -351,6 +422,42 @@ mod tests {
         s.set_cooldown("p", Some("m"), None, true, "429");
         s.clear_cooldown("p", "m");
         assert!(s.cooldown("p", "m").is_none());
+    }
+
+    #[test]
+    fn cooldowns_survive_restart() {
+        let dir = std::env::temp_dir().join(format!("pxy-test-{}-persist", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("s.sqlite");
+
+        let s = State::open(&path).unwrap();
+        s.set_cooldown("p", None, Some(Duration::from_secs(3600)), false, "monthly quota");
+        s.set_cooldown("p", Some("m"), Some(Duration::from_millis(1)), true, "blip");
+        drop(s);
+
+        std::thread::sleep(Duration::from_millis(20));
+        let s2 = State::open(&path).unwrap();
+        let cd = s2.cooldown("p", "any").expect("hour-long cooldown must survive restart");
+        assert_eq!(cd.reason, "monthly quota");
+        assert!(!cd.retryable, "retryability must survive too");
+        let remaining = cd.until.saturating_duration_since(Instant::now());
+        assert!(remaining > Duration::from_secs(3500), "remaining wait preserved: {remaining:?}");
+
+        // The prune at open really deleted the expired "p/m" row (lazy expiry
+        // would mask an unpruned row from cooldown(), so check the table).
+        let raw = Connection::open(&path).unwrap();
+        let count = |key: &str| -> i64 {
+            raw.query_row("SELECT COUNT(*) FROM cooldowns WHERE key = ?1", [key], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("p/m"), 0, "expired row must be pruned at open");
+        assert_eq!(count("p"), 1, "live row must survive the prune");
+
+        // clear_cooldown removes the persisted rows as well.
+        s2.clear_cooldown("p", "m");
+        drop(s2);
+        let s3 = State::open(&path).unwrap();
+        assert!(s3.cooldown("p", "any").is_none(), "cleared cooldown must stay cleared");
     }
 
     #[test]
