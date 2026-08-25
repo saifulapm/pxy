@@ -89,7 +89,7 @@ pub async fn handle_chat(
             continue;
         }
 
-        match try_candidate(&app, cand, client_format, &payload, stream, input_estimate, &ctx)
+        match try_candidate(&app, cand, client_format, &payload, stream, input_estimate, &ctx, multi)
             .await
         {
             AttemptResult::Done(outcome) => return outcome,
@@ -208,6 +208,7 @@ async fn try_candidate(
     stream: bool,
     input_estimate: u64,
     ctx: &ClientContext,
+    multi: bool,
 ) -> AttemptResult {
     let provider_cfg = app.cfg.providers.get(&cand.provider).unwrap();
     let upstream_format = cand.format(provider_cfg);
@@ -282,7 +283,7 @@ async fn try_candidate(
     if status >= 400 {
         let retry_after = parse_retry_after(resp.headers());
         let err_body = resp.text().await.unwrap_or_default();
-        return classify_error(app, cand, client_format, status, retry_after, err_body);
+        return classify_error(app, cand, client_format, status, retry_after, err_body, multi);
     }
 
     // Success: count the request now; tokens follow when usage is known.
@@ -334,6 +335,11 @@ async fn try_candidate(
 /// retryable (408/409/429/5xx) and auth (401/403) -> skip candidate;
 /// everything else 4xx -> fatal, pass upstream error through unmodified
 /// (Claude Code's auto-retry needs the raw body).
+///
+/// Exception: on a multi-candidate walk (`auto`), a 404 also skips. Free
+/// model lists churn, and one delisted id must not kill the whole chain
+/// (zenmux delisting glm-5.3-free took `auto` down, 2026-08-25). On a
+/// single-candidate request the 404 still passes through raw.
 fn classify_error(
     app: &App,
     cand: &Candidate,
@@ -341,14 +347,18 @@ fn classify_error(
     status: u16,
     retry_after: Option<Duration>,
     err_body: String,
+    multi: bool,
 ) -> AttemptResult {
     // 402 included: aggregators (ZenMux, OpenRouter, DeepSeek) use it for
     // exhausted quota/credits — an account problem, not a request problem.
-    let skip = matches!(status, 401 | 402 | 403 | 408 | 409 | 429) || status >= 500;
+    let skip = matches!(status, 401 | 402 | 403 | 408 | 409 | 429)
+        || status >= 500
+        || (multi && status == 404);
     if skip {
         let reason = match status {
             401 | 403 => "auth error",
             402 => "quota/credits exhausted",
+            404 => "model not found upstream",
             429 => "rate limited",
             _ => "upstream error",
         };
