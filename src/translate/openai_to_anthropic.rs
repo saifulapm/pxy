@@ -322,9 +322,8 @@ impl StreamState {
                 if let Some(id) = payload["message"]["id"].as_str() {
                     self.message_id = id.to_string();
                 }
-                self.usage.input = payload["message"]["usage"]["input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0);
+                self.usage.input =
+                    TokenUsage::from_anthropic(&payload["message"]["usage"]).input;
                 self.chunk(json!({"role": "assistant", "content": ""}), None)
             }
             "content_block_start" => {

@@ -268,27 +268,31 @@ async fn try_candidate(
 
     // Build the upstream body.
     let mut body = match (client_format, upstream_format) {
-        (ClientFormat::Openai, WireFormat::Openai)
-        | (ClientFormat::Anthropic, WireFormat::Anthropic) => payload.clone(),
+        (ClientFormat::Openai, WireFormat::Openai) => payload.clone(),
+        (ClientFormat::Anthropic, WireFormat::Anthropic) => payload.clone(),
         (ClientFormat::Anthropic, WireFormat::Openai) => anthropic_to_openai::request(payload),
         (ClientFormat::Openai, WireFormat::Anthropic) => {
             openai_to_anthropic::request(payload, cand.model.max_output_tokens)
         }
         // Kiro takes neither dialect: normalize to Anthropic first (reusing
         // the existing translator), then build conversationState from it.
-        (ClientFormat::Anthropic, WireFormat::Kiro) => kiro::request(
-            payload,
-            &cand.model.id,
-            "",
-            &now_iso8601(),
-        ),
-        (ClientFormat::Openai, WireFormat::Kiro) => kiro::request(
-            &openai_to_anthropic::request(payload, cand.model.max_output_tokens),
-            &cand.model.id,
-            "",
-            &now_iso8601(),
-        ),
+        (ClientFormat::Anthropic, WireFormat::Kiro) => {
+            let mut a = payload.clone();
+            crate::translate::anthropic_sanitize::sanitize(&mut a);
+            kiro::request(&a, &cand.model.id, "", &now_iso8601())
+        }
+        (ClientFormat::Openai, WireFormat::Kiro) => {
+            let mut a = openai_to_anthropic::request(payload, cand.model.max_output_tokens);
+            crate::translate::anthropic_sanitize::sanitize(&mut a);
+            kiro::request(&a, &cand.model.id, "", &now_iso8601())
+        }
     };
+    // Anthropic validates history strictly (thinking signatures, tool
+    // pairing, empty blocks) and the passthrough path replays whatever the
+    // client accumulated — repair it at the one choke point.
+    if upstream_format == WireFormat::Anthropic {
+        crate::translate::anthropic_sanitize::sanitize(&mut body);
+    }
     if upstream_format != WireFormat::Kiro {
         body["model"] = json!(cand.model.id);
     }
@@ -846,7 +850,7 @@ impl StreamCtx {
                         match v["type"].as_str() {
                             Some("message_start") => {
                                 usage.input =
-                                    v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                                    TokenUsage::from_anthropic(&v["message"]["usage"]).input;
                             }
                             Some("message_delta") => {
                                 if let Some(o) = v["usage"]["output_tokens"].as_u64() {

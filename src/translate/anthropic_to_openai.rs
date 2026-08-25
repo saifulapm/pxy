@@ -289,7 +289,10 @@ pub fn response(openai: &Value, model: &str) -> Value {
 
     if let Some(reason) = message["reasoning_content"].as_str() {
         if !reason.is_empty() {
-            content.push(json!({"type": "thinking", "thinking": reason, "signature": ""}));
+            // No signature field: a fabricated `signature: ""` gets stored in
+            // client history and poisons every later replay to a real
+            // Anthropic upstream (400 invalid signature, forever).
+            content.push(json!({"type": "thinking", "thinking": reason}));
         }
     }
     if let Some(text) = message["content"].as_str() {
@@ -442,7 +445,8 @@ impl StreamState {
                 let idx = self.next_block;
                 self.next_block += 1;
                 let block = if kind == 1 {
-                    json!({"type": "thinking", "thinking": "", "signature": ""})
+                    // No fabricated signature — see the non-streaming path.
+                    json!({"type": "thinking", "thinking": ""})
                 } else {
                     json!({"type": "text", "text": ""})
                 };
