@@ -67,6 +67,37 @@ models = [
   "github-free/gpt-5-mini",                        # 0x multiplier, unlimited floor
 ]
 
+# ---------------------------------------------------------------------------
+# Model quality ranking for `pxy refresh --write`. Bare model names, best
+# first, no provider. Ordering applies WITHIN a cost tier: a preferred model
+# on a paid pool still sits below the free tier, so this list can never
+# quietly start spending money.
+# ---------------------------------------------------------------------------
+[preferences]
+models = [
+  "ox-alpha",             # frontier agentic coder, 1M ctx
+  "hy3",                  # Hunyuan 3, 295B reasoning
+  "kimi-k3",              # 1M ctx
+  "glm-5.3",
+  "minimax-m3",           # 1M ctx
+  "gemini-3.7-flash",     # widest context of the Gemini line
+  "gemini-3-flash",
+  "deepseek-v4-flash-vision-exp",
+  "nemotron-3-ultra-550b-a55b",
+  "glm-4.7-flash",        # 59.2 SWE-bench; note z.ai does not list it
+  "devstral",
+  "mercury-2",
+]
+max_pools_per_model = 3
+max_unranked = 12          # resilience tail below the ranked models
+# Listed by a provider but verified not to work — never let discovery re-add
+# these (checked 2026-08-25).
+deny = [
+  "kilo-auto/free",        # kilocode's router id errors on every call
+  "openrouter/free",       # same shape, same problem
+  "gpt-5.5-free",          # aihubmix lists it; it never routes
+]
+
 [launch]
 model = "auto"
 small_model = "github-free/gpt-5-mini"
@@ -81,6 +112,7 @@ small_model = "github-free/gpt-5-mini"
 # (haiku slightly overcounted). Context lengths from the live /models API
 # (max_prompt_tokens governs what fits).
 [providers.github]
+tier = "subscription"
 kind = "github-copilot"
 format = "openai"
 credentials = { pass = "AI/github/main" }
@@ -99,6 +131,7 @@ reset_tz = "UTC"
 # after the 300 premium requests are spent. Separate provider so their heavy
 # background use never eats the premium budget in pxy's accounting.
 [providers.github-free]
+tier = "subscription"
 kind = "github-copilot"
 format = "openai"
 credentials = { pass = "AI/github/main" }
@@ -119,6 +152,7 @@ models = [
 # base URL. Note: pxy's total_tokens guard is per-provider; Tencent enforces
 # quotas per-model.
 [providers.tencent]
+tier = "finite"
 base_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions"
 embeddings_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/embeddings"
 api_key = { pass = "AI/tencent/main" }
@@ -224,6 +258,7 @@ models = [
 # Account id from the old OmniRoute db (provider_connections). Tool calling
 # verified on all included models 2026-08-25.
 [providers.cloudflare]
+tier = "reserve"
 base_url = "https://api.cloudflare.com/client/v4/accounts/0a937759fca2672765c005345aebe060/ai/v1/chat/completions"
 api_key = { pass = "AI/cloudflare-ai/main" }
 # Discovery: the OpenAI-compat path has no /models, and in the real listing
@@ -245,6 +280,7 @@ daily_tokens = 50000
 # The *-free models cost nothing (limited time; NVIDIA ones are trial-only —
 # don't send personal data; muse-spark trains on prompts).
 [providers.opencode-zen]
+tier = "subscription"
 base_url = "https://opencode.ai/zen/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/github" }
 models = [
@@ -263,6 +299,7 @@ models = [
 # upstream — $12 per 5h window, $30/week, $60/month. Two accounts; pxy's
 # 429+Retry-After cooldown rotates between them automatically.
 [providers.opencode-go-github]
+tier = "subscription"
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/github" }
 models = [
@@ -283,6 +320,7 @@ models = [
 ]
 
 [providers.opencode-go-google]
+tier = "subscription"
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/google" }
 models = [
@@ -354,6 +392,7 @@ rpm = 30
 # deepseek) are paid — deliberately not listed here. The china account is
 # not activated (AccessDenied.Unpurchased) — parked.
 [providers.alibaba]
+tier = "finite"
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 embeddings_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings"
 api_key = { pass = "AI/alibaba/global" }
@@ -373,6 +412,7 @@ total_tokens = 5000000        # 5 chat models x 1M free quota (90-day expiry!)
 # money. Cheap picks: gpt-oss-120b $0.15/$0.60 per M, deepseek-v4-flash
 # $0.14/$0.28. Fully-qualified model ids required.
 [providers.fireworks]
+tier = "reserve"
 base_url = "https://api.fireworks.ai/inference/v1/chat/completions"
 embeddings_url = "https://api.fireworks.ai/inference/v1/embeddings"
 api_key = { pass = "AI/fireworks/main" }
@@ -393,6 +433,7 @@ rpm = 10
 # is the minimal passing fingerprint (probed 2026-08-24). PAID balance
 # (prepaid credits) — kept OUT of [auto]; premium manual-use reserve.
 [providers.agentrouter]
+tier = "reserve"
 format = "anthropic"
 base_url = "https://agentrouter.org/v1/messages"
 auth_header = "x-api-key"
@@ -406,6 +447,7 @@ models = [
 # gpt-5.6-sol is OpenAI-endpoint-only; deepseek-v4f also lives here because
 # agentrouter's Anthropic route rejects it unless stream=true (probed).
 [providers.agentrouter-openai]
+tier = "reserve"
 base_url = "https://agentrouter.org/v1/chat/completions"
 api_key = { pass = "AI/agentrouter/main" }
 headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
@@ -422,6 +464,7 @@ models = [
 # returns dummy limits, so no remote balance readout. PAID balance — kept OUT
 # of [auto]; premium manual-use reserve.
 [providers.tabitoken]
+tier = "reserve"
 format = "anthropic"
 base_url = "https://tabitoken.com/v1/messages"
 auth_header = "x-api-key"
@@ -438,6 +481,7 @@ models = [
 # injection, `kiro_credits` leak). $70 referral credits (2026-08-25). Same
 # caveats apply. PAID balance — kept OUT of [auto]; premium manual-use reserve.
 [providers.gorouter]
+tier = "reserve"
 format = "anthropic"
 base_url = "https://gorouter.app/v1/messages"
 auth_header = "x-api-key"
@@ -455,6 +499,7 @@ models = [
 # headers; concurrency probing showed sporadic 503s, so keep rpm modest and
 # rely on failover. total_usage on this account is $0 — free models only here.
 [providers.tokenrouter]
+tier = "finite"
 base_url = "https://api.tokenrouter.com/v1/chat/completions"
 api_key = { pass = "AI/tokenrouter/main" }
 models = [
@@ -475,6 +520,7 @@ rpm = 10
 # models are PAID-plan only (their "free/" prefix means free-*experimental*,
 # not free-to-you); only these 5 small models are callable — probed 2026-08-24.
 [providers.openadapter]
+tier = "reserve"
 base_url = "https://api.openadapter.in/v1/chat/completions"
 api_key = { pass = "AI/openadapter/main" }
 models = [
@@ -508,6 +554,7 @@ rpm = 10
 # mimo-v2.5 — free but heavily throttled (429s with empty bodies under any
 # concurrency), so keep rpm low and let failover absorb it.
 [providers.bai]
+tier = "reserve"
 base_url = "https://api.b.ai/v1/chat/completions"
 api_key = { pass = "AI/bai/main" }
 models = [
@@ -548,8 +595,8 @@ rpm = 2
 base_url = "https://api.z.ai/api/paas/v4/chat/completions"
 api_key = { pass = "AI/zai/main" }
 models = [
-  { id = "glm-4.7-flash", context_length = 200000 },
-  { id = "glm-4.5-flash", context_length = 128000 },
+  { id = "glm-4.7-flash", context_length = 200000, tool_call = true },
+  { id = "glm-4.5-flash", context_length = 128000, tool_call = true },
   { id = "glm-4.6v-flash", context_length = 200000 },
 ]
 [providers.zai.limits]
@@ -560,9 +607,10 @@ rpm = 5
 #    pre-2026-02-24 accounts — mercury-2 is the only model on this key.
 #    Flip the training opt-out in Account Settings after signup.
 [providers.inception]
+tier = "finite"
 base_url = "https://api.inceptionlabs.ai/v1/chat/completions"
 api_key = { pass = "AI/inception/main" }
-models = [{ id = "mercury-2", context_length = 128000 }]
+models = [{ id = "mercury-2", context_length = 128000, tool_call = true }]
 [providers.inception.limits]
 total_tokens = 100000000
 
@@ -610,6 +658,7 @@ total_tokens = 100000000
 # deepseek-3.2/minimax-m2.5 0.25x, haiku 0.4x, glm-5 0.5x, sonnet-4.5 1.3x).
 # NOT in [auto]: 50 credits/month is scarcer than every free pool above.
 [providers.kiro]
+tier = "finite"
 kind = "kiro"
 format = "kiro"
 credentials = { pass = "AI/kiro/main" }
@@ -640,6 +689,7 @@ reset_tz = "UTC"
 # (Kimi's error hygiene is poor). Auth/refresh verified working end-to-end.
 # Keep OUT of [auto] until a quota reset makes calls succeed.
 [providers.kimi-coding]
+tier = "finite"
 kind = "kimi-coding"
 format = "anthropic"
 credentials = { pass = "AI/kimi-coding/main" }
@@ -684,7 +734,7 @@ rpm = 15
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 api_key = { pass = "AI/google/main" }
 models = [
-  { id = "gemini-3-flash-preview", context_length = 1048576 },
+  { id = "gemini-3-flash-preview", context_length = 1048576, tool_call = true },
   { id = "gemini-3.1-flash-lite", context_length = 1048576 },
   { id = "gemini-2.5-flash", context_length = 1048576 },
 ]

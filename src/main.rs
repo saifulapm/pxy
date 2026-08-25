@@ -46,11 +46,12 @@ enum Command {
     Models,
     /// Show provider status (cooldowns, usage)
     Status,
-    /// Discover live provider catalogs and report drift (read-only)
+    /// Discover live provider catalogs; report drift and optionally regenerate
     Refresh {
-        /// Report only; never write. Currently the only supported mode.
-        #[arg(long, default_value_t = true)]
-        dry_run: bool,
+        /// Write generated.toml (model lists + auto chain). Without this the
+        /// command only reports.
+        #[arg(long)]
+        write: bool,
     },
 }
 
@@ -92,16 +93,15 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Refresh { dry_run } => {
-            if !dry_run {
-                anyhow::bail!("only --dry-run is implemented so far");
-            }
-            let cfg = config::Config::load(&cfg_path)?;
+        Command::Refresh { write } => {
+            // Baseline only: generation must never consume its own output.
+            let cfg = config::Config::load_base(&cfg_path)?;
             let secrets = secrets::Secrets::new();
+            let out = config::generated_path(&cfg_path);
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(refresh::run(&cfg, &secrets))
+                .block_on(refresh::run(&cfg, &secrets, write, &out))
         }
         Command::Status => {
             let cfg = config::Config::load(&cfg_path)?;

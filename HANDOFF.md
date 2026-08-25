@@ -23,7 +23,7 @@ pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
 pxy models                    # 146 models exposed
 pxy status                    # per-provider usage vs limits
-pxy refresh                   # discover live catalogs + drift report (read-only)
+pxy refresh [--write]         # discover catalogs; report drift / regenerate generated.toml
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
 ```
@@ -239,7 +239,28 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    (the last hard piece of work in Phase 3) would buy nothing. Re-verify with those two
    calls BEFORE writing any code if Antigravity ships a new client/API. Free Gemini is
    already covered by the `google` (AI Studio) provider in `auto`.
-4. **Catalog automation (`pxy refresh`) — stage 1 DONE 2026-08-25**, stages 2-3 pending.
+4. **Catalog automation (`pxy refresh`) — ALL THREE STAGES DONE 2026-08-25.**
+   `pxy refresh` = dry-run report; `pxy refresh --write` = regenerate
+   `~/.config/pxy/generated.toml` (model lists + auto chain), which Config::load
+   overlays onto config.toml at startup. Restart pxy after a --write.
+   - `[preferences]` in config.toml: bare model names best-first, `max_pools_per_model`,
+     `max_unranked` tail, `deny` list for listed-but-broken ids. **Tier-first ordering**
+     (free -> subscription -> finite; reserve NEVER generated), preference order within
+     a tier — a ranking can never start spending money.
+   - Per-provider: `tier`, `discover`, `models_url`, `id_field`, `[providers.X.promo]`
+     (`expires = "YYYY-MM-DD"`, fails closed on bad dates).
+   - Per-model: `tool_call = true|false` — a CURATED fact that beats discovery and
+     probing (zai's 1-concurrent throttle makes probing it unreliable; its glm-4.7-flash
+     is also absent from Z.AI's own /models yet works).
+   - Probes: only for ranked models with unknown capability; YES cached forever, NO for
+     7 days (aihubmix's gemini tool-called in the morning and stopped by afternoon —
+     free pools degrade and recover), truncated answers (finish=length) cache nothing.
+   - **Write guard**: --write ABORTS if any discovery failure is credential-shaped or
+     >half of providers fail (a locked gpg agent takes out every provider at once;
+     generating from that would shrink the chain and then be loaded as truth).
+   - **Feedback-loop guard**: refresh reads `Config::load_base` (baseline WITHOUT the
+     generated overlay) — generation consuming its own output erased curated marks.
+   - Stage-1 history (research + rules):
    Design research: OmniRoute + litellm + our own config (see the commit message).
    - **Stage 1 (done)**: `pxy refresh` discovers every provider's live `/models`
      (default-ON, seed fallback — an opt-in allowlist is how OmniRoute silently served

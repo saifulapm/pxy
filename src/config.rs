@@ -11,6 +11,14 @@ pub fn default_config_path() -> PathBuf {
     base.join("pxy").join("config.toml")
 }
 
+/// `generated.toml` lives beside the config it augments.
+pub fn generated_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("generated.toml")
+}
+
 pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME not set"))
 }
@@ -32,16 +40,102 @@ pub struct Config {
     pub auto: AutoConfig,
     #[serde(default)]
     pub launch: LaunchConfig,
+    /// Model-quality ranking used to generate the `auto` chain.
+    #[serde(default)]
+    pub preferences: Preferences,
+}
+
+/// Bare model names (no provider), best first. Ordering INSIDE a tier only:
+/// a preferred model on a paid pool still sits below the free tier, so a
+/// ranking can never quietly start spending money.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preferences {
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Cap on how many providers may serve the same model in `auto`. Without
+    /// it, one popular model with 4 pools crowds out everything below it.
+    #[serde(default = "default_max_pools")]
+    pub max_pools_per_model: usize,
+    /// How many models NOT on the preference list may ride along as a
+    /// resilience tail. They sit below every ranked model in their tier.
+    #[serde(default = "default_max_unranked")]
+    pub max_unranked: usize,
+    /// Model ids (or bare names) that must never enter `auto`, whatever
+    /// discovery says. For catalogue entries that list but don't work.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+fn default_max_unranked() -> usize {
+    12
+}
+
+fn default_max_pools() -> usize {
+    3
+}
+
+/// Cost class. Decides `auto` ordering, and whether a provider may be in
+/// `auto` at all. Never inferred — a vendor's billing behaviour is a curated
+/// fact, so `metered`/`reserve` must be set by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tier {
+    /// Free and renewing; the default home of the auto chain.
+    #[default]
+    Free,
+    /// A subscription already paid for, with a usage allowance.
+    Subscription,
+    /// A finite grant that does not renew — spend after renewables.
+    Finite,
+    /// Real money per token, or a balance that can be drained. NEVER in `auto`.
+    Reserve,
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        let mut cfg = Self::load_base(path)?;
+        let gen_path = generated_path(path);
+        if gen_path.exists() {
+            let graw = std::fs::read_to_string(&gen_path)
+                .with_context(|| format!("reading {}", gen_path.display()))?;
+            let generated: Generated = toml::from_str(&graw)
+                .with_context(|| format!("parsing {}", gen_path.display()))?;
+            cfg.apply_generated(generated);
+        }
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// The hand-written config alone, without the generated overlay.
+    /// `pxy refresh` MUST use this: generation reading its own previous
+    /// output is a feedback loop — the first symptom was curated `tool_call`
+    /// marks vanishing because the overlay had replaced the model lists
+    /// before the generator could read them.
+    pub fn load_base(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("parsing config {}", path.display()))?;
-        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Overlay generated model lists and auto chain onto the hand-written
+    /// baseline. Generation only ever produces these two things, so nothing
+    /// hand-curated (credentials, limits, headers, quirks) can be clobbered.
+    /// A generated block for an unknown provider is ignored rather than
+    /// creating a half-configured provider with no credentials.
+    fn apply_generated(&mut self, generated: Generated) {
+        for (name, g) in generated.providers {
+            if let Some(p) = self.providers.get_mut(&name) {
+                if !g.models.is_empty() {
+                    p.models = g.models;
+                }
+            }
+        }
+        if !generated.auto.models.is_empty() {
+            self.auto.models = generated.auto.models;
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -67,6 +161,24 @@ impl Config {
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.server.port)
     }
+}
+
+/// The subset `pxy refresh --write` produces. Deliberately tiny: anything not
+/// in this struct cannot be generated, and so cannot be lost to generation.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Generated {
+    #[serde(default)]
+    pub providers: BTreeMap<String, GeneratedProvider>,
+    #[serde(default)]
+    pub auto: AutoConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedProvider {
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +277,32 @@ pub struct ProviderConfig {
     /// Field holding the usable model id in the discovery response. Default
     /// "id"; Cloudflare needs "name" because its `id` is a UUID.
     pub id_field: Option<String>,
+    /// Cost class for `auto` generation.
+    #[serde(default)]
+    pub tier: Tier,
+    /// Time-limited promotional models, dropped from generation once expired.
+    /// Upstream expiry metadata is not trustworthy (OpenRouter carries
+    /// `expiration_date` on 8 of 419 models, and not on the promo we use), so
+    /// the deadline is declared here.
+    pub promo: Option<Promo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Promo {
+    /// Model ids that are only free until `expires`.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Last day the promo is valid, `YYYY-MM-DD` (inclusive).
+    pub expires: String,
+}
+
+impl Promo {
+    /// True once `today` is past `expires`. An unparseable date is treated as
+    /// expired: failing closed drops a model, failing open spends money.
+    pub fn is_expired(&self, today: &str) -> bool {
+        self.expires.as_str() < today
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +327,8 @@ impl ProviderConfig {
             discover: true,
             models_url: None,
             id_field: None,
+            tier: Tier::default(),
+            promo: None,
         }
     }
 }
@@ -236,6 +376,11 @@ pub struct ModelSpec {
     pub max_output_tokens: u64,
     /// Override wire format for this model (e.g. copilot claude models)
     pub format: Option<WireFormat>,
+    /// Asserted tool-calling support, skipping discovery and probing. Set this
+    /// only from a real verified call — it exists because probing can't reach
+    /// some models (Z.AI allows one concurrent request, so a refresh sweep
+    /// gets 429s and would exclude a model that works).
+    pub tool_call: Option<bool>,
 }
 
 pub fn default_context() -> u64 {
@@ -254,6 +399,7 @@ impl ModelEntry {
                 context_length: default_context(),
                 max_output_tokens: default_max_output(),
                 format: None,
+                tool_call: None,
             },
             ModelEntry::Full(s) => s.clone(),
         }

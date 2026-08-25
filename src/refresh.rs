@@ -27,13 +27,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::{Config, ProviderConfig};
+use crate::config::{Config, ProviderConfig, Tier};
 use crate::secrets::Secrets;
+use crate::state::State;
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 /// Reject an upstream catalog that looks truncated rather than overwriting a
 /// good one with it (litellm's poison-pill guard).
 const MIN_MODELS_DEV_ENTRIES: usize = 500;
+/// How long a "does not support tools" verdict is trusted before re-probing.
+const NEGATIVE_PROBE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Tri-state. `Unknown` is a real answer and must survive as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,8 +274,8 @@ fn snippet(s: &str) -> String {
     }
 }
 
-/// Run discovery across all providers and print a drift report. Read-only.
-pub async fn run(cfg: &Config, secrets: &Secrets) -> Result<()> {
+/// Discover, report, and (when `write`) generate `generated.toml`.
+pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::path::Path) -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -294,6 +297,7 @@ pub async fn run(cfg: &Config, secrets: &Secrets) -> Result<()> {
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut new_free: BTreeMap<String, Vec<Discovered>> = BTreeMap::new();
     let mut pools: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut found: BTreeMap<String, Vec<Discovered>> = BTreeMap::new();
     let (mut n_ok, mut n_models) = (0usize, 0usize);
 
     for (name, pcfg) in &cfg.providers {
@@ -351,6 +355,7 @@ pub async fn run(cfg: &Config, secrets: &Secrets) -> Result<()> {
                     }
                 }
                 // Free + tool-capable + not already configured = candidates.
+                let all = models.clone();
                 let cands: Vec<Discovered> = models
                     .into_iter()
                     .filter(|m| {
@@ -362,6 +367,10 @@ pub async fn run(cfg: &Config, secrets: &Secrets) -> Result<()> {
                 if !cands.is_empty() {
                     new_free.insert(name.clone(), cands);
                 }
+                // Keep the FULL list: a model already in config.toml still needs
+                // its discovered capability data, or generation would re-probe
+                // something models.dev already answered.
+                found.insert(name.clone(), all);
             }
         }
     }
@@ -428,7 +437,387 @@ pub async fn run(cfg: &Config, secrets: &Secrets) -> Result<()> {
             println!("  {:<20} … and {} more", prov, sorted.len() - 6);
         }
     }
+
+    if !write {
+        println!("\n(dry run — nothing written. Use `pxy refresh --write` to generate.)");
+        return Ok(());
+    }
+    // Generating from degraded discovery would shrink the chain to whatever
+    // happened to work this minute, and the shrunken file would then be loaded
+    // as truth. Credential failures (a locked gpg agent takes out EVERY
+    // provider at once) or a high failure rate abort the write; the previous
+    // generated.toml stays in force.
+    let cred_failures = failures
+        .iter()
+        .filter(|(_, why)| why.starts_with("credential:"))
+        .count();
+    if cred_failures > 0 || failures.len() > n_ok / 2 {
+        anyhow::bail!(
+            "refusing to write: {} discovery failure(s), {} credential-related \
+             (locked gpg agent?). Fix access and rerun; the existing \
+             generated.toml is untouched.",
+            failures.len(),
+            cred_failures
+        );
+    }
+    generate(cfg, secrets, &http, found, out_path).await
+}
+
+/// Build and write `generated.toml`.
+async fn generate(
+    cfg: &Config,
+    secrets: &Secrets,
+    http: &reqwest::Client,
+    discovered: BTreeMap<String, Vec<Discovered>>,
+    out_path: &std::path::Path,
+) -> Result<()> {
+    let state = State::open(&crate::config::data_dir().join("state.sqlite"))?;
+    let today = today();
+    let prefs = &cfg.preferences;
+    let rank_of = |canon: &str| prefs.models.iter().position(|p| canonical(p) == canon);
+
+    println!("\n── generating ──");
+
+    let mut per_provider: BTreeMap<String, Vec<(String, u64, Option<bool>)>> = BTreeMap::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut probed = 0usize;
+    let mut dropped_promo: Vec<String> = Vec::new();
+
+    for (name, pcfg) in &cfg.providers {
+        if !pcfg.enabled {
+            continue;
+        }
+        // Start from what config.toml already has. Never lose a hand-added
+        // model: discovery can omit one that works.
+        let mut models: BTreeMap<String, u64> = pcfg
+            .models
+            .iter()
+            .map(|m| {
+                let s = m.spec();
+                (s.id, s.context_length)
+            })
+            .collect();
+        // Hand-asserted capability wins over both discovery and probing.
+        let asserted: HashMap<String, bool> = pcfg
+            .models
+            .iter()
+            .filter_map(|m| {
+                let s = m.spec();
+                s.tool_call.map(|t| (s.id, t))
+            })
+            .collect();
+
+        // Drop expired promo models wherever they came from.
+        if let Some(promo) = &pcfg.promo {
+            if promo.is_expired(&today) {
+                for id in &promo.models {
+                    if models.remove(id).is_some() {
+                        dropped_promo.push(format!("{name}/{id}"));
+                    }
+                }
+            }
+        }
+
+        for d in discovered.get(name).into_iter().flatten() {
+            // Only free models are auto-added. The full discovery list is kept
+            // for capability lookups, but unioning it wholesale would pull a
+            // provider's entire paid catalogue into the exposed model list.
+            if d.free != Tri::Yes {
+                continue;
+            }
+            if pcfg
+                .promo
+                .as_ref()
+                .is_some_and(|p| p.is_expired(&today) && p.models.contains(&d.id))
+            {
+                continue;
+            }
+            models.insert(d.id.clone(), d.context.unwrap_or(crate::config::default_context()));
+        }
+
+        // Candidates for `auto`: reserve tiers never qualify, whatever their
+        // ranking — a preference list must not be able to start spending money.
+        if pcfg.tier != Tier::Reserve {
+            for (id, ctx) in &models {
+                let canon = canonical(id);
+                let rank = rank_of(&canon);
+                // Only rank-worthy models are worth a probe.
+                let known = discovered
+                    .get(name)
+                    .and_then(|v| v.iter().find(|d| &d.id == id))
+                    .map(|d| d.tool_call)
+                    .unwrap_or(Tri::Unknown);
+                let known = match asserted.get(id) {
+                    Some(true) => Tri::Yes,
+                    Some(false) => Tri::No,
+                    None => known,
+                };
+                let tools = match known {
+                    Tri::Unknown if rank.is_some() => {
+                        probed += 1;
+                        probe_tool_calling(name, pcfg, id, secrets, &state, http).await
+                    }
+                    other => other,
+                };
+                // Unknown is NOT eligible. An optimistic default here is
+                // exactly the bug OmniRoute shipped.
+                if tools != Tri::Yes {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    provider: name.clone(),
+                    id: id.clone(),
+                    canonical: canon,
+                    tier: pcfg.tier,
+                    context: *ctx,
+                    rank,
+                });
+            }
+        }
+        per_provider.insert(
+            name.clone(),
+            models
+                .into_iter()
+                .map(|(id, ctx)| {
+                    let a = asserted.get(&id).copied();
+                    (id, ctx, a)
+                })
+                .collect(),
+        );
+    }
+
+    // Tier first (free pools before paid), preference order within a tier,
+    // then widest context. Ranked models always precede unranked ones.
+    candidates.sort_by(|a, b| {
+        a.tier
+            .cmp(&b.tier)
+            .then(a.rank.is_none().cmp(&b.rank.is_none()))
+            .then(a.rank.cmp(&b.rank))
+            .then(b.context.cmp(&a.context))
+            .then(a.provider.cmp(&b.provider))
+    });
+
+    // Cap pools per model so one popular model can't crowd out the chain, and
+    // bound the unranked tail so `auto` stays preference-driven.
+    let denied: BTreeSet<String> = prefs.deny.iter().map(|d| canonical(d)).collect();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut unranked = 0usize;
+    let auto: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| {
+            if denied.contains(&c.canonical) || prefs.deny.contains(&c.id) {
+                return false;
+            }
+            if c.rank.is_none() {
+                unranked += 1;
+                if unranked > prefs.max_unranked {
+                    return false;
+                }
+            }
+            let n = seen.entry(c.canonical.clone()).or_insert(0);
+            *n += 1;
+            *n <= prefs.max_pools_per_model
+        })
+        .collect();
+
+    let unmatched: Vec<&String> = prefs
+        .models
+        .iter()
+        .filter(|p| {
+            let c = canonical(p);
+            !auto.iter().any(|a| a.canonical == c)
+        })
+        .collect();
+
+    let body = render_generated(&per_provider, &auto, &today);
+    std::fs::write(out_path, &body)
+        .with_context(|| format!("writing {}", out_path.display()))?;
+
+    let total: usize = per_provider.values().map(|v| v.len()).sum();
+    println!("probed {probed} model(s) for tool calling (results cached)");
+    if !dropped_promo.is_empty() {
+        println!("dropped {} expired promo model(s):", dropped_promo.len());
+        for d in &dropped_promo {
+            println!("  {d}");
+        }
+    }
+    if !unmatched.is_empty() {
+        println!("preferences with no eligible pool ({}):", unmatched.len());
+        for u in &unmatched {
+            println!("  {u}");
+        }
+    }
+    println!(
+        "wrote {} — {} models across {} providers, auto chain of {}",
+        out_path.display(),
+        total,
+        per_provider.len(),
+        auto.len()
+    );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: probing the gap models.dev can't answer
+// ---------------------------------------------------------------------------
+
+/// Ask a model to call a trivial tool. Only used when capability data is
+/// missing AND the model is a candidate for `auto`, so the cost stays tiny.
+/// A result is cached forever: a model's tool support doesn't change.
+async fn probe_tool_calling(
+    prov: &str,
+    cfg: &ProviderConfig,
+    model_id: &str,
+    secrets: &Secrets,
+    state: &State,
+    http: &reqwest::Client,
+) -> Tri {
+    let key = format!("probe:tools:{prov}/{model_id}");
+    if let Ok(Some(v)) = state.kv_get(&key) {
+        let (verdict, at) = v.split_once('@').unwrap_or((v.as_str(), "0"));
+        let age = now_secs().saturating_sub(at.parse().unwrap_or(0));
+        match verdict {
+            // Capability is intrinsic, so a YES never needs rechecking.
+            "yes" => return Tri::Yes,
+            // A NO expires. Free pools degrade and recover (aihubmix's
+            // gemini-3.7-flash tool-called in the morning and stopped by the
+            // afternoon), so a permanent negative would bury a model that
+            // came back.
+            "no" if age < NEGATIVE_PROBE_TTL_SECS => return Tri::No,
+            _ => {}
+        }
+    }
+    let Some(url) = cfg.base_url.clone() else {
+        return Tri::Unknown;
+    };
+    let mut req = http.post(&url).header("content-type", "application/json");
+    if let Some(sref) = cfg.api_key.as_ref().or(cfg.credentials.as_ref()) {
+        match secrets.resolve_key(sref) {
+            Ok(k) => req = req.header("authorization", format!("Bearer {k}")),
+            Err(_) => return Tri::Unknown,
+        }
+    }
+    for (k, v) in &cfg.headers {
+        req = req.header(k, v);
+    }
+    let body = serde_json::json!({
+        "model": model_id,
+        // Generous budget on purpose: a reasoning model can spend a small
+        // allowance entirely on thinking and emit no tool call, which would
+        // read as "no tool support".
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "What is the weather in Dhaka? Use the tool."}],
+        "tools": [{"type": "function", "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+        }}],
+    });
+    let Ok(resp) = req.json(&body).send().await else {
+        return Tri::Unknown; // transport failure proves nothing; don't cache
+    };
+    if !resp.status().is_success() {
+        return Tri::Unknown;
+    }
+    let Ok(v) = resp.json::<Value>().await else {
+        return Tri::Unknown;
+    };
+    let choice = &v["choices"][0];
+    let called = choice["message"]["tool_calls"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty());
+    if called {
+        let _ = state.kv_set(&key, &format!("yes@{}", now_secs()));
+        return Tri::Yes;
+    }
+    // Ran out of room before it could answer: that is not evidence of
+    // anything, so record nothing.
+    if choice["finish_reason"].as_str() == Some("length") {
+        return Tri::Unknown;
+    }
+    let _ = state.kv_set(&key, &format!("no@{}", now_secs()));
+    Tri::No
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: generating the model lists and the auto chain
+// ---------------------------------------------------------------------------
+
+/// A model eligible for the generated auto chain.
+struct Candidate {
+    provider: String,
+    id: String,
+    canonical: String,
+    tier: Tier,
+    context: u64,
+    /// Index into the preference list; None = unranked (sorts after ranked).
+    rank: Option<usize>,
+}
+
+/// Today as YYYY-MM-DD, for promo expiry.
+fn today() -> String {
+    jiff::Zoned::now().date().to_string()
+}
+
+/// Build `generated.toml`: per-provider model lists (union of hand-configured
+/// and newly discovered) plus the auto chain.
+fn render_generated(
+    per_provider: &BTreeMap<String, Vec<(String, u64, Option<bool>)>>,
+    auto: &[Candidate],
+    stamp: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# AUTO-GENERATED by `pxy refresh --write` on {stamp}.\n"
+    ));
+    out.push_str(concat!(
+        "# Do not edit: rerun the command instead. Hand-written provider settings\n",
+        "# (credentials, limits, headers, quirks) live in config.toml and are never\n",
+        "# touched by generation; only model lists and the auto chain come from here.\n",
+        "# Model lists are a UNION with config.toml: a provider's /models can omit a\n",
+        "# model that works (zai/glm-4.7-flash is absent from Z.AI's own listing).\n\n",
+    ));
+    for (prov, models) in per_provider {
+        out.push_str(&format!("[providers.{prov}]\nmodels = [\n"));
+        for (id, ctx, asserted) in models {
+            let extra = match asserted {
+                Some(t) => format!(", tool_call = {t}"),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "  {{ id = \"{id}\", context_length = {ctx}{extra} }},\n"
+            ));
+        }
+        out.push_str("]\n\n");
+    }
+    out.push_str("[auto]\nmodels = [\n");
+    let mut last_tier: Option<Tier> = None;
+    for c in auto {
+        if last_tier != Some(c.tier) {
+            out.push_str(&format!("  # --- {:?} ---\n", c.tier).to_lowercase());
+            last_tier = Some(c.tier);
+        }
+        let note = match c.rank {
+            Some(r) => format!("preference #{}", r + 1),
+            None => "unranked".to_string(),
+        };
+        out.push_str(&format!(
+            "  \"{}/{}\",{}# {note}, ctx={}\n",
+            c.provider,
+            c.id,
+            " ".repeat(46usize.saturating_sub(c.provider.len() + c.id.len())),
+            c.context
+        ));
+    }
+    out.push_str("]\n");
+    out
 }
 
 #[cfg(test)]
@@ -485,6 +874,98 @@ mod tests {
         assert_eq!(Tri::from_opt(Some(false)), Tri::No);
         assert_eq!(Tri::from_opt(Some(true)), Tri::Yes);
         assert_ne!(Tri::Unknown, Tri::No);
+    }
+
+    fn cand(provider: &str, id: &str, tier: Tier, rank: Option<usize>, ctx: u64) -> Candidate {
+        Candidate {
+            provider: provider.into(),
+            id: id.into(),
+            canonical: canonical(id),
+            tier,
+            context: ctx,
+            rank,
+        }
+    }
+
+    /// The ordering contract: cost class outranks preference, so a ranking can
+    /// never move a paid pool above a free one.
+    fn sort_for_test(mut v: Vec<Candidate>) -> Vec<String> {
+        v.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then(a.rank.is_none().cmp(&b.rank.is_none()))
+                .then(a.rank.cmp(&b.rank))
+                .then(b.context.cmp(&a.context))
+                .then(a.provider.cmp(&b.provider))
+        });
+        v.into_iter().map(|c| format!("{}/{}", c.provider, c.id)).collect()
+    }
+
+    #[test]
+    fn tier_outranks_preference() {
+        // "best" is the top preference but only on a finite pool; a lower-ranked
+        // model on a free pool must still come first.
+        let order = sort_for_test(vec![
+            cand("finite-pool", "best", Tier::Finite, Some(0), 100),
+            cand("free-pool", "second", Tier::Free, Some(1), 100),
+        ]);
+        assert_eq!(order, ["free-pool/second", "finite-pool/best"]);
+    }
+
+    #[test]
+    fn preference_orders_within_a_tier_and_ranked_beats_unranked() {
+        let order = sort_for_test(vec![
+            cand("p", "unranked-huge", Tier::Free, None, 1_000_000),
+            cand("p", "third", Tier::Free, Some(2), 100),
+            cand("p", "first", Tier::Free, Some(0), 100),
+        ]);
+        assert_eq!(order, ["p/first", "p/third", "p/unranked-huge"]);
+    }
+
+    #[test]
+    fn reserve_tier_is_ordered_last() {
+        let order = sort_for_test(vec![
+            cand("money", "top-model", Tier::Reserve, Some(0), 100),
+            cand("free", "meh", Tier::Free, None, 100),
+        ]);
+        assert_eq!(order, ["free/meh", "money/top-model"]);
+    }
+
+    #[test]
+    fn pool_cap_limits_duplicates_of_one_model() {
+        let cands = vec![
+            cand("a", "kimi-k3", Tier::Free, Some(0), 100),
+            cand("b", "kimi-k3:free", Tier::Free, Some(0), 100),
+            cand("c", "moonshotai/kimi-k3", Tier::Free, Some(0), 100),
+            cand("d", "kimi-k3-free", Tier::Free, Some(0), 100),
+        ];
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let kept: Vec<_> = cands
+            .into_iter()
+            .filter(|c| {
+                let n = seen.entry(c.canonical.clone()).or_insert(0);
+                *n += 1;
+                *n <= 2
+            })
+            .collect();
+        assert_eq!(kept.len(), 2, "all four are the same canonical model");
+    }
+
+    #[test]
+    fn promo_expiry_is_date_ordered_and_fails_closed() {
+        let p = crate::config::Promo {
+            models: vec!["m".into()],
+            expires: "2026-09-06".into(),
+        };
+        assert!(!p.is_expired("2026-09-06"), "expiry day is inclusive");
+        assert!(!p.is_expired("2026-08-25"));
+        assert!(p.is_expired("2026-09-07"));
+        // An unparseable date must drop the model, not keep spending on it.
+        let bad = crate::config::Promo {
+            models: vec!["m".into()],
+            expires: "".into(),
+        };
+        assert!(bad.is_expired("2026-08-25"));
     }
 
     #[test]
