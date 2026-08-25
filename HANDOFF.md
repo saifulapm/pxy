@@ -73,7 +73,11 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
   the 0x-multiplier model: unlimited, never consumes premium requests.
-- `opencode-go-github` + `opencode-go-google` — $12/5h, $30/wk, $60/mo per account.
+- `opencode-go-github` + `opencode-go-google` — $10/mo Go plan per account; usage-dollar
+  limits $12/5h (rolling), $30/wk, $60/mo, enforced upstream (429 → pxy cooldown +
+  account rotation; pxy does no dollar accounting itself). Live utilization:
+  `GET /zen/go/v1/usage` with the API key (found in the opencode source, wired into
+  `pxy status --remote` 2026-08-25 — shows percent per window + reset time).
   **Per-model allowances vary 400×** — table in docs/07. Only high-allowance models are in
   `auto`; kimi-k3 (110/5h), grok-4.5 (120), qwen3.8-max (160), glm-5.3 (220) are excluded.
   - `muse-spark-1.2-contributor` (45,300/5h): data-collection opt-in was enabled on both
