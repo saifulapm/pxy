@@ -308,6 +308,8 @@ models = [
 [providers.opencode-go-github]
 tier = "subscription"
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
+# Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
+balance_url = "https://opencode.ai/zen/go/v1/usage"
 api_key = { pass = "AI/opencode-go/github" }
 models = [
   # High-allowance picks only (per-5h caps in the [auto] comment above).
@@ -329,6 +331,8 @@ models = [
 [providers.opencode-go-google]
 tier = "subscription"
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
+# Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
+balance_url = "https://opencode.ai/zen/go/v1/usage"
 api_key = { pass = "AI/opencode-go/google" }
 models = [
   # High-allowance picks only (per-5h caps in the [auto] comment above).

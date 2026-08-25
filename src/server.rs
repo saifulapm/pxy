@@ -423,6 +423,22 @@ async fn fetch_balance(
     {
         return format!("${:.2} left of ${credits:.2}", credits - usage);
     }
+    // opencode Go: percent used per window (GET /zen/go/v1/usage).
+    if body["usage"]["monthly"].is_object() {
+        let win = |w: &str| {
+            let pct = body["usage"][w]["percent"].as_u64().unwrap_or(0);
+            let limited = body["usage"][w]["status"] == "rate-limited";
+            format!("{pct}%{}", if limited { "!" } else { "" })
+        };
+        let resets = body["usage"]["monthly"]["resetsAt"].as_str().unwrap_or("?");
+        return format!(
+            "5h {} · wk {} · mo {} (mo resets {})",
+            win("rolling"),
+            win("weekly"),
+            win("monthly"),
+            &resets[..resets.len().min(10)],
+        );
+    }
     // OpenAI/new-api dashboard billing: total_usage in cents.
     if let Some(cents) = body["total_usage"].as_f64() {
         return format!("used ${:.2}", cents / 100.0);
