@@ -23,6 +23,7 @@ pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
 pxy models                    # 146 models exposed
 pxy status                    # per-provider usage vs limits
+pxy refresh                   # discover live catalogs + drift report (read-only)
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
 ```
@@ -49,6 +50,7 @@ Both chat protocols translate in both directions, streaming included.
 | `translate/eventstream.rs` | AWS vnd.amazon.eventstream binary frame decoder |
 | `translate/kiro.rs` | anthropic<->conversationState; frames -> OpenAI SSE; sha1/uuidv5 |
 | `translate/` | anthropic↔openai (request + streaming response), SSE parser, `<think>` filter |
+| `refresh.rs` | catalog discovery: provider /models x models.dev join, drift report |
 | `launch.rs` | per-agent env/config injection |
 
 Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
@@ -237,7 +239,30 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    (the last hard piece of work in Phase 3) would buy nothing. Re-verify with those two
    calls BEFORE writing any code if Antigravity ships a new client/API. Free Gemini is
    already covered by the `google` (AI Studio) provider in `auto`.
-4. **Nice-to-haves identified but not built**:
+4. **Catalog automation (`pxy refresh`) — stage 1 DONE 2026-08-25**, stages 2-3 pending.
+   Design research: OmniRoute + litellm + our own config (see the commit message).
+   - **Stage 1 (done)**: `pxy refresh` discovers every provider's live `/models`
+     (default-ON, seed fallback — an opt-in allowlist is how OmniRoute silently served
+     stale catalogs), joins **models.dev** (7285 models, 100% carry `tool_call`; covers
+     94% of our config and 27/27 of `auto`), and prints drift + free-and-tool-capable
+     candidates + cross-provider pools. Read-only.
+   - **Stage 2 (todo)**: probe cache in sqlite for the ~6% models.dev can't answer;
+     generate per-provider `models` lists into `generated.toml` (merged at load, so
+     hand-written auth/limits/quirks are never touched).
+   - **Stage 3 (todo)**: `[preferences]` list of bare model names + per-provider `tier`;
+     generate the `auto` chain. **Open decision**: tier-first (free pools before paid,
+     preference orders within a tier — recommended) vs literal preference-first.
+     Also: `[providers.X.promo] expires = "…"` to auto-drop promos (openrouter's own
+     `expiration_date` is present on only 8/419 models and absent on the GMI promo, so
+     upstream expiry data can NOT be relied on).
+   - **Rules that must not be relaxed** (each is somebody's post-mortem):
+     absence from a listing is REPORTED, never auto-deleted; capabilities are tri-state
+     (Unknown never collapses to No or to an optimistic Yes); a failed fetch is distinct
+     from an empty catalog; billing-safety stays hand-curated.
+   - **Proof the no-auto-delete rule is load-bearing**: `zai/glm-4.7-flash` (our best free
+     coding model, 59.2 SWE-bench) does NOT appear in Z.AI's own `/models` listing but
+     works fine — verified live. Auto-deletion would have removed it.
+5. **Nice-to-haves identified but not built**:
    - Read upstream quota headers (`X-Quota-5h/Week/Month` on openadapter, Copilot's, etc.) and
      cool a provider down when it self-reports exhaustion.
    - `pxy status` showing remote balances (agentrouter/tokenrouter expose billing endpoints).

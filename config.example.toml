@@ -226,6 +226,10 @@ models = [
 [providers.cloudflare]
 base_url = "https://api.cloudflare.com/client/v4/accounts/0a937759fca2672765c005345aebe060/ai/v1/chat/completions"
 api_key = { pass = "AI/cloudflare-ai/main" }
+# Discovery: the OpenAI-compat path has no /models, and in the real listing
+# `id` is a UUID while `name` (@cf/vendor/model) is what you call.
+models_url = "https://api.cloudflare.com/client/v4/accounts/0a937759fca2672765c005345aebe060/ai/models/search?per_page=200&task=Text%20Generation"
+id_field = "name"
 models = [
   { id = "@cf/openai/gpt-oss-120b", context_length = 128000 },
   { id = "@cf/deepseek-ai/deepseek-v4-flash-0731", context_length = 1310720 },
@@ -338,6 +342,7 @@ rpm = 30
 [providers.codestral]
 base_url = "https://codestral.mistral.ai/v1/chat/completions"
 api_key = { pass = "AI/codestral/main" }
+discover = false   # the codestral endpoint serves no /models list (404)
 models = ["codestral-latest", "codestral-2508"]
 [providers.codestral.limits]
 rpm = 30

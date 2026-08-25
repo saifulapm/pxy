@@ -152,6 +152,45 @@ pub struct ProviderConfig {
     /// reasoning (for models like MiniMax/Qwen that inline CoT as text)
     #[serde(default)]
     pub parse_think_tags: bool,
+
+    // ---- `pxy refresh` (discovery) ----
+    /// Include this provider in catalog discovery. Default ON: an opt-in
+    /// allowlist is how OmniRoute ended up silently serving stale catalogs
+    /// for dozens of providers.
+    #[serde(default = "default_true")]
+    pub discover: bool,
+    /// Complete models-list URL. Only needed when it can't be derived from
+    /// base_url (i.e. base_url doesn't end in /chat/completions).
+    pub models_url: Option<String>,
+    /// Field holding the usable model id in the discovery response. Default
+    /// "id"; Cloudflare needs "name" because its `id` is a UUID.
+    pub id_field: Option<String>,
+}
+
+#[cfg(test)]
+impl ProviderConfig {
+    /// Minimal instance for unit tests.
+    pub fn test_default() -> Self {
+        Self {
+            kind: ProviderKind::default(),
+            format: WireFormat::default(),
+            base_url: None,
+            embeddings_url: None,
+            embedding_models: Vec::new(),
+            api_key: None,
+            credentials: None,
+            headers: BTreeMap::new(),
+            auth_header: AuthHeader::default(),
+            models: Vec::new(),
+            limits: None,
+            enabled: true,
+            timeout_secs: default_timeout(),
+            parse_think_tags: false,
+            discover: true,
+            models_url: None,
+            id_field: None,
+        }
+    }
 }
 
 fn default_true() -> bool {

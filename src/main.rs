@@ -2,6 +2,7 @@ mod catalog;
 mod config;
 mod launch;
 mod providers;
+mod refresh;
 mod router;
 mod secrets;
 mod server;
@@ -45,6 +46,12 @@ enum Command {
     Models,
     /// Show provider status (cooldowns, usage)
     Status,
+    /// Discover live provider catalogs and report drift (read-only)
+    Refresh {
+        /// Report only; never write. Currently the only supported mode.
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -84,6 +91,17 @@ fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Refresh { dry_run } => {
+            if !dry_run {
+                anyhow::bail!("only --dry-run is implemented so far");
+            }
+            let cfg = config::Config::load(&cfg_path)?;
+            let secrets = secrets::Secrets::new();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(refresh::run(&cfg, &secrets))
         }
         Command::Status => {
             let cfg = config::Config::load(&cfg_path)?;
