@@ -47,6 +47,9 @@ pub async fn prepare(
                     AuthHeader::XApiKey => {
                         headers.push(("x-api-key".into(), key));
                     }
+                    AuthHeader::XiApiKey => {
+                        headers.push(("xi-api-key".into(), key));
+                    }
                 }
             }
             Ok(PreparedRequest { url, headers, body_patch: None })

@@ -24,6 +24,12 @@ pxy launch claude|opencode|pi|codex # spawn an agent wired to pxy (--dry-run sho
 pxy models                    # 146 models exposed
 pxy status [--remote]         # per-provider usage vs limits; --remote adds live balances
 pxy refresh [--write]         # discover catalogs; report drift / regenerate generated.toml
+pxy search "query" [-n N]     # web search (brave -> jina -> firecrawl)
+pxy fetch <url>               # URL -> markdown (jina-reader -> firecrawl)
+pxy transcribe <file>         # STT (groq whisper default)
+pxy say "text" [-o f.mp3]     # TTS (cloudflare aura default; --voice nova etc.)
+pxy image "prompt" [-o f.png] # image gen (cloudflare flux default)
+pxy video "prompt" [-o f.mp4] # video gen (agnes v2.0; blocks minutes)
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
 ```
@@ -34,6 +40,16 @@ systemctl --user restart pxy  # REQUIRED after any config or pass change (secret
 `GET /v1/models` · `GET /healthz`.
 Both chat protocols translate in both directions, streaming included. /v1/responses
 wraps the OpenAI path (translate/responses.rs), so routing/accounting apply unchanged.
+
+**Phase 2 (added 2026-08-25):** `POST /v1/images/generations` (OpenAI shape) ·
+`POST /v1/audio/transcriptions` (multipart) · `POST /v1/audio/speech` (binary streamed) ·
+`POST /v1/rerank` (Cohere shape) · `POST /v1/videos/generations` (blocking submit+poll) ·
+`POST /v1/search` + `POST/GET /v1/fetch` (custom minimal shapes). Handlers live in
+`src/media/`; model resolution mirrors embeddings (`provider/model`, bare id, or the
+`[media]` default per capability). Media usage + cooldowns are isolated under
+`<provider>#media` / `search#<name>` / `fetch#<name>` keys (own rows in `pxy status`) so
+they never touch chat budgets; cloudflare's media pool has a hard `daily_requests = 30`
+cap because Workers AI overage bills real money.
 
 ## Architecture (src/)
 
@@ -56,6 +72,7 @@ wraps the OpenAI path (translate/responses.rs), so routing/accounting apply unch
 | `translate/aggregate.rs` | SSE stream → complete JSON body (the `force_stream` re-assembly) |
 | `refresh.rs` | catalog discovery: provider /models x models.dev join, drift report |
 | `launch.rs` | per-agent env/config injection |
+| `media/` | Phase 2: images, audio STT/TTS, rerank, video, search, fetch + CLI verbs |
 
 Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - **Cooldown scopes**: 401/402/403 → provider-wide; 429/408/409/5xx → `provider/model` only.
@@ -211,6 +228,12 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 **Commented out (dead):** `deepseek` ($0 balance, no free tier), `v0-vercel` (API plan-gated,
 404s), plus `freemodel-dev` (insufficient balance).
 
+**Service/media-only providers (Phase 2, 2026-08-25):** `elevenlabs` (STT/TTS, xi-api-key
+auth), `voyage` (rerank + embeddings), `jina` (rerank; same key as jina-reader), plus
+`[[search.providers]]` brave/jina/firecrawl and `[[fetch.providers]]` jina-reader/firecrawl.
+Media capabilities on existing providers: cloudflare (images/STT/TTS via run endpoint),
+groq + mistral (STT), agnes (images/video).
+
 ## Where we left off — NEXT STEPS
 
 1. **Add more free providers** — research is DONE: see `docs/08-free-provider-candidates.md`.
@@ -232,12 +255,29 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    staged as a short-call-only provider and must never go in `auto`.
    Always test tool calling before putting anything in `auto`.
    Note: Pollinations' keyless tier is gone (401 as of 2026-08-24); it needs a free key now.
-2. **Phase 2 — non-chat endpoints** (design already validated; these are simple pass-through
-   handlers, architecturally separate): images generations/edits, audio transcription + TTS,
-   video generation, web search, rerank. Credentials already in pass for: `voyage-ai`,
-   `jina-reader`, `elevenlabs`, `brave-search`, `firecrawl`, `cloudflare-ai`, plus agnes
-   image/video and Tencent's `hy-3d-*` models. `/v1/embeddings` already exists (4 pools:
-   tencent kinfra, alibaba qwen, fireworks qwen3-8b, voyage pending).
+2. **Phase 2 — non-chat endpoints: DONE 2026-08-25** (see "Endpoints served" above; research
+   basis: OmniRoute's registries + litellm's per-capability adapters, both studied from
+   `references/`). Everything below verified live end-to-end:
+   - **Search**: brave (2k q/mo free, capped 1900) → jina `s.jina.ai` → firecrawl
+     (500 credits/mo, capped 200/scope). **Fetch**: jina-reader → firecrawl scrape.
+   - **STT**: groq whisper-large-v3(-turbo) default (⚠️ groq needs a real file EXTENSION),
+     mistral voxtral, cloudflare whisper (base64 JSON dialect), elevenlabs scribe_v1.
+   - **TTS**: cloudflare aura-2 default, elevenlabs (10k chars/mo; ⚠️ library voices 402
+     on free — premade ids mapped from OpenAI voice names in config; usage counted in
+     characters). melotts was 500ing upstream — retest.
+   - **Images**: cloudflare flux-1-schnell default (b64 JSON; SDXL answers raw bytes —
+     handled), agnes-image-2.x (`size` required, config default "1K").
+   - **Video**: agnes-video-v2.0 (submit `/v1/videos` → poll `/agnesapi?video_id=`,
+     ~75s, upstream limit ~2/min). ⚠️ agnes 2.5 video models require an undocumented
+     `mode` value (std/pro/fast/t2v all rejected) — revisit when Agnes documents it.
+     Fun fact: agnes's video_id decodes as a litellm-encoded job handle — they run litellm.
+   - **Rerank**: voyage rerank-2.5(-lite) default (top_k/data[] dialect mapped to Cohere
+     shape), jina reranker (Cohere-compatible passthrough). Voyage embeddings also added
+     to `/v1/embeddings` (5th pool).
+   - **Dead ends verified**: Google AI Studio image gen is billing-gated (free-tier limit
+     is literally 0); aihubmix `gpt-image-2-free` allows 10 lifetime calls and answers in
+     chat shape. Not wired: tencent `hy-3d-*`/tripo 3D (niche — revisit on demand),
+     groq has no TTS models on this key.
 3. **Phase 3 — OAuth providers**, one at a time, easiest first (research in docs/06):
    ~~kilocode~~ (DONE 2026-08-25 — token turned out long-lived, plain config, no Rust) →
    ~~kiro/amazon-q~~ (kiro DONE 2026-08-25 — see catalog; amazon-q is the same

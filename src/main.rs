@@ -1,6 +1,7 @@
 mod catalog;
 mod config;
 mod launch;
+mod media;
 mod providers;
 mod refresh;
 mod router;
@@ -56,6 +57,62 @@ enum Command {
         /// command only reports.
         #[arg(long)]
         write: bool,
+    },
+    /// Web search via the configured search providers
+    Search {
+        query: String,
+        /// Number of results
+        #[arg(long, short, default_value_t = 5)]
+        n: u64,
+        /// Force a specific search provider
+        #[arg(long)]
+        provider: Option<String>,
+        /// Print the raw JSON response
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch a URL as markdown (jina-reader / firecrawl)
+    Fetch {
+        url: String,
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Transcribe an audio file (speech-to-text)
+    Transcribe {
+        file: std::path::PathBuf,
+        /// Model ("provider/model" or bare id; default from [media])
+        #[arg(long, short)]
+        model: Option<String>,
+    },
+    /// Text-to-speech into an audio file
+    Say {
+        text: String,
+        /// Output file
+        #[arg(long, short, default_value = "say.mp3")]
+        output: std::path::PathBuf,
+        #[arg(long, short)]
+        model: Option<String>,
+        /// Voice name (mapped per provider) or a raw provider voice id
+        #[arg(long)]
+        voice: Option<String>,
+    },
+    /// Generate an image
+    Image {
+        prompt: String,
+        /// Output file
+        #[arg(long, short, default_value = "image.png")]
+        output: std::path::PathBuf,
+        #[arg(long, short)]
+        model: Option<String>,
+    },
+    /// Generate a video (blocks until the upstream job finishes)
+    Video {
+        prompt: String,
+        /// Output file
+        #[arg(long, short, default_value = "video.mp4")]
+        output: std::path::PathBuf,
+        #[arg(long, short)]
+        model: Option<String>,
     },
 }
 
@@ -114,5 +171,42 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(server::print_status(&cfg, remote))
         }
+        Command::Search { query, n, provider, json } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            block_on_current(media::cli::search(&cfg, &query, n, provider.as_deref(), json))
+        }
+        Command::Fetch { url, provider } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            block_on_current(media::cli::fetch(&cfg, &url, provider.as_deref()))
+        }
+        Command::Transcribe { file, model } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            block_on_current(media::cli::transcribe(&cfg, &file, model.as_deref()))
+        }
+        Command::Say { text, output, model, voice } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            block_on_current(media::cli::say(
+                &cfg,
+                &text,
+                model.as_deref(),
+                voice.as_deref(),
+                &output,
+            ))
+        }
+        Command::Image { prompt, output, model } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            block_on_current(media::cli::image(&cfg, &prompt, model.as_deref(), &output))
+        }
+        Command::Video { prompt, output, model } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            block_on_current(media::cli::video(&cfg, &prompt, model.as_deref(), &output))
+        }
     }
+}
+
+fn block_on_current<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(fut)
 }

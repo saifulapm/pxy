@@ -286,6 +286,21 @@ models = [
 [providers.cloudflare.limits]
 rpm = 10
 daily_tokens = 50000
+# Workers AI media through the run endpoint. SAME billing caveat as chat:
+# past 10k neurons/day it bills automatically, so the media pool has its own
+# hard daily cap (counted under cloudflare#media, separate from chat tokens).
+# flux-1-schnell + whisper turbo + aura-2 verified live 2026-08-25; melotts
+# was 500ing upstream (retest); SDXL answers raw PNG bytes (handled).
+[providers.cloudflare.media]
+kind = "cloudflare"
+run_url = "https://api.cloudflare.com/client/v4/accounts/0a937759fca2672765c005345aebe060/ai/run/{model}"
+image_models = [
+  "@cf/black-forest-labs/flux-1-schnell",
+  "@cf/bytedance/stable-diffusion-xl-lightning",
+]
+transcription_models = ["@cf/openai/whisper-large-v3-turbo"]
+speech_models = ["@cf/deepgram/aura-2-en", "@cf/myshell-ai/melotts"]
+daily_requests = 30
 
 # opencode Zen: pay-per-token gateway sharing the Go workspace key.
 # The *-free models cost nothing (limited time; NVIDIA ones are trial-only —
@@ -389,6 +404,11 @@ models = [
 ]
 [providers.mistral.limits]
 rpm = 30
+# Voxtral STT on the free Experiment tier (OpenAI multipart; returns real
+# usage incl. prompt_audio_seconds). Verified 2026-08-25.
+[providers.mistral.media]
+transcription_url = "https://api.mistral.ai/v1/audio/transcriptions"
+transcription_models = ["voxtral-mini-latest", "voxtral-small-latest"]
 
 # Codestral dedicated endpoint — SEPARATE key from api.mistral.ai, currently
 # free (phone-verified). Aimed at IDE/FIM use; also serves chat.
@@ -573,6 +593,21 @@ models = [
 ]
 [providers.agnes.limits]
 rpm = 10
+# Agnes media (free flash tier): OpenAI-ish images (`size` is REQUIRED — the
+# default fills it) and async video jobs (submit /v1/videos -> poll
+# /agnesapi?video_id=...; flow lifted from OmniRoute's agnes-video-job preset).
+[providers.agnes.media]
+kind = "agnes"
+images_url = "https://apihub.agnes-ai.com/v1/images/generations"
+image_models = ["agnes-image-2.1-flash", "agnes-image-2.0-flash"]
+image_defaults = { size = "1K" }
+video_url = "https://apihub.agnes-ai.com/v1/videos"
+video_status_url = "https://apihub.agnes-ai.com/agnesapi?video_id={id}"
+# v2.0 first: verified end-to-end (~75s, ~2/min rate limit upstream). The 2.5
+# models 400 with "mode is required" and no documented value works
+# (std/pro/fast/t2v all "invalid mode", 2026-08-25) — pass `mode` through
+# from the client once Agnes documents it.
+video_models = ["agnes-video-v2.0", "agnes-video-2.5-flash", "agnes-video-2.5"]
 
 # b.ai — 42 models (Claude/GPT/Gemini/GLM/Qwen), nearly all deposit-gated
 # ("Access restricted. Deposit required to unlock premium models"). Full
@@ -780,6 +815,12 @@ models = [
 [providers.groq.limits]
 rpm = 25
 daily_requests = 1000
+# Groq whisper: the best free STT we hold (generous daily quota, very fast).
+# Plain OpenAI multipart. NB groq infers the format from the FILENAME — a
+# file part without a real extension is rejected.
+[providers.groq.media]
+transcription_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+transcription_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
 
 # 6) Ant Ling — 500K tokens/day recurring (resets 02:00 UTC+8). Signup may need a
 #    Chinese phone/ID — unverified.
@@ -833,3 +874,93 @@ daily_requests = 1000
 # Google AI Studio (Gemini): DONE — served by [providers.google] above via
 # Google's OpenAI compat layer (/v1beta/openai/); no Gemini translator needed.
 # (This note previously claimed one was required — that was wrong.)
+# ---------------------------------------------------------------------------
+# Phase 2 (2026-08-25): non-chat capabilities.
+# Endpoints: /v1/images/generations, /v1/audio/transcriptions,
+# /v1/audio/speech, /v1/rerank, /v1/videos/generations, /v1/search, /v1/fetch.
+# CLI: pxy search / fetch / transcribe / say / image / video.
+# Media usage + cooldowns are tracked under <provider>#media, search/fetch
+# under search#<name> / fetch#<name> — never mixed with chat counters.
+# ---------------------------------------------------------------------------
+
+# ElevenLabs — media only. Free tier: 10k credits/month (TTS chars; STT
+# included). Library voices 402 on free — only premade voice ids work, hence
+# the map (keys mirror OpenAI voice names; "default" = Sarah).
+[providers.elevenlabs]
+api_key = { pass = "AI/elevenlabs/main" }
+auth_header = "xi-api-key"
+discover = false
+[providers.elevenlabs.media]
+kind = "elevenlabs"
+transcription_url = "https://api.elevenlabs.io/v1/speech-to-text"
+transcription_models = ["scribe_v1"]
+speech_url = "https://api.elevenlabs.io/v1/text-to-speech/{voice}"
+speech_models = ["eleven_turbo_v2_5", "eleven_multilingual_v2"]
+[providers.elevenlabs.media.voices]
+default = "EXAVITQu4vr4xnSDxMaL"   # Sarah
+alloy = "SAz9YHcvj6GT2YYXdXww"     # River
+echo = "IKne3meq5aSn9XLyUdCD"      # Charlie
+fable = "JBFqnCBsd6RMkjVDRZzb"     # George
+onyx = "CwhRBWXzGAHq8TQ4Fs17"      # Roger
+nova = "FGY2WhTYpPnrIDTdsKH5"      # Laura
+shimmer = "Xb7hH8MSUJpSbSDYk0k2"   # Alice
+
+# Voyage — embeddings + rerank (generous free token allowance per model).
+# Rerank dialect: top_k in, data[] out — pxy maps to/from Cohere shape.
+[providers.voyage]
+api_key = { pass = "AI/voyage-ai/main" }
+discover = false
+embeddings_url = "https://api.voyageai.com/v1/embeddings"
+embedding_models = ["voyage-3.5-lite", "voyage-3.5", "voyage-code-3"]
+[providers.voyage.media]
+kind = "voyage"
+rerank_url = "https://api.voyageai.com/v1/rerank"
+rerank_models = ["rerank-2.5-lite", "rerank-2.5"]
+
+# Jina — rerank (Cohere-compatible passthrough). Same key as jina-reader.
+[providers.jina]
+api_key = { pass = "AI/jina-reader/main" }
+discover = false
+[providers.jina.media]
+rerank_url = "https://api.jina.ai/v1/rerank"
+rerank_models = ["jina-reranker-v2-base-multilingual"]
+
+# Default model per capability (requests with model omitted or "auto").
+[media]
+image = "cloudflare/@cf/black-forest-labs/flux-1-schnell"
+transcription = "groq/whisper-large-v3-turbo"
+speech = "cloudflare/@cf/deepgram/aura-2-en"
+rerank = "voyage/rerank-2.5-lite"
+video = "agnes/agnes-video-v2.0"
+
+# Web search, priority order. Brave free = 2,000 q/month (cap with margin);
+# jina search shares the reader key; firecrawl = 500 credits/month split
+# between search and scrape below.
+[[search.providers]]
+name = "brave"
+kind = "brave"
+api_key = { pass = "AI/brave-search/main" }
+monthly_requests = 1900
+
+[[search.providers]]
+name = "jina"
+kind = "jina"
+api_key = { pass = "AI/jina-reader/main" }
+
+[[search.providers]]
+name = "firecrawl"
+kind = "firecrawl-search"
+api_key = { pass = "AI/firecrawl/main" }
+monthly_requests = 200
+
+# URL -> markdown. jina-reader first (big free quota), firecrawl fallback.
+[[fetch.providers]]
+name = "jina-reader"
+kind = "jina-reader"
+api_key = { pass = "AI/jina-reader/main" }
+
+[[fetch.providers]]
+name = "firecrawl"
+kind = "firecrawl-scrape"
+api_key = { pass = "AI/firecrawl/main" }
+monthly_requests = 200

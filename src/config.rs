@@ -43,6 +43,63 @@ pub struct Config {
     /// Model-quality ranking used to generate the `auto` chain.
     #[serde(default)]
     pub preferences: Preferences,
+    /// Phase 2: web search providers (ordered; first healthy wins).
+    #[serde(default)]
+    pub search: ServiceConfig,
+    /// Phase 2: URL -> markdown providers (ordered; first healthy wins).
+    #[serde(default)]
+    pub fetch: ServiceConfig,
+    /// Phase 2: default model per media capability (used when a request
+    /// omits `model` or asks for "auto").
+    #[serde(default)]
+    pub media: MediaDefaults,
+}
+
+/// A non-model HTTP service pool (search, fetch). Array of tables so config
+/// order is priority order.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfig {
+    #[serde(default)]
+    pub providers: Vec<ServiceProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceProvider {
+    pub name: String,
+    pub kind: ServiceKind,
+    pub api_key: SecretRef,
+    /// Free-quota guards, enforced locally against pxy's own counters.
+    pub daily_requests: Option<u64>,
+    pub monthly_requests: Option<u64>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceKind {
+    /// Brave web search (GET, X-Subscription-Token)
+    Brave,
+    /// Jina s.jina.ai search (POST {q, num})
+    Jina,
+    /// Firecrawl /v2/search
+    FirecrawlSearch,
+    /// Jina r.jina.ai reader (GET, markdown out)
+    JinaReader,
+    /// Firecrawl /v2/scrape
+    FirecrawlScrape,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaDefaults {
+    pub image: Option<String>,
+    pub transcription: Option<String>,
+    pub speech: Option<String>,
+    pub rerank: Option<String>,
+    pub video: Option<String>,
 }
 
 /// Bare model names (no provider), best first. Ordering INSIDE a tier only:
@@ -158,8 +215,11 @@ impl Config {
             if p.kind == ProviderKind::OpenaiCompat
                 && p.base_url.is_none()
                 && p.embeddings_url.is_none()
+                && p.media.is_none()
             {
-                anyhow::bail!("provider '{name}': base_url (or embeddings_url) is required");
+                anyhow::bail!(
+                    "provider '{name}': base_url (or embeddings_url / media) is required"
+                );
             }
         }
         for entry in &self.auto.models {
@@ -304,6 +364,63 @@ pub struct ProviderConfig {
     /// recognized: OpenRouter's `data.{total_credits,total_usage}` (dollars)
     /// and the OpenAI/new-api `total_usage` (cents).
     pub balance_url: Option<String>,
+    /// Phase 2 media capabilities (images, audio, rerank, video).
+    pub media: Option<MediaConfig>,
+}
+
+/// Non-chat capabilities of a provider. URLs may contain `{model}` (and, for
+/// speech, `{voice}`) placeholders. `run_url` is the fallback for every
+/// capability URL — cloudflare serves all media through one run template.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Wire dialect. `openai` = canonical shapes pass through untouched.
+    #[serde(default)]
+    pub kind: MediaKind,
+    pub run_url: Option<String>,
+    pub images_url: Option<String>,
+    #[serde(default)]
+    pub image_models: Vec<String>,
+    /// Fields merged into image requests when absent (agnes requires `size`).
+    #[serde(default)]
+    pub image_defaults: BTreeMap<String, serde_json::Value>,
+    pub transcription_url: Option<String>,
+    #[serde(default)]
+    pub transcription_models: Vec<String>,
+    pub speech_url: Option<String>,
+    #[serde(default)]
+    pub speech_models: Vec<String>,
+    /// Voice-name -> provider voice id (elevenlabs). Key "default" is used
+    /// when the request has no `voice`; an unmapped name passes through.
+    #[serde(default)]
+    pub voices: BTreeMap<String, String>,
+    pub rerank_url: Option<String>,
+    #[serde(default)]
+    pub rerank_models: Vec<String>,
+    pub video_url: Option<String>,
+    /// Poll URL template with `{id}` (agnes job flow).
+    pub video_status_url: Option<String>,
+    #[serde(default)]
+    pub video_models: Vec<String>,
+    /// Media-only daily request cap, counted separately from chat usage.
+    /// Billing safety for providers where overage costs money (cloudflare).
+    pub daily_requests: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MediaKind {
+    /// OpenAI images/audio + Cohere rerank shapes, passed through.
+    #[default]
+    Openai,
+    /// Workers AI run endpoint: JSON-or-binary results per task type.
+    Cloudflare,
+    /// ElevenLabs native TTS/STT.
+    Elevenlabs,
+    /// Voyage rerank (top_k / data[] instead of top_n / results[]).
+    Voyage,
+    /// Agnes: OpenAI-ish images + async video job (submit then poll).
+    Agnes,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -349,6 +466,7 @@ impl ProviderConfig {
             tier: Tier::default(),
             promo: None,
             balance_url: None,
+            media: None,
         }
     }
 }
@@ -375,6 +493,9 @@ mod tests {
             auto: AutoConfig::default(),
             launch: LaunchConfig::default(),
             preferences: Preferences::default(),
+            search: ServiceConfig::default(),
+            fetch: ServiceConfig::default(),
+            media: MediaDefaults::default(),
         };
         let generated: Generated = toml::from_str(
             r#"
@@ -413,6 +534,8 @@ pub enum AuthHeader {
     #[default]
     Bearer,
     XApiKey,
+    /// ElevenLabs' `xi-api-key` (Bearer is rejected with 401)
+    XiApiKey,
 }
 
 #[derive(Debug, Clone, Deserialize)]

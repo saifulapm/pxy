@@ -34,8 +34,24 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/models", get(models))
+        .route("/v1/images/generations", post(crate::media::images::generations))
+        .route("/v1/audio/transcriptions", post(crate::media::audio::transcriptions))
+        .route("/v1/audio/speech", post(crate::media::audio::speech))
+        .route("/v1/rerank", post(crate::media::rerank::rerank))
+        .route("/v1/videos/generations", post(crate::media::video::generations))
+        .route(
+            "/v1/search",
+            post(crate::media::search::search),
+        )
+        .route(
+            "/v1/fetch",
+            post(crate::media::search::fetch).get(crate::media::search::fetch_get),
+        )
         .route("/healthz", get(healthz))
         .fallback(not_found)
+        // axum's default body cap is 2 MB, which rejects any real audio
+        // upload before the transcription handler runs.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(app);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -343,6 +359,49 @@ pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
         .is_err()
         {
             break;
+        }
+    }
+
+    // Media + service pools use synthetic usage keys (provider#media,
+    // search#name, fetch#name) with default UTC windows.
+    let mut service_rows: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
+    for (name, p) in &cfg.providers {
+        if let Some(m) = p.media.as_ref().filter(|_| p.enabled) {
+            service_rows.push((crate::media::media_key(name), m.daily_requests, None));
+        }
+    }
+    for (scope, svc) in [("search", &cfg.search), ("fetch", &cfg.fetch)] {
+        for p in svc.providers.iter().filter(|p| p.enabled) {
+            service_rows.push((
+                format!("{scope}#{}", p.name),
+                p.daily_requests,
+                p.monthly_requests,
+            ));
+        }
+    }
+    let default_limits = crate::config::Limits::default();
+    if let Ok(w) = current_windows(&default_limits, now) {
+        for (key, daily, monthly) in service_rows {
+            let day = state.usage(&key, "day", w.day_start).unwrap_or_default();
+            let month = state.usage(&key, "month", w.month_start).unwrap_or_default();
+            let total = state.usage_total(&key).unwrap_or_default();
+            if day.requests == 0 && month.requests == 0 && total.requests == 0 {
+                continue; // unused pools stay out of the table
+            }
+            let fmt_limit = |used: u64, limit: Option<u64>| match limit {
+                Some(l) => format!("{used}/{l}"),
+                None => format!("{used}"),
+            };
+            let _ = writeln!(
+                out,
+                "{:<20} {:>10} {:>14} {:>12} {:>14} {:>16}",
+                key,
+                fmt_limit(day.requests, daily),
+                day.tokens,
+                fmt_limit(month.requests, monthly),
+                month.tokens,
+                total.tokens,
+            );
         }
     }
 
