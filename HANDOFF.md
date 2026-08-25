@@ -5,7 +5,7 @@ Read this first in a new session, then `docs/07-pxy-design.md` for design ration
 ## What pxy is
 
 A tiny Rust proxy replacing OmniRoute (a heavy Node router that used ~800 MB RAM).
-**pxy uses ~12.5 MB.** One local endpoint over 27 providers, an `auto` model that routes by
+**pxy uses ~12.5 MB.** One local endpoint over 28 providers, an `auto` model that routes by
 priority + quota with automatic failover, and `pxy launch claude|opencode|pi` to wire coding
 agents to it. Repo: `github.com/saifulapm/pxy` (private).
 
@@ -21,7 +21,7 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 ```sh
 pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
-pxy models                    # 130 models exposed
+pxy models                    # 137 models exposed
 pxy status                    # per-provider usage vs limits
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
@@ -58,7 +58,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
 - 24 unit tests: `cargo test`.
 
-## Provider catalog (27 active)
+## Provider catalog (28 active)
 
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
@@ -73,6 +73,11 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
 
 **Free, renewable:**
+- `kilocode` — Kilo Code gateway (added 2026-08-25, **Phase 3 #1 — zero Rust needed**):
+  the archived device-flow token is a long-lived JWT (exp ~2031, no refresh), so it's a
+  plain bearer + `X-KILOCODE-EDITORNAME` header, with a `cmd` secret extracting the token
+  from the OAuth JSON in pass. 17 `:free` models; hy3:free + minimax-m3:free in `auto`.
+  Paid models refuse cleanly at $0. `kilo-auto/free` router id is broken — skip it.
 - `google` — AI Studio Gemini free tier (added 2026-08-25) via Google's **OpenAI compat
   layer** (`/v1beta/openai/` — docs/08's "needs a Gemini translator" was WRONG, 3rd
   correction). gemini-3-flash-preview (in `auto`), 3.1-flash-lite, 2.5-flash; all 1M ctx,
@@ -176,7 +181,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    image/video and Tencent's `hy-3d-*` models. `/v1/embeddings` already exists (4 pools:
    tencent kinfra, alibaba qwen, fireworks qwen3-8b, voyage pending).
 3. **Phase 3 — OAuth providers**, one at a time, easiest first (research in docs/06):
-   kilocode (easy) → kimi-coding (device flow + persistent device id) → antigravity/agy
+   ~~kilocode~~ (DONE 2026-08-25 — token turned out long-lived, plain config, no Rust) →
+   kimi-coding (device flow + persistent device id, refresh tokens ROTATE) → antigravity/agy
    (Google auth-code + Cloud Code envelope) → kiro/amazon-q (AWS eventstream binary parser).
    Credentials for all of these are already archived in `pass`.
 4. **Nice-to-haves identified but not built**:

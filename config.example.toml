@@ -48,6 +48,8 @@ models = [
   "aihubmix/gemini-3.7-flash-free",                # 2nd Gemini pool via aggregator, 1M ctx
   "aihubmix/minimax-m3-free",                      # outlives the openrouter GMI promo
   "aihubmix/ox-alpha",                             # 4th ox-alpha pool, deep fallback
+  "kilocode/tencent/hy3:free",                     # hy3 pool #3 (295B reasoning)
+  "kilocode/minimax/minimax-m3:free",              # M3 pool #4, 1M ctx
   "agnes/agnes-2.5-flash",                         # free flash tier
 
   # --- deeper Go fallbacks (still very high allowance) ---
@@ -589,6 +591,30 @@ total_tokens = 100000000
 #    = 250 req/day, 70K TPM, built-in web search/code-exec; REJECTS external
 #    tools ("tool calling is not supported"), so ask it questions directly.
 #    ~3000 tok/s. No card on the account = hard 429 stop, no billing risk.
+# Kilo Code gateway — Phase 3 #1, ACTIVE 2026-08-25, and it needed ZERO Rust:
+# the device-flow token archived in pass is a long-lived JWT (exp ~2031, no
+# refresh), so runtime is a plain bearer + the mandatory X-KILOCODE-EDITORNAME
+# header. The `cmd` secret extracts the token from the archived OAuth JSON.
+# Free tier: 17 `:free` models (tool calling verified on 4); paid models
+# refuse cleanly ("Add credits to continue") — zero billing risk. The
+# `kilo-auto/free` router id errors — use concrete model ids. Rate limits
+# undocumented; rpm kept modest, 429s handled by cooldown/failover.
+[providers.kilocode]
+base_url = "https://api.kilo.ai/api/openrouter/chat/completions"
+api_key = { cmd = "pass show 'AI/kilocode/saiful.apm@gmail.com' | jq -r .access_token" }
+headers = { X-KILOCODE-EDITORNAME = "pxy" }
+models = [
+  { id = "tencent/hy3:free", context_length = 262144 },
+  { id = "minimax/minimax-m3:free", context_length = 1048576 },
+  { id = "nvidia/nemotron-3-ultra-550b-a55b:free", context_length = 1000000 },
+  { id = "meituan/longcat-2.0-free", context_length = 1048576 },
+  { id = "poolside/laguna-s-2.1:free", context_length = 262144 },
+  { id = "stepfun/step-3.7-flash:free", context_length = 262144 },
+  { id = "thinkingmachines/inkling:free", context_length = 1048576 },
+]
+[providers.kilocode.limits]
+rpm = 15
+
 # Google AI Studio (Gemini API) — free tier, ACTIVE 2026-08-25. docs/08 said
 # this needs a Gemini translator: WRONG (3rd correction) — Google's OpenAI
 # compatibility layer (/v1beta/openai/) does chat + tool calling fine.
