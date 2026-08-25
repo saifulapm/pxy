@@ -300,6 +300,10 @@ pub struct ProviderConfig {
     /// `expiration_date` on 8 of 419 models, and not on the promo we use), so
     /// the deadline is declared here.
     pub promo: Option<Promo>,
+    /// Remote billing endpoint for `pxy status --remote`. Two shapes are
+    /// recognized: OpenRouter's `data.{total_credits,total_usage}` (dollars)
+    /// and the OpenAI/new-api `total_usage` (cents).
+    pub balance_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -344,6 +348,7 @@ impl ProviderConfig {
             id_field: None,
             tier: Tier::default(),
             promo: None,
+            balance_url: None,
         }
     }
 }

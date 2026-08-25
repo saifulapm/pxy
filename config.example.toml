@@ -203,6 +203,7 @@ models = [
 # (accounts under $10 lifetime get only 50/day).
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1/chat/completions"
+balance_url = "https://openrouter.ai/api/v1/credits"
 api_key = { pass = "AI/openrouter/main" }
 headers = { HTTP-Referer = "http://localhost", X-Title = "pxy" }
 models = [
@@ -442,6 +443,8 @@ rpm = 10
 tier = "reserve"
 format = "anthropic"
 base_url = "https://agentrouter.org/v1/messages"
+# Same account/key as agentrouter-openai — one balance, fetched once here.
+balance_url = "https://agentrouter.org/v1/dashboard/billing/usage"
 auth_header = "x-api-key"
 api_key = { pass = "AI/agentrouter/main" }
 headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
@@ -479,6 +482,7 @@ models = [
 tier = "reserve"
 format = "anthropic"
 base_url = "https://tabitoken.com/v1/messages"
+balance_url = "https://tabitoken.com/v1/dashboard/billing/usage"
 auth_header = "x-api-key"
 api_key = { pass = "AI/tabitoken/main" }
 headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
@@ -496,6 +500,7 @@ models = [
 tier = "reserve"
 format = "anthropic"
 base_url = "https://gorouter.app/v1/messages"
+balance_url = "https://gorouter.app/v1/dashboard/billing/usage"
 auth_header = "x-api-key"
 api_key = { pass = "AI/gorouter/main" }
 headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
@@ -513,6 +518,7 @@ models = [
 [providers.tokenrouter]
 tier = "finite"
 base_url = "https://api.tokenrouter.com/v1/chat/completions"
+balance_url = "https://api.tokenrouter.com/v1/dashboard/billing/usage"
 api_key = { pass = "AI/tokenrouter/main" }
 models = [
   { id = "qwen/qwen3.8-max-free", context_length = 262144 },

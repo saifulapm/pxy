@@ -45,7 +45,11 @@ enum Command {
     /// List available models
     Models,
     /// Show provider status (cooldowns, usage)
-    Status,
+    Status {
+        /// Also query providers' remote billing endpoints (balance_url)
+        #[arg(long)]
+        remote: bool,
+    },
     /// Discover live provider catalogs; report drift and optionally regenerate
     Refresh {
         /// Write generated.toml (model lists + auto chain). Without this the
@@ -103,12 +107,12 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(refresh::run(&cfg, &secrets, write, &out))
         }
-        Command::Status => {
+        Command::Status { remote } => {
             let cfg = config::Config::load(&cfg_path)?;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(server::print_status(&cfg))
+                .block_on(server::print_status(&cfg, remote))
         }
     }
 }

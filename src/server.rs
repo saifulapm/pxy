@@ -247,7 +247,8 @@ async fn not_found() -> Response {
 }
 
 /// `pxy status`: reads config + sqlite (works while the daemon runs — WAL).
-pub async fn print_status(cfg: &Config) -> Result<()> {
+/// With `remote`, also queries each provider's `balance_url` (concurrent).
+pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
     use std::io::Write;
     let state = PxyState::open(&crate::config::data_dir().join("state.sqlite"))?;
     let now = Timestamp::now();
@@ -283,5 +284,87 @@ pub async fn print_status(cfg: &Config) -> Result<()> {
             break;
         }
     }
+
+    if remote {
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let secrets = Secrets::new();
+        let targets: Vec<(&String, &crate::config::ProviderConfig, &String)> = cfg
+            .providers
+            .iter()
+            .filter(|(_, p)| p.enabled)
+            .filter_map(|(n, p)| p.balance_url.as_ref().map(|u| (n, p, u)))
+            .collect();
+        if targets.is_empty() {
+            let _ = writeln!(out, "\nno balance_url configured on any provider");
+            return Ok(());
+        }
+        let fetches = targets.iter().map(|(name, p, url)| {
+            let http = &http;
+            let secrets = &secrets;
+            let state = &state;
+            async move {
+                let line = fetch_balance(name, p, url, secrets, state, http).await;
+                (name.to_string(), line)
+            }
+        });
+        let results = futures_util::future::join_all(fetches).await;
+        let _ = writeln!(out, "\nremote balances:");
+        for (name, line) in results {
+            let _ = writeln!(out, "  {name:<20} {line}");
+        }
+    }
     Ok(())
+}
+
+/// One provider's balance line. Never errors — a broken endpoint reports
+/// itself in place of a number.
+async fn fetch_balance(
+    name: &str,
+    p: &crate::config::ProviderConfig,
+    url: &str,
+    secrets: &Secrets,
+    state: &PxyState,
+    http: &reqwest::Client,
+) -> String {
+    let prepared = match crate::providers::prepare(name, p, secrets, state, http).await {
+        Ok(pr) => pr,
+        Err(e) => return format!("credential error: {e:#}"),
+    };
+    let mut req = http.get(url);
+    for (k, v) in &prepared.headers {
+        req = req.header(k, v);
+    }
+    // Providers whose chat route wants x-api-key (gorouter, tabitoken) still
+    // gate billing behind a Bearer header; mirror the key into both.
+    if !prepared.headers.iter().any(|(k, _)| k == "authorization") {
+        if let Some((_, key)) = prepared.headers.iter().find(|(k, _)| k == "x-api-key") {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return format!("network: {e}"),
+    };
+    let status = resp.status().as_u16();
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return format!("HTTP {status}: non-JSON body"),
+    };
+    if status >= 400 {
+        return format!("HTTP {status}");
+    }
+    // OpenRouter: dollars, with the grant total alongside.
+    if let (Some(credits), Some(usage)) =
+        (body["data"]["total_credits"].as_f64(), body["data"]["total_usage"].as_f64())
+    {
+        return format!("${:.2} left of ${credits:.2}", credits - usage);
+    }
+    // OpenAI/new-api dashboard billing: total_usage in cents.
+    if let Some(cents) = body["total_usage"].as_f64() {
+        return format!("used ${:.2}", cents / 100.0);
+    }
+    format!("unrecognized shape: {}", &body.to_string().chars().take(120).collect::<String>())
 }
