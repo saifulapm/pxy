@@ -32,7 +32,7 @@ enum Command {
     Serve,
     /// Launch a coding agent wired to pxy
     Launch {
-        /// Agent: claude | opencode | pi
+        /// Agent: claude | opencode | pi | codex | fx
         agent: String,
         /// Model to use (pxy model id, e.g. "auto" or "provider/model")
         #[arg(long, short)]

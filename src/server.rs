@@ -47,6 +47,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
             "/v1/fetch",
             post(crate::media::search::fetch).get(crate::media::search::fetch_get),
         )
+        // fx (vercel-labs/fx) impersonates its AI Gateway here: the generation
+        // endpoint plus the catalog/credits GETs it makes. See translate/aisdk.
+        .route("/v3/ai/language-model", post(ai_language_model))
+        .route("/coding-agent/v1/models", get(fx_models))
+        .route("/coding-agent/v1/credits", get(fx_credits))
         .route("/healthz", get(healthz))
         // Claude Code posts telemetry batches here; a 404 makes it retry.
         // Accept and discard (litellm ships the same stub for the same reason).
@@ -182,6 +187,105 @@ async fn responses(
             )
         }
     }
+}
+
+/// `POST /v3/ai/language-model` — the fx generation endpoint. Model id and
+/// streaming arrive as HEADERS in this dialect, not body fields.
+async fn ai_language_model(
+    State(app): State<SharedApp>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    use futures_util::StreamExt;
+
+    let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let model = hdr("ai-language-model-id").unwrap_or("auto").to_string();
+    let stream = hdr("ai-language-model-streaming") != Some("false");
+    let ctx = client_ctx(&headers);
+
+    let chat_payload = crate::translate::aisdk::request(&payload, &model, stream);
+    let outcome = router::handle_chat(app, ClientFormat::Openai, chat_payload, ctx).await;
+    match outcome {
+        Outcome::Json { status, body, provider } => {
+            let body = if status == 200 { crate::translate::aisdk::response(&body) } else { body };
+            outcome_response(Outcome::Json { status, body, provider }, ClientFormat::Openai)
+        }
+        Outcome::Stream { provider, body } => {
+            let state = crate::translate::aisdk::StreamState::new(&model);
+            let parser = crate::translate::sse::SseParser::new();
+            let upstream = body.into_data_stream();
+            let stream = futures_util::stream::unfold(
+                (upstream, parser, state, false),
+                |(mut upstream, mut parser, mut state, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    match upstream.next().await {
+                        Some(Ok(bytes)) => {
+                            let mut out = String::new();
+                            for ev in parser.feed(&bytes) {
+                                out.push_str(&state.on_data(&ev.data));
+                            }
+                            Some((
+                                Ok::<_, std::io::Error>(bytes::Bytes::from(out)),
+                                (upstream, parser, state, false),
+                            ))
+                        }
+                        _ => {
+                            let tail = bytes::Bytes::from(state.finish());
+                            Some((Ok(tail), (upstream, parser, state, true)))
+                        }
+                    }
+                },
+            );
+            outcome_response(
+                Outcome::Stream { provider, body: axum::body::Body::from_stream(stream) },
+                ClientFormat::Openai,
+            )
+        }
+    }
+}
+
+/// fx's model catalog. Entries need `type: "language"` or fx drops them;
+/// `tags` drive its capability display. Ids must be byte-equal to what fx
+/// will send back in `ai-language-model-id`.
+async fn fx_models(State(app): State<SharedApp>) -> Json<Value> {
+    let mut data: Vec<Value> = Vec::new();
+    let auto_chain = app.catalog.resolve(&app.cfg, "auto");
+    let mut push = |id: String, ctx: u64, max_out: u64, tools: bool| {
+        let mut tags = vec![json!("tool-use")];
+        if !tools {
+            tags.clear();
+        }
+        data.push(json!({
+            "id": id,
+            "type": "language",
+            "owned_by": "pxy",
+            "tags": tags,
+            "context_window": ctx,
+            "max_tokens": max_out,
+        }));
+    };
+    if !auto_chain.is_empty() {
+        let ctx = auto_chain.iter().map(|c| c.model.context_length).min().unwrap_or(0);
+        let max_out = auto_chain.iter().map(|c| c.model.max_output_tokens).min().unwrap_or(0);
+        push("auto".into(), ctx, max_out, true);
+    }
+    for cand in app.catalog.models() {
+        push(
+            cand.full_id(),
+            cand.model.context_length,
+            cand.model.max_output_tokens,
+            cand.model.tool_call != Some(false),
+        );
+    }
+    Json(json!({"data": data}))
+}
+
+/// fx's credit check. All three fields must be STRINGS or fx drops them.
+/// pxy is free-first and does no dollar accounting, so this is cosmetic.
+async fn fx_credits() -> Json<Value> {
+    Json(json!({"balance": "0", "used": "0", "plan": "pxy"}))
 }
 
 async fn messages(

@@ -30,7 +30,10 @@ pub fn launch(
         "opencode" => launch_opencode(cfg, &catalog, &model, dry_run, extra_args),
         "pi" => launch_pi(cfg, &catalog, &model, dry_run, extra_args),
         "codex" => launch_codex(cfg, &model, dry_run, extra_args),
-        other => anyhow::bail!("unknown agent '{other}' (supported: claude, opencode, pi, codex)"),
+        "fx" => launch_fx(cfg, &model, dry_run, extra_args),
+        other => {
+            anyhow::bail!("unknown agent '{other}' (supported: claude, opencode, pi, codex, fx)")
+        }
     }
 }
 
@@ -188,6 +191,38 @@ fn launch_codex(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String])
     cmd.env("PXY_API_KEY", &cfg.server.api_key);
 
     exec_or_print(cmd, dry_run, "codex wired via -c model_providers.pxy overrides")
+}
+
+// ---------------------------------------------------------------------------
+// fx (vercel-labs/fx)
+// ---------------------------------------------------------------------------
+
+/// fx talks to Vercel's AI Gateway in the AI SDK LanguageModel dialect; pxy
+/// serves that at /v3/ai/language-model (translate/aisdk).
+///
+/// Two overrides are needed, not one: `FX_GATEWAY_BASE_URL` redirects the
+/// catalog/credits GETs, while the generation POST reads its own
+/// `FX_GATEWAY_CHAT_URL`. fx silently ignores either unless the URL is
+/// loopback HTTP with an explicit port (the base URL carries the bearer
+/// token), which pxy's 127.0.0.1:<port> satisfies.
+///
+/// `AI_GATEWAY_API_KEY` short-circuits fx's credential chain: no Vercel
+/// login, no token refresh, no team lookup — zero traffic leaves the machine.
+fn launch_fx(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String]) -> Result<()> {
+    let mut cmd = Command::new("fx");
+    // A stale Vercel session would otherwise outrank the injected key.
+    for (key, _) in std::env::vars() {
+        if key.starts_with("FX_") || key.starts_with("AI_GATEWAY_") || key == "VERCEL_OIDC_TOKEN" {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("AI_GATEWAY_API_KEY", &cfg.server.api_key);
+    cmd.env("FX_GATEWAY_BASE_URL", cfg.base_url());
+    cmd.env("FX_GATEWAY_CHAT_URL", format!("{}/v3/ai/language-model", cfg.base_url()));
+    cmd.env("FX_MODEL", model);
+    cmd.args(extra_args);
+
+    exec_or_print(cmd, dry_run, "fx wired via FX_GATEWAY_* + AI_GATEWAY_API_KEY")
 }
 
 // ---------------------------------------------------------------------------
