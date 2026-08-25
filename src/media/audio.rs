@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use super::{Capability, error_response, images::preflight};
+use super::{Attempt, Capability, error_response};
 use crate::config::MediaKind;
 use crate::router::SharedApp;
 
@@ -58,18 +58,22 @@ pub async fn transcriptions(State(app): State<SharedApp>, multipart: Multipart) 
         .find(|(k, _)| k == "model")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
-    let Some(r) = super::resolve(&app.cfg, Capability::Transcription, &requested) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            format!("transcription model '{requested}' not found"),
-        );
-    };
-    if let Some(resp) = preflight(&app, &r) {
-        return resp;
-    }
-    let headers = match super::auth_headers(&app, r.cfg) {
+    super::run_chain(&app, Capability::Transcription, &requested, |r| {
+        Box::pin(attempt_transcription(&app, r, &upload))
+    })
+    .await
+}
+
+async fn attempt_transcription(
+    app: &crate::router::App,
+    r: &super::Resolved<'_>,
+    upload: &Upload,
+) -> Attempt {
+    let headers = match super::auth_headers(app, r.cfg) {
         Ok(h) => h,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")));
+        }
     };
 
     let mut req = app
@@ -125,11 +129,10 @@ pub async fn transcriptions(State(app): State<SharedApp>, multipart: Multipart) 
 
     let resp = match resp {
         Ok(resp) => resp,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("network: {e}")),
+        Err(e) => return super::network_failure(app, r, e),
     };
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        super::cool_on_failure(&app, &r.provider, &r.model, status);
+    if resp.status().as_u16() >= 400 {
+        return super::failed_attempt(app, r, resp).await;
     }
     let content_type = resp
         .headers()
@@ -139,7 +142,12 @@ pub async fn transcriptions(State(app): State<SharedApp>, multipart: Multipart) 
         .to_string();
     let bytes = match resp.bytes().await {
         Ok(b) => b,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("reading body: {e}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("reading body: {e}"),
+            ));
+        }
     };
 
     // Native dialects wrap the transcript; unwrap to the OpenAI `{text}`
@@ -151,13 +159,13 @@ pub async fn transcriptions(State(app): State<SharedApp>, multipart: Multipart) 
         _ => None,
     };
     let unwraps = matches!(r.media.kind, MediaKind::Cloudflare | MediaKind::Dashscope);
-    let (body, content_type) = if status < 400 && unwraps {
+    let (body, content_type) = if unwraps {
         let text = serde_json::from_slice::<Value>(&bytes).ok().as_ref().and_then(wrapped_text);
         let Some(text) = text else {
-            return error_response(
+            return Attempt::Retryable(error_response(
                 StatusCode::BAD_GATEWAY,
                 format!("no transcript in upstream response: {}", String::from_utf8_lossy(&bytes)),
-            );
+            ));
         };
         (
             serde_json::to_vec(&json!({"text": text})).unwrap_or_default(),
@@ -167,54 +175,50 @@ pub async fn transcriptions(State(app): State<SharedApp>, multipart: Multipart) 
         (bytes.to_vec(), content_type)
     };
 
-    if status < 400 {
-        // Audio seconds aren't reported by most providers; count any token
-        // usage the body happens to carry (mistral does).
-        let tokens = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|v| v["usage"]["total_tokens"].as_u64())
-            .unwrap_or(0);
-        super::add_units(&app, &super::media_key(&r.provider), tokens);
-        app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
-    }
-    let mut resp = (
-        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-        [("content-type", content_type)],
-        body,
-    )
-        .into_response();
+    // Audio seconds aren't reported by most providers; count any token
+    // usage the body happens to carry (mistral does).
+    let tokens = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["usage"]["total_tokens"].as_u64())
+        .unwrap_or(0);
+    super::add_units(app, &super::media_key(&r.provider), tokens);
+    app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
+
+    let mut resp = (StatusCode::OK, [("content-type", content_type)], body).into_response();
     if let Ok(v) = format!("{}/{}", r.provider, r.model).parse() {
         resp.headers_mut().insert("x-pxy-provider", v);
     }
-    resp
+    Attempt::Ok(resp)
 }
 
 pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) -> Response {
     let requested = payload["model"].as_str().unwrap_or("").to_string();
-    let Some(r) = super::resolve(&app.cfg, Capability::Speech, &requested) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            format!("speech model '{requested}' not found"),
-        );
-    };
-    if let Some(resp) = preflight(&app, &r) {
-        return resp;
-    }
     let input = payload["input"].as_str().unwrap_or("").to_string();
     if input.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "'input' is required");
     }
+    super::run_chain(&app, Capability::Speech, &requested, |r| {
+        Box::pin(attempt_speech(&app, r, &payload, &input))
+    })
+    .await
+}
 
+async fn attempt_speech(
+    app: &crate::router::App,
+    r: &super::Resolved<'_>,
+    payload: &Value,
+    input: &str,
+) -> Attempt {
     let (url, body) = match r.media.kind {
         MediaKind::Cloudflare => (r.url.clone(), json!({"text": input})),
         MediaKind::Elevenlabs => {
-            let voice = resolve_voice(&payload, r.media);
+            let voice = resolve_voice(payload, r.media);
             let url = format!("{}?output_format=mp3_44100_128", r.url.replace("{voice}", &voice));
             (url, json!({"text": input, "model_id": r.model}))
         }
         MediaKind::Dashscope => {
-            let voice = resolve_voice(&payload, r.media);
-            (r.url.clone(), super::dashscope::speech_request(&r.model, &input, &voice))
+            let voice = resolve_voice(payload, r.media);
+            (r.url.clone(), super::dashscope::speech_request(&r.model, input, &voice))
         }
         _ => {
             let mut body = payload.clone();
@@ -223,9 +227,11 @@ pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         }
     };
 
-    let headers = match super::auth_headers(&app, r.cfg) {
+    let headers = match super::auth_headers(app, r.cfg) {
         Ok(h) => h,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")));
+        }
     };
     let mut req = app
         .http
@@ -237,16 +243,14 @@ pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
     }
     let resp = match req.json(&body).send().await {
         Ok(resp) => resp,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("network: {e}")),
+        Err(e) => return super::network_failure(app, r, e),
     };
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        super::cool_on_failure(&app, &r.provider, &r.model, status);
-        return super::passthrough_error(resp).await;
+    if resp.status().as_u16() >= 400 {
+        return super::failed_attempt(app, r, resp).await;
     }
 
     // TTS quotas are per character (elevenlabs' 10k/month); count them.
-    super::add_units(&app, &super::media_key(&r.provider), input.chars().count() as u64);
+    super::add_units(app, &super::media_key(&r.provider), input.chars().count() as u64);
     app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
 
     let content_type = resp
@@ -259,10 +263,10 @@ pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         // DashScope answers with a signed OSS URL; fetch and relay the bytes.
         let v: Value = resp.json().await.unwrap_or_default();
         let Some(url) = super::dashscope::speech_audio_url(&v) else {
-            return error_response(
+            return Attempt::Retryable(error_response(
                 StatusCode::BAD_GATEWAY,
                 format!("no audio url in upstream response: {v}"),
-            );
+            ));
         };
         return match app.http.get(&url).timeout(std::time::Duration::from_secs(60)).send().await {
             Ok(audio) if audio.status().is_success() => {
@@ -273,29 +277,39 @@ pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
                     .filter(|c| c.starts_with("audio/"))
                     .unwrap_or("audio/wav")
                     .to_string();
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", ct)
-                    .body(axum::body::Body::from_stream(audio.bytes_stream()))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                Attempt::Ok(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", ct)
+                        .body(axum::body::Body::from_stream(audio.bytes_stream()))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                )
             }
-            Ok(audio) => {
-                error_response(StatusCode::BAD_GATEWAY, format!("fetching audio: http {}", audio.status()))
-            }
-            Err(e) => error_response(StatusCode::BAD_GATEWAY, format!("fetching audio: {e}")),
+            Ok(audio) => Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("fetching audio: http {}", audio.status()),
+            )),
+            Err(e) => Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("fetching audio: {e}"),
+            )),
         };
     }
     if content_type.starts_with("application/json") {
         // JSON-wrapped audio (melotts): {result: {audio: base64}} -> bytes.
         let v: Value = resp.json().await.unwrap_or_default();
         let Some(b64) = v["result"]["audio"].as_str().or(v["audio"].as_str()) else {
-            return error_response(StatusCode::BAD_GATEWAY, "no audio in upstream response");
+            return Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                "no audio in upstream response",
+            ));
         };
         match base64::engine::general_purpose::STANDARD.decode(b64) {
-            Ok(bytes) => {
-                ([("content-type", "audio/mpeg")], bytes).into_response()
-            }
-            Err(e) => error_response(StatusCode::BAD_GATEWAY, format!("bad audio base64: {e}")),
+            Ok(bytes) => Attempt::Ok(([("content-type", "audio/mpeg")], bytes).into_response()),
+            Err(e) => Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("bad audio base64: {e}"),
+            )),
         }
     } else {
         let mut out = Response::builder()
@@ -304,8 +318,10 @@ pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         if let Ok(v) = format!("{}/{}", r.provider, r.model).parse::<axum::http::HeaderValue>() {
             out = out.header("x-pxy-provider", v);
         }
-        out.body(axum::body::Body::from_stream(resp.bytes_stream()))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        Attempt::Ok(
+            out.body(axum::body::Body::from_stream(resp.bytes_stream()))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        )
     }
 }
 

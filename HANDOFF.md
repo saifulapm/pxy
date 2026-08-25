@@ -97,11 +97,22 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   glm-5.3-free and its 404 killed the whole `auto` chain): in `auto`, an upstream 404 skips
   the candidate with a model-scoped cooldown + failover log; an explicit single-model
   request still passes the raw 404 through (Claude Code needs the unmodified body).
-- **Token accounting** comes only from real `usage` fields; never guess.
+- **Token accounting** comes only from real `usage` fields; never guess. A client
+  disconnect mid-stream (Ctrl-C'd agent turn) still records whatever real usage the
+  tap saw — `Drop for StreamCtx` (added 2026-08-25); the upstream billed those tokens.
+- **Media failover chains (added 2026-08-25)**: the `[media]` default per capability is
+  one id OR an ordered list (`image = ["cloudflare/…", "agnes/…"]` — bare string stays
+  valid). "auto"/omitted-model requests walk it: cooldown/cap-gated per candidate,
+  provider-side failures (401/402/403/408/409/429/5xx/network) fail over, fatal 4xx
+  passes through raw. Upstream 404 on a multi-candidate chain gets the same carve-out
+  as chat (non-retryable model cooldown + walk on). A bare id walks every provider
+  listing it (alphabetical — BTreeMap); explicit `provider/model` stays single-candidate
+  with raw error passthrough. Embeddings deliberately have NO cross-model failover:
+  different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 90 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and router
-  integration tests against a local mock upstream: dead-stream failover, retry-after
-  recovery, auth fail-fast, fatal stream-error passthrough).
+- 95 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
+  tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
+  fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover).
 
 ## Provider catalog (30 active)
 

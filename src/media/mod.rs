@@ -53,13 +53,24 @@ impl Capability {
         specific.or(m.run_url.as_deref())
     }
 
-    fn default_model<'a>(&self, cfg: &'a Config) -> Option<&'a str> {
+    fn default_models<'a>(&self, cfg: &'a Config) -> &'a [String] {
+        let chain = match self {
+            Capability::Image => &cfg.media.image,
+            Capability::Transcription => &cfg.media.transcription,
+            Capability::Speech => &cfg.media.speech,
+            Capability::Rerank => &cfg.media.rerank,
+            Capability::Video => &cfg.media.video,
+        };
+        chain.as_ref().map(|c| c.as_slice()).unwrap_or_default()
+    }
+
+    pub fn label(&self) -> &'static str {
         match self {
-            Capability::Image => cfg.media.image.as_deref(),
-            Capability::Transcription => cfg.media.transcription.as_deref(),
-            Capability::Speech => cfg.media.speech.as_deref(),
-            Capability::Rerank => cfg.media.rerank.as_deref(),
-            Capability::Video => cfg.media.video.as_deref(),
+            Capability::Image => "image",
+            Capability::Transcription => "transcription",
+            Capability::Speech => "speech",
+            Capability::Rerank => "rerank",
+            Capability::Video => "video",
         }
     }
 }
@@ -73,44 +84,178 @@ pub struct Resolved<'a> {
     pub url: String,
 }
 
-/// Resolve a requested model to (provider, model, url). Accepts
-/// `provider/model` (first-slash split — cloudflare ids contain slashes),
-/// a bare id matched against every provider's list (config order), or
-/// empty/"auto" -> the `[media]` default for this capability.
-pub fn resolve<'a>(cfg: &'a Config, capability: Capability, requested: &str) -> Option<Resolved<'a>> {
-    let requested = if requested.is_empty() || requested == "auto" {
-        capability.default_model(cfg)?
-    } else {
-        requested
-    };
+/// Ordered candidate chain for a request. An explicit `provider/model` stays
+/// a single candidate (its errors pass through raw, mirroring chat); a bare
+/// id yields EVERY provider listing it; empty/"auto" walks the configured
+/// `[media]` default chain in order (a single string is a chain of one).
+pub fn resolve_chain<'a>(
+    cfg: &'a Config,
+    capability: Capability,
+    requested: &str,
+) -> Vec<Resolved<'a>> {
+    if requested.is_empty() || requested == "auto" {
+        let mut chain: Vec<Resolved<'a>> = Vec::new();
+        for entry in capability.default_models(cfg) {
+            for r in resolve_one(cfg, capability, entry) {
+                if !chain.iter().any(|c| c.provider == r.provider && c.model == r.model) {
+                    chain.push(r);
+                }
+            }
+        }
+        return chain;
+    }
+    resolve_one(cfg, capability, requested)
+}
 
+/// Resolve one requested id. Accepts `provider/model` (first-slash split —
+/// cloudflare ids contain slashes) or a bare id matched against every
+/// provider's list.
+fn resolve_one<'a>(cfg: &'a Config, capability: Capability, requested: &str) -> Vec<Resolved<'a>> {
     let usable = |p: &&'a ProviderConfig| -> Option<&'a MediaConfig> {
         let m = p.media.as_ref()?;
-        if p.enabled && capability.url(m).is_some() { Some(m) } else { None }
+        // Video needs the poll URL too; a provider without one can't serve
+        // the job flow and must not enter a chain (it would burn a counted
+        // request per attempt without ever calling upstream).
+        let complete = capability != Capability::Video || m.video_status_url.is_some();
+        if p.enabled && capability.url(m).is_some() && complete { Some(m) } else { None }
+    };
+    let build = |prov: String, model: String, pcfg: &'a ProviderConfig, media: &'a MediaConfig| {
+        let url = capability.url(media)?.replace("{model}", &model);
+        Some(Resolved { provider: prov, model, cfg: pcfg, media, url })
     };
 
     // Provider-prefix parse first; a miss falls back to the bare-id scan so
     // ids that themselves contain slashes (cloudflare's @cf/...) still work
     // without the provider prefix.
-    let by_prefix = requested.split_once('/').and_then(|(prov, model)| {
-        let p = cfg.providers.get(prov)?;
-        let m = usable(&p)?;
-        Some((prov.to_string(), model.to_string(), p, m))
-    });
-    let (prov, model, pcfg, media) = match by_prefix {
-        Some(hit) => hit,
-        None => cfg.providers.iter().find_map(|(name, p)| {
+    if let Some((prov, model)) = requested.split_once('/')
+        && let Some(p) = cfg.providers.get(prov)
+        && let Some(m) = usable(&p)
+    {
+        return build(prov.to_string(), model.to_string(), p, m)
+            .into_iter()
+            .collect();
+    }
+    cfg.providers
+        .iter()
+        .filter_map(|(name, p)| {
             let m = usable(&p)?;
             capability
                 .models(m)
                 .iter()
                 .any(|id| id == requested)
-                .then(|| (name.clone(), requested.to_string(), p, m))
-        })?,
-    };
+                .then(|| build(name.clone(), requested.to_string(), p, m))
+                .flatten()
+        })
+        .collect()
+}
 
-    let url = capability.url(media)?.replace("{model}", &model);
-    Some(Resolved { provider: prov, model, cfg: pcfg, media, url })
+/// Outcome of one candidate attempt in a media failover chain.
+pub enum Attempt {
+    Ok(Response),
+    /// Provider-side failure: try the next candidate. The response is kept
+    /// as the answer of last resort.
+    Retryable(Response),
+    /// The caller's fault (or a definitive answer): return immediately —
+    /// every other provider would reject the same request identically.
+    Fatal(Response),
+}
+
+/// Walk the chain: gate each candidate (cooldown + cap), attempt, and fail
+/// over on provider-side failures. The last failure body is the client's
+/// answer when the whole chain is down. (Boxed futures rather than AsyncFn:
+/// axum needs Send futures, which AsyncFn bounds can't express yet.)
+pub async fn run_chain<'a>(
+    app: &'a App,
+    capability: Capability,
+    requested: &str,
+    attempt: impl for<'r> Fn(&'r Resolved<'a>) -> futures_util::future::BoxFuture<'r, Attempt>,
+) -> Response {
+    let chain = resolve_chain(&app.cfg, capability, requested);
+    if chain.is_empty() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("{} model '{requested}' not found", capability.label()),
+        );
+    }
+    let mut last: Option<Response> = None;
+    for r in &chain {
+        if let Some(gate) = preflight(app, r) {
+            last = Some(gate);
+            continue;
+        }
+        match attempt(r).await {
+            Attempt::Ok(resp) => return resp,
+            // Multi-candidate carve-out mirroring chat's classify_error:
+            // media model lists churn too, and one delisted id must not kill
+            // the whole chain. The cooldown is non-retryable — a 404 doesn't
+            // heal by waiting. An explicit single-candidate request still
+            // gets the raw 404 back.
+            Attempt::Fatal(resp)
+                if chain.len() > 1 && resp.status() == StatusCode::NOT_FOUND =>
+            {
+                app.state.set_cooldown(
+                    &media_key(&r.provider),
+                    Some(&r.model),
+                    None,
+                    false,
+                    "404 model not found upstream",
+                );
+                tracing::warn!(
+                    candidate = %format!("{}/{}", r.provider, r.model),
+                    "media failover (upstream 404)"
+                );
+                last = Some(resp);
+            }
+            Attempt::Fatal(resp) => return resp,
+            Attempt::Retryable(resp) => {
+                tracing::warn!(
+                    candidate = %format!("{}/{}", r.provider, r.model),
+                    "media failover"
+                );
+                last = Some(resp);
+            }
+        }
+    }
+    last.expect("chain is non-empty")
+}
+
+/// Cooldown + media-cap gate shared by all media handlers. When it passes,
+/// the request is COUNTED immediately (see `record`): the upstream call is
+/// about to happen, and a billed-but-lost response must not escape the cap.
+pub fn preflight(app: &App, r: &Resolved<'_>) -> Option<Response> {
+    let key = media_key(&r.provider);
+    if let Some(cd) = app.state.cooldown(&key, &r.model) {
+        return Some(error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("{key} cooling down ({})", cd.reason),
+        ));
+    }
+    if cap_exhausted(app, &r.provider, r.media) {
+        return Some(error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("{key} daily media cap reached"),
+        ));
+    }
+    record(app, &key);
+    None
+}
+
+/// Classify an upstream error status: cool down exactly like chat, pass the
+/// body through unmodified either way. Fatal 4xx (caller's fault) stops the
+/// chain; provider-side failures walk on.
+pub async fn failed_attempt(app: &App, r: &Resolved<'_>, resp: reqwest::Response) -> Attempt {
+    let status = resp.status().as_u16();
+    cool_on_failure(app, &r.provider, &r.model, status);
+    let retryable = matches!(status, 401 | 402 | 403 | 408 | 409 | 429) || status >= 500;
+    let response = passthrough_error(resp).await;
+    if retryable { Attempt::Retryable(response) } else { Attempt::Fatal(response) }
+}
+
+/// Transport failure before any status: cool the provider's media pool.
+pub fn network_failure(app: &App, r: &Resolved<'_>, e: impl std::fmt::Display) -> Attempt {
+    app.state
+        .set_cooldown(&media_key(&r.provider), None, None, true, "network error");
+    Attempt::Retryable(error_response(StatusCode::BAD_GATEWAY, format!("network: {e}")))
 }
 
 /// Usage/cooldown key for media traffic: isolated from the chat counters so
@@ -256,8 +401,10 @@ mod tests {
     #[test]
     fn resolves_prefixed_model_with_slashes() {
         let cfg = test_config();
-        let r = resolve(&cfg, Capability::Image, "cloudflare/@cf/black-forest-labs/flux-1-schnell")
-            .unwrap();
+        let chain =
+            resolve_chain(&cfg, Capability::Image, "cloudflare/@cf/black-forest-labs/flux-1-schnell");
+        assert_eq!(chain.len(), 1, "explicit provider/model stays a single candidate");
+        let r = &chain[0];
         assert_eq!(r.provider, "cloudflare");
         assert_eq!(r.model, "@cf/black-forest-labs/flux-1-schnell");
         assert_eq!(r.url, "https://cf.example/ai/run/@cf/black-forest-labs/flux-1-schnell");
@@ -267,14 +414,179 @@ mod tests {
     #[test]
     fn resolves_bare_id_and_default() {
         let cfg = test_config();
-        let bare = resolve(&cfg, Capability::Transcription, "whisper-large-v3-turbo").unwrap();
-        // Bare ids scan config order; cloudflare's list doesn't contain the
-        // groq id, so it lands on groq.
-        assert_eq!(bare.provider, "groq");
-        let default = resolve(&cfg, Capability::Transcription, "auto").unwrap();
-        assert_eq!(default.provider, "groq");
-        assert_eq!(default.url, "https://groq.example/v1/audio/transcriptions");
-        assert!(resolve(&cfg, Capability::Speech, "auto").is_none());
+        let bare = resolve_chain(&cfg, Capability::Transcription, "whisper-large-v3-turbo");
+        // Bare ids scan providers ALPHABETICALLY (BTreeMap); cloudflare's
+        // list doesn't contain the groq id, so it lands on groq.
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].provider, "groq");
+        let default = resolve_chain(&cfg, Capability::Transcription, "auto");
+        assert_eq!(default[0].provider, "groq");
+        assert_eq!(default[0].url, "https://groq.example/v1/audio/transcriptions");
+        assert!(resolve_chain(&cfg, Capability::Speech, "auto").is_empty());
+    }
+
+    #[test]
+    fn default_list_becomes_ordered_chain() {
+        let toml = r#"
+            [server]
+            port = 1
+            [providers.a]
+            base_url = "https://a.example/chat"
+            [providers.a.media]
+            images_url = "https://a.example/img"
+            image_models = ["ma"]
+            [providers.b]
+            base_url = "https://b.example/chat"
+            [providers.b.media]
+            images_url = "https://b.example/img"
+            image_models = ["mb"]
+            [media]
+            image = ["b/mb", "a/ma", "b/mb"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let chain = resolve_chain(&cfg, Capability::Image, "auto");
+        // Configured order wins (not provider alphabetical), duplicates drop.
+        assert_eq!(
+            chain.iter().map(|r| format!("{}/{}", r.provider, r.model)).collect::<Vec<_>>(),
+            ["b/mb", "a/ma"]
+        );
+    }
+
+    #[test]
+    fn bare_id_walks_every_provider_listing_it() {
+        let toml = r#"
+            [server]
+            port = 1
+            [providers.a]
+            base_url = "https://a.example/chat"
+            [providers.a.media]
+            transcription_url = "https://a.example/stt"
+            transcription_models = ["whisper"]
+            [providers.b]
+            base_url = "https://b.example/chat"
+            [providers.b.media]
+            transcription_url = "https://b.example/stt"
+            transcription_models = ["whisper"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let chain = resolve_chain(&cfg, Capability::Transcription, "whisper");
+        assert_eq!(chain.len(), 2, "same id on two providers = a failover pair");
+    }
+
+    #[tokio::test]
+    async fn chain_fails_over_to_next_provider() {
+        use axum::routing::post;
+        // Provider a's endpoint 500s; b answers a valid OpenAI image body.
+        let router = axum::Router::new()
+            .route(
+                "/a",
+                post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+            )
+            .route(
+                "/b",
+                post(|| async {
+                    Json(serde_json::json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let base = format!("http://{addr}");
+
+        let cfg: Config = toml::from_str(&format!(
+            r#"
+            [server]
+            [providers.a]
+            [providers.a.media]
+            images_url = "{base}/a"
+            image_models = ["ma"]
+            [providers.b]
+            [providers.b.media]
+            images_url = "{base}/b"
+            image_models = ["mb"]
+            [media]
+            image = ["a/ma", "b/mb"]
+            "#
+        ))
+        .unwrap();
+        let catalog = crate::catalog::Catalog::from_config(&cfg);
+        let dir = std::env::temp_dir().join(format!("pxy-media-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = std::sync::Arc::new(crate::router::App {
+            catalog,
+            secrets: crate::secrets::Secrets::new(),
+            state: crate::state::State::open(&dir.join("s.sqlite")).unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        });
+
+        let resp = crate::media::images::generations(
+            axum::extract::State(app.clone()),
+            Json(serde_json::json!({"model": "auto", "prompt": "p"})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "must fail over past the 500");
+        assert_eq!(resp.headers().get("x-pxy-provider").unwrap(), "b/mb");
+        // The failed model cooled down in the media pool scope only.
+        assert!(app.state.cooldown(&media_key("a"), "ma").is_some());
+        assert!(app.state.cooldown("a", "ma").is_none(), "chat scope untouched");
+    }
+
+    #[tokio::test]
+    async fn upstream_404_walks_the_chain_with_cooldown() {
+        use axum::routing::post;
+        // Provider a delisted its model (404); b still serves.
+        let router = axum::Router::new()
+            .route("/a", post(|| async { (StatusCode::NOT_FOUND, "model gone") }))
+            .route(
+                "/b",
+                post(|| async {
+                    Json(serde_json::json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let base = format!("http://{addr}");
+
+        let cfg: Config = toml::from_str(&format!(
+            r#"
+            [server]
+            [providers.a]
+            [providers.a.media]
+            images_url = "{base}/a"
+            image_models = ["ma"]
+            [providers.b]
+            [providers.b.media]
+            images_url = "{base}/b"
+            image_models = ["mb"]
+            [media]
+            image = ["a/ma", "b/mb"]
+            "#
+        ))
+        .unwrap();
+        let catalog = crate::catalog::Catalog::from_config(&cfg);
+        let dir = std::env::temp_dir().join(format!("pxy-media-404-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = std::sync::Arc::new(crate::router::App {
+            catalog,
+            secrets: crate::secrets::Secrets::new(),
+            state: crate::state::State::open(&dir.join("s.sqlite")).unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        });
+
+        let resp = crate::media::images::generations(
+            axum::extract::State(app.clone()),
+            Json(serde_json::json!({"model": "auto", "prompt": "p"})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "a delisted model must not kill the chain");
+        assert_eq!(resp.headers().get("x-pxy-provider").unwrap(), "b/mb");
+        // Non-retryable model-scoped cooldown on the delisted id.
+        let cd = app.state.cooldown(&media_key("a"), "ma").expect("cooldown set");
+        assert!(cd.reason.contains("404"));
+        assert!(!cd.retryable);
     }
 
     #[test]

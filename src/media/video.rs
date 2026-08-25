@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
-use super::{Capability, error_response, images::preflight};
+use super::{Attempt, Capability, error_response};
 use crate::router::SharedApp;
 
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -20,24 +20,25 @@ const MAX_POLLS: u32 = 100; // ~5 minutes
 
 pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value>) -> Response {
     let requested = payload["model"].as_str().unwrap_or("").to_string();
-    let Some(r) = super::resolve(&app.cfg, Capability::Video, &requested) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            format!("video model '{requested}' not found"),
-        );
-    };
+    super::run_chain(&app, Capability::Video, &requested, |r| {
+        Box::pin(attempt(&app, r, &payload))
+    })
+    .await
+}
+
+async fn attempt(app: &crate::router::App, r: &super::Resolved<'_>, payload: &Value) -> Attempt {
     let Some(status_template) = r.media.video_status_url.clone() else {
-        return error_response(
+        // Config gap on this provider, not the caller's fault: walk on.
+        return Attempt::Retryable(error_response(
             StatusCode::NOT_IMPLEMENTED,
             format!("provider '{}' has no video_status_url", r.provider),
-        );
+        ));
     };
-    if let Some(resp) = preflight(&app, &r) {
-        return resp;
-    }
-    let headers = match super::auth_headers(&app, r.cfg) {
+    let headers = match super::auth_headers(app, r.cfg) {
         Ok(h) => h,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")));
+        }
     };
 
     // Submit. The client body passes through (image / num_frames / ratio…),
@@ -54,22 +55,25 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
     }
     let resp = match req.json(&body).send().await {
         Ok(resp) => resp,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("network: {e}")),
+        Err(e) => return super::network_failure(app, r, e),
     };
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        super::cool_on_failure(&app, &r.provider, &r.model, status);
-        return super::passthrough_error(resp).await;
+    if resp.status().as_u16() >= 400 {
+        return super::failed_attempt(app, r, resp).await;
     }
     let submitted: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("bad upstream json: {e}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("bad upstream json: {e}"),
+            ));
+        }
     };
     let Some(job_id) = submitted["video_id"].as_str().or(submitted["id"].as_str()) else {
-        return error_response(
+        return Attempt::Retryable(error_response(
             StatusCode::BAD_GATEWAY,
             format!("no video_id in submit response: {submitted}"),
-        );
+        ));
     };
 
     // Poll.
@@ -87,10 +91,10 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
                 app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
                 let url = body["metadata"]["url"].as_str().or(body["url"].as_str());
                 let Some(url) = url else {
-                    return error_response(
+                    return Attempt::Retryable(error_response(
                         StatusCode::BAD_GATEWAY,
                         format!("job completed but no url: {body}"),
-                    );
+                    ));
                 };
                 let out = json!({
                     "created": Timestamp::now().as_second(),
@@ -100,20 +104,22 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
                 if let Ok(v) = format!("{}/{}", r.provider, r.model).parse() {
                     resp.headers_mut().insert("x-pxy-provider", v);
                 }
-                return resp;
+                return Attempt::Ok(resp);
             }
             "failed" => {
-                super::cool_on_failure(&app, &r.provider, &r.model, 502);
-                return error_response(
+                super::cool_on_failure(app, &r.provider, &r.model, 502);
+                return Attempt::Retryable(error_response(
                     StatusCode::BAD_GATEWAY,
                     format!("video job failed: {body}"),
-                );
+                ));
             }
             _ => {}
         }
     }
-    error_response(
+    // The job may still complete upstream; kicking off a fresh multi-minute
+    // job on another provider after 5 minutes of waiting helps nobody.
+    Attempt::Fatal(error_response(
         StatusCode::GATEWAY_TIMEOUT,
         format!("video job {job_id} still running after {} polls", MAX_POLLS),
-    )
+    ))
 }

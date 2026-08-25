@@ -953,12 +953,16 @@ discover = false
 rerank_url = "https://api.jina.ai/v1/rerank"
 rerank_models = ["jina-reranker-v2-base-multilingual"]
 
-# Default model per capability (requests with model omitted or "auto").
+# Default per capability (requests with model omitted or "auto"). Each value
+# is one id OR an ordered failover chain — first healthy (not cooling down,
+# under its media cap) wins, provider-side failures walk to the next entry.
+# A bare `provider/model` request stays single-candidate: its errors pass
+# through raw.
 [media]
-image = "cloudflare/@cf/black-forest-labs/flux-1-schnell"
-transcription = "groq/whisper-large-v3-turbo"
+image = ["cloudflare/@cf/black-forest-labs/flux-1-schnell", "agnes/agnes-image-2.1-flash"]
+transcription = ["groq/whisper-large-v3-turbo", "mistral/voxtral-mini-latest"]
 speech = "cloudflare/@cf/deepgram/aura-2-en"
-rerank = "voyage/rerank-2.5-lite"
+rerank = ["voyage/rerank-2.5-lite", "jina/jina-reranker-v2-base-multilingual"]
 video = "agnes/agnes-video-v2.0"
 
 # Web search, priority order. Brave free = 2,000 q/month (cap with margin);

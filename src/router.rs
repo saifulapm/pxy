@@ -750,6 +750,23 @@ fn think_flush_chunk(filter: &mut ThinkFilter) -> Option<String> {
     Some(json!({"choices": [{"index": 0, "delta": delta}]}).to_string())
 }
 
+/// A client disconnect (Ctrl-C'd agent turn) drops the stream future before
+/// `finish()` runs. The upstream still billed those tokens, so whatever real
+/// usage the tap saw must reach the counters — otherwise every aborted turn
+/// under-counts quota, and the router routes on numbers it knows are low.
+impl Drop for StreamCtx {
+    fn drop(&mut self) {
+        if self.done {
+            return; // finish() ran and already recorded
+        }
+        if let Some(kiro_usage) = self.kiro.as_ref().map(|(_, state, ctx_len)| state.usage(*ctx_len))
+        {
+            self.usage = kiro_usage;
+        }
+        record_tokens(&self.app, &self.provider, self.usage);
+    }
+}
+
 impl StreamCtx {
     /// Process one upstream chunk; returns bytes for the client.
     fn process(&mut self, bytes: &Bytes) -> Bytes {
@@ -1468,6 +1485,40 @@ mod tests {
         }
         assert_eq!(seen.load(Ordering::SeqCst), 1, "a dead key must not be re-fired");
         assert!(started.elapsed() < Duration::from_millis(500), "must fail fast, not back off");
+    }
+
+    #[tokio::test]
+    async fn disconnect_still_records_usage() {
+        use axum::routing::post;
+        // Upstream reports usage in its first chunk; the client then walks
+        // away without reading the stream to its end (Ctrl-C'd agent turn).
+        let router = axum::Router::new().route("/s", post(|| async {
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n"
+        }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.f]
+                base_url = "{base}/s"
+                models = ["m"]
+                "#
+            ),
+            "disconnect_usage",
+        );
+
+        let payload = json!({"model": "f/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Stream { body, .. } => drop(body), // the disconnect
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        let total = app.state.usage_total("f").unwrap();
+        assert_eq!(total.requests, 1);
+        assert_eq!(total.tokens, 8, "usage seen before the disconnect must be recorded");
     }
 
     #[tokio::test]

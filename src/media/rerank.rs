@@ -9,24 +9,21 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use super::{Capability, error_response, images::preflight};
+use super::{Attempt, Capability, error_response};
 use crate::config::MediaKind;
 use crate::router::SharedApp;
 
 pub async fn rerank(State(app): State<SharedApp>, Json(payload): Json<Value>) -> Response {
     let requested = payload["model"].as_str().unwrap_or("").to_string();
-    let Some(r) = super::resolve(&app.cfg, Capability::Rerank, &requested) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            format!("rerank model '{requested}' not found"),
-        );
-    };
-    if let Some(resp) = preflight(&app, &r) {
-        return resp;
-    }
+    super::run_chain(&app, Capability::Rerank, &requested, |r| {
+        Box::pin(attempt(&app, r, &payload))
+    })
+    .await
+}
 
+async fn attempt(app: &crate::router::App, r: &super::Resolved<'_>, payload: &Value) -> Attempt {
     let body = match r.media.kind {
-        MediaKind::Voyage => voyage_request(&payload, &r.model),
+        MediaKind::Voyage => voyage_request(payload, &r.model),
         _ => {
             let mut b = payload.clone();
             b["model"] = json!(r.model);
@@ -34,9 +31,11 @@ pub async fn rerank(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         }
     };
 
-    let headers = match super::auth_headers(&app, r.cfg) {
+    let headers = match super::auth_headers(app, r.cfg) {
         Ok(h) => h,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")));
+        }
     };
     let mut req = app
         .http
@@ -48,31 +47,34 @@ pub async fn rerank(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
     }
     let resp = match req.json(&body).send().await {
         Ok(resp) => resp,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("network: {e}")),
+        Err(e) => return super::network_failure(app, r, e),
     };
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        super::cool_on_failure(&app, &r.provider, &r.model, status);
-        return super::passthrough_error(resp).await;
+    if resp.status().as_u16() >= 400 {
+        return super::failed_attempt(app, r, resp).await;
     }
     let upstream: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("bad upstream json: {e}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("bad upstream json: {e}"),
+            ));
+        }
     };
 
     let out = match r.media.kind {
-        MediaKind::Voyage => voyage_response(&upstream, &payload),
+        MediaKind::Voyage => voyage_response(&upstream, payload),
         _ => upstream,
     };
     let tokens = out["usage"]["total_tokens"].as_u64().unwrap_or(0);
-    super::add_units(&app, &super::media_key(&r.provider), tokens);
+    super::add_units(app, &super::media_key(&r.provider), tokens);
     app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
 
     let mut resp = (StatusCode::OK, Json(out)).into_response();
     if let Ok(v) = format!("{}/{}", r.provider, r.model).parse() {
         resp.headers_mut().insert("x-pxy-provider", v);
     }
-    resp
+    Attempt::Ok(resp)
 }
 
 fn voyage_request(payload: &Value, model: &str) -> Value {

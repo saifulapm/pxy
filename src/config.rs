@@ -95,11 +95,29 @@ pub enum ServiceKind {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaDefaults {
-    pub image: Option<String>,
-    pub transcription: Option<String>,
-    pub speech: Option<String>,
-    pub rerank: Option<String>,
-    pub video: Option<String>,
+    pub image: Option<ModelChain>,
+    pub transcription: Option<ModelChain>,
+    pub speech: Option<ModelChain>,
+    pub rerank: Option<ModelChain>,
+    pub video: Option<ModelChain>,
+}
+
+/// One model id or an ordered failover chain (first healthy wins). A bare
+/// string stays valid so existing configs don't change.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ModelChain {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ModelChain {
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            ModelChain::One(s) => std::slice::from_ref(s),
+            ModelChain::Many(v) => v,
+        }
+    }
 }
 
 /// Bare model names (no provider), best first. Ordering INSIDE a tier only:

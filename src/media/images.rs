@@ -16,25 +16,30 @@ use crate::router::SharedApp;
 
 pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value>) -> Response {
     let requested = payload["model"].as_str().unwrap_or("").to_string();
-    let Some(r) = super::resolve(&app.cfg, Capability::Image, &requested) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            format!("image model '{requested}' not found"),
-        );
-    };
-    if let Some(resp) = preflight(&app, &r) {
-        return resp;
-    }
+    super::run_chain(&app, Capability::Image, &requested, |r| {
+        Box::pin(attempt(&app, r, &payload))
+    })
+    .await
+}
+
+async fn attempt(
+    app: &crate::router::App,
+    r: &super::Resolved<'_>,
+    payload: &Value,
+) -> super::Attempt {
+    use super::Attempt;
 
     let body = match r.media.kind {
-        MediaKind::Cloudflare => cloudflare_request(&payload),
-        MediaKind::Dashscope => super::dashscope::image_request(&payload, &r.model),
-        _ => openai_request(&payload, &r),
+        MediaKind::Cloudflare => cloudflare_request(payload),
+        MediaKind::Dashscope => super::dashscope::image_request(payload, &r.model),
+        _ => openai_request(payload, r),
     };
 
-    let headers = match super::auth_headers(&app, r.cfg) {
+    let headers = match super::auth_headers(app, r.cfg) {
         Ok(h) => h,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+        Err(e) => {
+            return Attempt::Retryable(error_response(StatusCode::BAD_GATEWAY, format!("{e:#}")));
+        }
     };
     let mut req = app
         .http
@@ -46,13 +51,12 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
     }
     let resp = match req.json(&body).send().await {
         Ok(resp) => resp,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("network: {e}")),
+        Err(e) => return super::network_failure(app, r, e),
     };
 
     let status = resp.status().as_u16();
     if status >= 400 {
-        super::cool_on_failure(&app, &r.provider, &r.model, status);
-        return super::passthrough_error(resp).await;
+        return super::failed_attempt(app, r, resp).await;
     }
 
     let content_type = resp
@@ -68,21 +72,31 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 json!({"created": Timestamp::now().as_second(), "data": [{"b64_json": b64}]})
             }
-            Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("reading image: {e}")),
+            Err(e) => {
+                return Attempt::Retryable(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("reading image: {e}"),
+                ));
+            }
         }
     } else {
         let body: Value = match resp.json().await {
             Ok(v) => v,
-            Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("bad upstream json: {e}")),
+            Err(e) => {
+                return Attempt::Retryable(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("bad upstream json: {e}"),
+                ));
+            }
         };
         match r.media.kind {
             MediaKind::Dashscope => match super::dashscope::image_response(&body) {
                 Some(v) => v,
                 None => {
-                    return error_response(
+                    return Attempt::Retryable(error_response(
                         StatusCode::BAD_GATEWAY,
                         format!("no image in upstream response: {body}"),
-                    );
+                    ));
                 }
             },
             _ => normalize_json(&body),
@@ -90,28 +104,7 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
     };
 
     app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
-    tag(normalized, &r.provider, &r.model)
-}
-
-/// Cooldown + media-cap gate shared by all media handlers. When it passes,
-/// the request is COUNTED immediately (see `record`): the upstream call is
-/// about to happen, and a billed-but-lost response must not escape the cap.
-pub fn preflight(app: &crate::router::App, r: &super::Resolved<'_>) -> Option<Response> {
-    let key = super::media_key(&r.provider);
-    if let Some(cd) = app.state.cooldown(&key, &r.model) {
-        return Some(error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("{key} cooling down ({})", cd.reason),
-        ));
-    }
-    if super::cap_exhausted(app, &r.provider, r.media) {
-        return Some(error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("{key} daily media cap reached"),
-        ));
-    }
-    super::record(app, &key);
-    None
+    Attempt::Ok(tag(normalized, &r.provider, &r.model))
 }
 
 fn tag(body: Value, provider: &str, model: &str) -> Response {
