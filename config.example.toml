@@ -591,6 +591,29 @@ total_tokens = 100000000
 #    = 250 req/day, 70K TPM, built-in web search/code-exec; REJECTS external
 #    tools ("tool calling is not supported"), so ask it questions directly.
 #    ~3000 tok/s. No card on the account = hard 429 stop, no billing risk.
+# Kimi coding tier — Phase 3 #2, ACTIVE 2026-08-25 (kind = kimi-coding in
+# providers/kimi.rs). ROTATING refresh tokens: the live credential lives in
+# state.sqlite kv (kimi_token:kimi-coding) after the first refresh; pass holds
+# only the login-time bootstrap + device identity. If state.sqlite is lost, a
+# fresh device-flow login is needed (pxy has no login flow yet — device flow
+# via curl works: POST auth.kimi.com/api/oauth/device_authorization with
+# client_id + X-Msh-* headers, then poll the token endpoint). Speaks Anthropic
+# natively (x-api-key, ?beta=true). Free coding tier: weekly + rolling-window
+# quotas (403s can be EITHER — see docs/06 quota note).
+# STATUS 2026-08-25: account credits EXHAUSTED ("Credits used up" from
+# /coding/v1/usages) — chat + /models return bare 500s while in this state
+# (Kimi's error hygiene is poor). Auth/refresh verified working end-to-end.
+# Keep OUT of [auto] until a quota reset makes calls succeed.
+[providers.kimi-coding]
+kind = "kimi-coding"
+format = "anthropic"
+credentials = { pass = "AI/kimi-coding/main" }
+models = [
+  { id = "k3", context_length = 1048576 },
+  { id = "kimi-for-coding", context_length = 262144 },
+  { id = "kimi-for-coding-highspeed", context_length = 262144 },
+]
+
 # Kilo Code gateway — Phase 3 #1, ACTIVE 2026-08-25, and it needed ZERO Rust:
 # the device-flow token archived in pass is a long-lived JWT (exp ~2031, no
 # refresh), so runtime is a plain bearer + the mandatory X-KILOCODE-EDITORNAME

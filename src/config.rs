@@ -109,6 +109,8 @@ pub enum ProviderKind {
     OpenaiCompat,
     /// GitHub Copilot: 2-stage token mint + header profile
     GithubCopilot,
+    /// Kimi coding tier: rotating refresh tokens + device-id header profile
+    KimiCoding,
 }
 
 #[derive(Debug, Clone, Deserialize)]

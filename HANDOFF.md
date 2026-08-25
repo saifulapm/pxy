@@ -5,7 +5,7 @@ Read this first in a new session, then `docs/07-pxy-design.md` for design ration
 ## What pxy is
 
 A tiny Rust proxy replacing OmniRoute (a heavy Node router that used ~800 MB RAM).
-**pxy uses ~12.5 MB.** One local endpoint over 28 providers, an `auto` model that routes by
+**pxy uses ~12.5 MB.** One local endpoint over 29 providers, an `auto` model that routes by
 priority + quota with automatic failover, and `pxy launch claude|opencode|pi` to wire coding
 agents to it. Repo: `github.com/saifulapm/pxy` (private).
 
@@ -21,7 +21,7 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 ```sh
 pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
-pxy models                    # 137 models exposed
+pxy models                    # 140 models exposed
 pxy status                    # per-provider usage vs limits
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
@@ -58,7 +58,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
 - 24 unit tests: `cargo test`.
 
-## Provider catalog (28 active)
+## Provider catalog (29 active)
 
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
@@ -73,11 +73,19 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
 
 **Free, renewable:**
+- `kimi-coding` — Moonshot Kimi coding tier (added 2026-08-25, **Phase 3 #2**, real Rust:
+  `providers/kimi.rs`). Rotating refresh tokens (serialized, persisted to kv BEFORE use —
+  losing one kills the session), 900s access tokens, X-Msh-* device identity, Anthropic
+  native. ⚠️ credits exhausted at activation (masked as bare 500s); NOT in `auto` — retest
+  after quota reset. Re-login = curl device flow (see config.example comment).
 - `kilocode` — Kilo Code gateway (added 2026-08-25, **Phase 3 #1 — zero Rust needed**):
   the archived device-flow token is a long-lived JWT (exp ~2031, no refresh), so it's a
   plain bearer + `X-KILOCODE-EDITORNAME` header, with a `cmd` secret extracting the token
   from the OAuth JSON in pass. 17 `:free` models; hy3:free + minimax-m3:free in `auto`.
   Paid models refuse cleanly at $0. `kilo-auto/free` router id is broken — skip it.
+  ⚠️ Kilo was acquired by Anaconda (announced ~2026-08) — free tiers often shrink
+  post-acquisition; if kilocode starts erroring, deprioritize rather than debug.
+  (Not to be confused with **Kiro** = AWS's IDE, the Phase 3 amazon-q item.)
 - `google` — AI Studio Gemini free tier (added 2026-08-25) via Google's **OpenAI compat
   layer** (`/v1beta/openai/` — docs/08's "needs a Gemini translator" was WRONG, 3rd
   correction). gemini-3-flash-preview (in `auto`), 3.1-flash-lite, 2.5-flash; all 1M ctx,
@@ -182,9 +190,14 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    tencent kinfra, alibaba qwen, fireworks qwen3-8b, voyage pending).
 3. **Phase 3 — OAuth providers**, one at a time, easiest first (research in docs/06):
    ~~kilocode~~ (DONE 2026-08-25 — token turned out long-lived, plain config, no Rust) →
-   kimi-coding (device flow + persistent device id, refresh tokens ROTATE) → antigravity/agy
+   ~~kimi-coding~~ (DONE 2026-08-25 — `kind = "kimi-coding"` in providers/kimi.rs: serialized
+   rotation-safe refresh persisted to kv, X-Msh-* identity profile, Anthropic endpoint.
+   The archived refresh token was dead; re-logged-in via curl device flow. ⚠️ Account
+   credits currently EXHAUSTED — Kimi masks this as bare 500s on chat/models; auth verified,
+   retest for quota reset before adding k3 to [auto]) → antigravity/agy
    (Google auth-code + Cloud Code envelope) → kiro/amazon-q (AWS eventstream binary parser).
-   Credentials for all of these are already archived in `pass`.
+   Credentials are archived in `pass`, but expect the kiro/antigravity refresh tokens to
+   need re-login too (the kimi one had rotated dead).
 4. **Nice-to-haves identified but not built**:
    - Read upstream quota headers (`X-Quota-5h/Week/Month` on openadapter, Copilot's, etc.) and
      cool a provider down when it self-reports exhaustion.

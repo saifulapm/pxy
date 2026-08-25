@@ -1,4 +1,5 @@
 pub mod copilot;
+pub mod kimi;
 
 use anyhow::{Context, Result};
 
@@ -47,5 +48,6 @@ pub async fn prepare(
             Ok(PreparedRequest { url, headers })
         }
         ProviderKind::GithubCopilot => copilot::prepare(name, cfg, secrets, state, http, headers).await,
+        ProviderKind::KimiCoding => kimi::prepare(name, cfg, secrets, state, http, headers).await,
     }
 }
