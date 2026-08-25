@@ -17,6 +17,13 @@
 //!   Claude Code system sentinel when a non-Claude-Code client selected this
 //!   provider manually — the OAuth inference endpoint rejects requests
 //!   without it. Real Claude Code traffic already carries it (no-op).
+//!
+//! RESIDUAL RACE (known, low-probability): the mutex is process-local, so if
+//! the live CLI and pxy both refresh within the same seconds, whichever
+//! write-back lands second wins and the loser's rotated pair survives only
+//! in its memory — worst case a forced `claude` re-login. Closing it fully
+//! needs an flock (libc dep); the 5-minute lead + staleness re-read makes
+//! the window seconds-wide per ~8h token lifetime.
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -187,15 +194,22 @@ async fn refresh(
 }
 
 fn write_credentials(path: &std::path::Path, creds: &Value) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
     // Backup the previous content once per write.
     if let Ok(old) = std::fs::read(path) {
         let _ = std::fs::write(path.with_extension("json.bak"), old);
     }
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string(creds)?;
-    std::fs::write(&tmp, &text)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    // 0600 from creation — never a umask-window where the token is readable.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    std::io::Write::write_all(&mut f, text.as_bytes())?;
+    drop(f);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

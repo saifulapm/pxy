@@ -17,6 +17,7 @@ use crate::secrets::Secrets;
 use crate::state::State;
 use crate::translate::sse::SseParser;
 use crate::translate::think::ThinkFilter;
+use crate::translate::tool_text::ToolTextFilter;
 use crate::translate::{anthropic_to_openai, estimate_tokens, kiro, openai_to_anthropic, TokenUsage};
 use crate::usage::current_windows;
 
@@ -188,9 +189,13 @@ pub async fn handle_chat(
 /// True when the LAST user message is exactly the magic token. Works from
 /// inside any agent: type "@@usage" (or "@@pxy-usage"), get the report.
 fn is_usage_magic(payload: &Value) -> bool {
+    // The magic message must be the FINAL message: an assistant-final
+    // continuation whose previous user turn was "@@usage" is a real
+    // request, not a report query.
     let Some(last) = payload["messages"]
         .as_array()
-        .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
+        .and_then(|m| m.last())
+        .filter(|m| m["role"] == "user")
     else {
         return false;
     };
@@ -572,6 +577,12 @@ async fn try_candidate(
         }
     }
 
+    // Textual tool-call extraction: OpenAI upstreams only, and only when the
+    // request declared tools (otherwise the markup is content, not protocol).
+    let tool_names = (upstream_format == WireFormat::Openai)
+        .then(|| declared_tool_names(payload))
+        .flatten();
+
     let initiator_override = ctx
         .initiator
         .as_deref()
@@ -631,8 +642,16 @@ async fn try_candidate(
         // A 200 status is not a commitment yet: hold the response until the
         // upstream produces a real first event, so a stream that dies before
         // saying anything fails over instead of reaching the client truncated.
-        match stream_outcome(app.clone(), cand, client_format, upstream_format, resp, input_estimate)
-            .await
+        match stream_outcome(
+            app.clone(),
+            cand,
+            client_format,
+            upstream_format,
+            resp,
+            input_estimate,
+            tool_names,
+        )
+        .await
         {
             Ok(outcome) => AttemptResult::Done(outcome),
             Err(StreamFailure::ErrorEvent(data)) => {
@@ -715,6 +734,9 @@ async fn try_candidate(
         };
         if provider_cfg.parse_think_tags && upstream_format == WireFormat::Openai {
             extract_think_from_response(&mut upstream_body);
+        }
+        if let Some(names) = &tool_names {
+            crate::translate::tool_text::extract_from_response(&mut upstream_body, names);
         }
         let usage = match upstream_format {
             WireFormat::Openai => TokenUsage::from_openai(&upstream_body["usage"]),
@@ -1074,11 +1096,80 @@ struct StreamCtx {
     kind: StreamKind,
     /// Present when the provider has parse_think_tags (openai upstreams only)
     think: Option<ThinkFilter>,
+    /// Present when the request declared tools and the upstream is OpenAI:
+    /// extracts text-embedded tool calls (free models emit them as prose).
+    tooltext: Option<ToolTextFilter>,
     usage: TokenUsage,
     provider: String,
     app: SharedApp,
     upstream: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
     done: bool,
+}
+
+/// Tool names the request declared, in either dialect's shape. None when the
+/// request has no tools (extraction must not run — `<tool_call>` in a
+/// toolless chat is content, not protocol).
+fn declared_tool_names(payload: &Value) -> Option<std::collections::HashSet<String>> {
+    let tools = payload["tools"].as_array()?;
+    let names: std::collections::HashSet<String> = tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str().or_else(|| t["name"].as_str()))
+        .map(String::from)
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+/// Extract text-embedded tool calls from an openai chunk's delta.content.
+/// Synthesized calls use indices from 100 up so a (rare) mix with native
+/// tool_calls can't collide on index.
+fn rewrite_chunk_tools(data: &str, filter: &mut ToolTextFilter) -> String {
+    use crate::translate::tool_text::Op;
+    let Ok(mut v) = serde_json::from_str::<Value>(data) else {
+        return data.to_string();
+    };
+    // The include_usage final chunk is `{"choices":[],"usage":{...}}` — a
+    // mutable index into the empty array PANICS (serde_json semantics).
+    if !v["choices"].as_array().is_some_and(|c| !c.is_empty()) {
+        return data.to_string();
+    }
+    let delta = &mut v["choices"][0]["delta"];
+    if let Some(text) = delta["content"].as_str().map(String::from) {
+        let ops = filter.push(&text);
+        let mut kept = String::new();
+        let mut calls: Vec<Value> = Vec::new();
+        for op in ops {
+            match op {
+                Op::Text(t) => kept.push_str(&t),
+                Op::Call { name, arguments } => {
+                    let n = filter.calls - 1;
+                    calls.push(json!({
+                        "index": 100 + n,
+                        "id": format!("textcall_{n}"),
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }));
+                }
+            }
+        }
+        delta["content"] = json!(kept);
+        if !calls.is_empty() {
+            let mut existing = delta["tool_calls"].as_array().cloned().unwrap_or_default();
+            existing.extend(calls);
+            delta["tool_calls"] = Value::Array(existing);
+        }
+    }
+    let finish = &mut v["choices"][0]["finish_reason"];
+    if finish.as_str() == Some("stop") && filter.calls > 0 {
+        // Clients gate tool execution on this value (audit §2.4).
+        *finish = json!("tool_calls");
+    }
+    v.to_string()
+}
+
+/// Leftover buffered text at stream end (an opener that never closed).
+fn tooltext_flush_chunk(filter: &mut ToolTextFilter) -> Option<String> {
+    let rest = filter.flush()?;
+    Some(json!({"choices": [{"index": 0, "delta": {"content": rest}}]}).to_string())
 }
 
 /// Move `<think>` spans in an openai chunk's delta.content into
@@ -1088,6 +1179,11 @@ fn rewrite_chunk_think(data: &str, filter: &mut ThinkFilter) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(data) else {
         return data.to_string();
     };
+    // Same empty-choices guard as rewrite_chunk_tools: the include_usage
+    // final chunk has `choices: []` and a mutable index would panic.
+    if !v["choices"].as_array().is_some_and(|c| !c.is_empty()) {
+        return data.to_string();
+    }
     let delta = &mut v["choices"][0]["delta"];
     if let Some(text) = delta["content"].as_str() {
         let (reasoning, content) = filter.push(text);
@@ -1152,7 +1248,7 @@ impl StreamCtx {
             }
             None => bytes,
         };
-        let Self { parser, kind, think, usage, .. } = self;
+        let Self { parser, kind, think, tooltext, usage, .. } = self;
         let events = parser.feed(bytes);
         match kind {
             StreamKind::OpenaiPass => {
@@ -1171,19 +1267,32 @@ impl StreamCtx {
                         }
                     }
                 }
-                let Some(filter) = think else {
+                if think.is_none() && tooltext.is_none() {
                     return bytes.clone();
-                };
-                // Think extraction forces chunk rewriting even in passthrough.
+                }
+                // Any active filter forces chunk rewriting even in passthrough.
                 let mut out = String::new();
                 for ev in events {
                     if ev.data.trim() == "[DONE]" {
-                        if let Some(tail) = think_flush_chunk(filter) {
+                        if let Some(filter) = think.as_mut()
+                            && let Some(tail) = think_flush_chunk(filter)
+                        {
+                            out.push_str(&format!("data: {tail}\n\n"));
+                        }
+                        if let Some(tf) = tooltext.as_mut()
+                            && let Some(tail) = tooltext_flush_chunk(tf)
+                        {
                             out.push_str(&format!("data: {tail}\n\n"));
                         }
                         out.push_str("data: [DONE]\n\n");
                     } else {
-                        let data = rewrite_chunk_think(&ev.data, filter);
+                        let mut data = ev.data.clone();
+                        if let Some(filter) = think.as_mut() {
+                            data = rewrite_chunk_think(&data, filter);
+                        }
+                        if let Some(tf) = tooltext.as_mut() {
+                            data = rewrite_chunk_tools(&data, tf);
+                        }
                         out.push_str(&format!("data: {data}\n\n"));
                     }
                 }
@@ -1211,19 +1320,29 @@ impl StreamCtx {
             StreamKind::ToAnthropic(state) => {
                 let mut out = String::new();
                 for ev in events {
-                    match think {
-                        Some(filter) if ev.data.trim() != "[DONE]" => {
+                    if ev.data.trim() == "[DONE]" {
+                        if let Some(filter) = think.as_mut()
+                            && let Some(tail) = think_flush_chunk(filter)
+                        {
+                            out.push_str(&state.on_data(&tail));
+                        }
+                        if let Some(tf) = tooltext.as_mut()
+                            && let Some(tail) = tooltext_flush_chunk(tf)
+                        {
+                            out.push_str(&state.on_data(&tail));
+                        }
+                        out.push_str(&state.on_data(&ev.data));
+                    } else {
+                        let mut data = ev.data.clone();
+                        if let Some(filter) = think.as_mut() {
                             // reasoning moved into delta.reasoning_content
                             // becomes a thinking block via on_data
-                            out.push_str(&state.on_data(&rewrite_chunk_think(&ev.data, filter)));
+                            data = rewrite_chunk_think(&data, filter);
                         }
-                        Some(filter) => {
-                            if let Some(tail) = think_flush_chunk(filter) {
-                                out.push_str(&state.on_data(&tail));
-                            }
-                            out.push_str(&state.on_data(&ev.data));
+                        if let Some(tf) = tooltext.as_mut() {
+                            data = rewrite_chunk_tools(&data, tf);
                         }
-                        None => out.push_str(&state.on_data(&ev.data)),
+                        out.push_str(&state.on_data(&data));
                     }
                 }
                 *usage = state.usage;
@@ -1273,16 +1392,25 @@ impl StreamCtx {
         let out = match &mut self.kind {
             StreamKind::ToAnthropic(state) => {
                 let mut s = String::new();
-                if let Some(filter) = &mut self.think {
-                    if let Some(tail) = think_flush_chunk(filter) {
-                        s.push_str(&state.on_data(&tail));
-                    }
+                if let Some(filter) = &mut self.think
+                    && let Some(tail) = think_flush_chunk(filter)
+                {
+                    s.push_str(&state.on_data(&tail));
+                }
+                if let Some(tf) = &mut self.tooltext
+                    && let Some(tail) = tooltext_flush_chunk(tf)
+                {
+                    s.push_str(&state.on_data(&tail));
                 }
                 s.push_str(&state.finish());
                 self.usage = state.usage;
                 Bytes::from(s)
             }
-            _ => Bytes::new(),
+            _ => match self.tooltext.as_mut().and_then(tooltext_flush_chunk) {
+                // Abrupt EOF with buffered text: hand it to the client raw.
+                Some(tail) => Bytes::from(format!("data: {tail}\n\n")),
+                None => Bytes::new(),
+            },
         };
         record_tokens(&self.app, &self.provider, self.usage);
         out
@@ -1357,6 +1485,7 @@ async fn stream_outcome(
     upstream_format: WireFormat,
     resp: reqwest::Response,
     input_estimate: u64,
+    tool_names: Option<std::collections::HashSet<String>>,
 ) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
@@ -1393,6 +1522,7 @@ async fn stream_outcome(
         }),
         kind,
         think: parse_think.then(ThinkFilter::new),
+        tooltext: tool_names.map(ToolTextFilter::new),
         usage: TokenUsage::default(),
         provider: cand.provider.clone(),
         app,
@@ -1866,6 +1996,55 @@ mod tests {
         assert!(!is_context_window_error(r#"{"error":{"message":"invalid 'user': maximum length"}}"#));
         // Ordinary errors don't match.
         assert!(!is_context_window_error(r#"{"error":{"message":"rate limited"}}"#));
+    }
+
+    #[tokio::test]
+    async fn textual_tool_call_streams_as_real_tool_use() {
+        use axum::routing::post;
+        // A free-model habit: the tool call arrives as prose, split across
+        // chunks, with finish_reason "stop".
+        // CJK content and a spec-compliant `choices: []` usage chunk are both
+        // present deliberately: each crashed a prior version of the filter.
+        let router = axum::Router::new().route("/t", post(|| async {
+            concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"好的 On it. <tool_\"}}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"call>{\\\"name\\\": \\\"Bash\\\", \\\"arguments\\\": {\\\"cmd\\\": \\\"ls\\\"}}</tool_call>\"}}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
+                "data: [DONE]\n\n",
+            )
+        }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.q]
+                base_url = "{base}/t"
+                models = ["m"]
+                "#
+            ),
+            "textual_tools",
+        );
+
+        let payload = json!({"model": "q/m", "stream": true, "max_tokens": 100,
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "list files"}]});
+        let out = handle_chat(app, ClientFormat::Anthropic, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("\"type\":\"tool_use\""), "real tool_use block: {text}");
+                assert!(text.contains("\"name\":\"Bash\""));
+                assert!(text.contains("\"stop_reason\":\"tool_use\""),
+                    "finish must map to tool_use: {text}");
+                assert!(!text.contains("<tool_call>"), "markup must not leak: {text}");
+                assert!(text.contains("好的 On it."), "surrounding prose survives: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
     }
 
     #[tokio::test]

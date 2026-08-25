@@ -110,11 +110,34 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 114 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
+- 128 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
   tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
+- **Feature round from docs/09 audit (2026-08-26)**:
+  - **`claude` provider** (`kind = "claude-oauth"`, providers/claude.rs): real Anthropic
+    subscription inference via the Claude Code CLI's own OAuth credential at
+    `~/.claude/.credentials.json` — no login flow in pxy. Rotating refresh tokens:
+    5-min lead, process mutex + staleness re-read, atomic write-back (0600, .bak,
+    foreign keys preserved). `tier = "reserve"` — NEVER in `auto` (Saiful's rule),
+    manual selection only. Non-CC clients get the CC system sentinel auto-prepended.
+    Known residual: process-local mutex can't stop a same-second CLI+pxy double
+    refresh (worst case: `claude` re-login; flock would need a libc dep).
+  - **429 body classification**: window-naming quota text gets a window-sized
+    non-retryable cooldown (daily→until provider reset, weekly 4h, monthly 6h,
+    credits 1h); header always wins; Gemini transient boilerplate deliberately
+    excluded. 402 with no hint waits 1h.
+  - **`@@usage` magic prompt**: final user message of exactly `@@usage` answered
+    locally (both dialects, streaming included) with day/month usage + cooldowns.
+    Zero tokens, no upstream.
+  - **Textual tool-call extraction** (translate/tool_text.rs): `<tool_call>{json}
+    </tool_call>` and `<invoke name=…><parameter…>` spans in OpenAI-upstream text
+    become REAL tool_calls (streaming state machine with cross-chunk assembly,
+    finish_reason stop→tool_calls override). Guards: only when the request declared
+    tools; extracted names must match a declared tool or the span re-emits
+    byte-for-byte; 16KB hold cap. Multi-byte-safe; `choices: []` usage chunks safe
+    (both were review-caught panics).
 - **Bug round from docs/09 audit (2026-08-26)** — read docs/09 §1 for full context:
   - Never mint `{"type":"thinking","signature":""}` (poisoned client history → permanent
     Anthropic 400s); `translate/anthropic_sanitize.rs` now repairs EVERY Anthropic-bound
