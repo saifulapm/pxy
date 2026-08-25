@@ -1,4 +1,4 @@
 # Memory index
 
-- [pxy project](pxy-project.md) — Rust OmniRoute replacement; design in docs/07-pxy-design.md, creds in pass AI/
+- [pxy project](pxy-project.md) — Rust LLM proxy, feature-complete in production; read HANDOFF.md first; Anthropic never in auto
 - [GPG unlock over SSH](gpg-unlock-over-ssh.md) — pinentry-curses swap; never reload after unlock (SIGHUP flushes cache)
