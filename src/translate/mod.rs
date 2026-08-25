@@ -1,4 +1,5 @@
 pub mod anthropic_to_openai;
+pub mod eventstream;
 pub mod openai_to_anthropic;
 pub mod sse;
 pub mod think;
