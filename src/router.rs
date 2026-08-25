@@ -66,6 +66,13 @@ pub async fn handle_chat(
 ) -> Outcome {
     let requested = payload["model"].as_str().unwrap_or("auto").to_string();
     let stream = payload["stream"].as_bool().unwrap_or(false);
+
+    // In-band magic prompt: a last user message of exactly "@@usage" is
+    // answered locally with the quota report — zero tokens, no upstream.
+    if is_usage_magic(&payload) {
+        return usage_outcome(usage_report(&app), client_format, stream);
+    }
+
     let candidates = app.catalog.resolve(&app.cfg, &requested);
     if candidates.is_empty() {
         return error_outcome(
@@ -172,6 +179,159 @@ pub async fn handle_chat(
             skipped.join("; ")
         ),
     )
+}
+
+// ---------------------------------------------------------------------------
+// @@usage — in-band quota report (answered locally, zero tokens)
+// ---------------------------------------------------------------------------
+
+/// True when the LAST user message is exactly the magic token. Works from
+/// inside any agent: type "@@usage" (or "@@pxy-usage"), get the report.
+fn is_usage_magic(payload: &Value) -> bool {
+    let Some(last) = payload["messages"]
+        .as_array()
+        .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
+    else {
+        return false;
+    };
+    let text = match &last["content"] {
+        Value::String(s) => s.trim(),
+        Value::Array(parts) if parts.len() == 1 => {
+            parts[0]["text"].as_str().unwrap_or("").trim()
+        }
+        _ => return false,
+    };
+    text == "@@usage" || text == "@@pxy-usage"
+}
+
+fn human_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+fn usage_report(app: &App) -> String {
+    let now = Timestamp::now();
+    let default_limits = crate::config::Limits::default();
+    let mut lines = vec!["pxy usage (today / this month)".to_string()];
+
+    for (name, p) in &app.cfg.providers {
+        if !p.enabled {
+            continue;
+        }
+        let limits = p.limits.as_ref().unwrap_or(&default_limits);
+        let Ok(w) = crate::usage::current_windows(limits, now) else { continue };
+        for key in [name.clone(), crate::media::media_key(name)] {
+            let day = app.state.usage(&key, "day", w.day_start).unwrap_or_default();
+            let month = app.state.usage(&key, "month", w.month_start).unwrap_or_default();
+            if day.requests == 0 && month.requests == 0 {
+                continue;
+            }
+            let cap = match limits.daily_requests {
+                Some(c) if !key.contains('#') => format!("/{c}"),
+                _ => String::new(),
+            };
+            lines.push(format!(
+                "  {key}: {}{} req, {} tok | month: {} req, {} tok",
+                day.requests,
+                cap,
+                human_tokens(day.tokens),
+                month.requests,
+                human_tokens(month.tokens),
+            ));
+        }
+    }
+
+    let cooldowns = app.state.active_cooldowns();
+    if !cooldowns.is_empty() {
+        lines.push("cooldowns:".to_string());
+        for (key, cd) in cooldowns {
+            let left = cd.until.saturating_duration_since(std::time::Instant::now()).as_secs();
+            let left = if left >= 120 {
+                format!("{}m", left / 60)
+            } else {
+                format!("{left}s")
+            };
+            lines.push(format!("  {key}: {} ({left} left)", cd.reason));
+        }
+    }
+    if lines.len() == 1 {
+        lines.push("  (no usage recorded yet today)".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Shape the report as a protocol-correct response in the client's dialect,
+/// streaming included — no upstream is contacted.
+fn usage_outcome(report: String, client_format: ClientFormat, stream: bool) -> Outcome {
+    use crate::translate::sse::{format_data, format_event};
+    if !stream {
+        let body = match client_format {
+            ClientFormat::Anthropic => json!({
+                "id": "msg_pxy_usage", "type": "message", "role": "assistant",
+                "model": "pxy",
+                "content": [{"type": "text", "text": report}],
+                "stop_reason": "end_turn", "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }),
+            ClientFormat::Openai => json!({
+                "id": "chatcmpl_pxy_usage", "object": "chat.completion",
+                "created": Timestamp::now().as_second(), "model": "pxy",
+                "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": report},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }),
+        };
+        return Outcome::Json { status: 200, body, provider: Some("pxy".into()) };
+    }
+    let sse = match client_format {
+        ClientFormat::Anthropic => {
+            let mut s = String::new();
+            s.push_str(&format_event("message_start", &json!({
+                "type": "message_start",
+                "message": {"id": "msg_pxy_usage", "type": "message", "role": "assistant",
+                            "model": "pxy", "content": [],
+                            "usage": {"input_tokens": 0, "output_tokens": 0}},
+            })));
+            s.push_str(&format_event("content_block_start", &json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })));
+            s.push_str(&format_event("content_block_delta", &json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": report},
+            })));
+            s.push_str(&format_event("content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0})));
+            s.push_str(&format_event("message_delta", &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": 0},
+            })));
+            s.push_str(&format_event("message_stop", &json!({"type": "message_stop"})));
+            s
+        }
+        ClientFormat::Openai => {
+            let chunk = |delta: Value, finish: Value| {
+                format_data(&json!({
+                    "id": "chatcmpl_pxy_usage", "object": "chat.completion.chunk",
+                    "created": Timestamp::now().as_second(), "model": "pxy",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }))
+            };
+            format!(
+                "{}{}data: [DONE]\n\n",
+                chunk(json!({"role": "assistant", "content": report}), Value::Null),
+                chunk(json!({}), json!("stop")),
+            )
+        }
+    };
+    Outcome::Stream { provider: "pxy".into(), body: axum::body::Body::from(sse) }
 }
 
 /// Extra full-chain walks after the first one fails (3 walks total).
@@ -1706,6 +1866,48 @@ mod tests {
         assert!(!is_context_window_error(r#"{"error":{"message":"invalid 'user': maximum length"}}"#));
         // Ordinary errors don't match.
         assert!(!is_context_window_error(r#"{"error":{"message":"rate limited"}}"#));
+    }
+
+    #[tokio::test]
+    async fn usage_magic_answers_locally_in_both_dialects() {
+        // No mock upstream at all: the report must never leave the process.
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/unreachable"
+            models = ["m"]
+            "#,
+            "usage_magic",
+        );
+        let payload = json!({"model": "auto",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": " @@usage "}]}]});
+        match handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+            .await
+        {
+            Outcome::Json { status, body, provider } => {
+                assert_eq!(status, 200);
+                assert_eq!(provider.as_deref(), Some("pxy"));
+                assert!(body["content"][0]["text"].as_str().unwrap().contains("pxy usage"));
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        // Streaming OpenAI dialect gets protocol-correct SSE.
+        let payload = json!({"model": "auto", "stream": true,
+            "messages": [{"role": "user", "content": "@@usage"}]});
+        match handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await {
+            Outcome::Stream { provider, body } => {
+                assert_eq!(provider, "pxy");
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("pxy usage") && text.contains("[DONE]"), "{text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        // A normal message containing the token mid-sentence is NOT magic.
+        assert!(!is_usage_magic(
+            &json!({"messages": [{"role": "user", "content": "what does @@usage do?"}]})
+        ));
     }
 
     #[test]

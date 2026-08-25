@@ -318,6 +318,19 @@ impl State {
         wait
     }
 
+    /// Everything currently cooling down (for the @@usage report).
+    pub fn active_cooldowns(&self) -> Vec<(String, Cooldown)> {
+        let map = self.cooldowns.lock().unwrap();
+        let now = Instant::now();
+        let mut list: Vec<(String, Cooldown)> = map
+            .iter()
+            .filter(|(_, c)| c.until > now)
+            .map(|(k, c)| (k.clone(), c.clone()))
+            .collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        list
+    }
+
     /// Success clears both scopes for this model.
     pub fn clear_cooldown(&self, provider: &str, model: &str) {
         let model_key = Self::cooldown_key(provider, Some(model));
