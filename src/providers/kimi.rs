@@ -3,9 +3,10 @@
 //! and invalidates the old one, so the rotated pair is persisted to sqlite kv
 //! immediately, under a lock so concurrent requests can't double-refresh
 //! (a second refresh with the consumed token would kill the session).
-//! pass holds only the login-time bootstrap (access/refresh/device identity);
-//! after the first rotation the kv row is the live credential — if state.sqlite
-//! is ever lost, a fresh device-flow login is needed.
+//! Rotated pairs are ALSO written back to the pass entry (gpg encryption needs
+//! only the public key, so it works headless), keeping the durable store live:
+//! losing state.sqlite then costs a refresh, not a re-login. A kv-only design
+//! is how the original archived token died.
 //! Chat goes to api.kimi.com/coding/v1/messages?beta=true (Anthropic format,
 //! x-api-key) with a 6-header X-Msh-* device identity profile that must reuse
 //! the SAME device id the login was issued against (anti-bot). All values
@@ -55,7 +56,7 @@ pub async fn prepare(
         .with_context(|| format!("provider {name}: credential is not the OAuth JSON blob"))?;
     let identity = identity_headers(&seed);
 
-    let token = current_token(name, &seed, &identity, state, http).await?;
+    let token = current_token(name, cred_ref, &seed, &identity, secrets, state, http).await?;
 
     headers.push(("x-api-key".into(), token));
     headers.push(("anthropic-version".into(), ANTHROPIC_VERSION.into()));
@@ -69,10 +70,13 @@ pub async fn prepare(
     Ok(PreparedRequest { url, headers })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn current_token(
     name: &str,
+    cred_ref: &crate::config::SecretRef,
     seed: &Value,
     identity: &[(String, String)],
+    secrets: &Secrets,
     state: &State,
     http: &reqwest::Client,
 ) -> Result<String> {
@@ -146,6 +150,24 @@ async fn current_token(
         })
         .to_string(),
     )?;
+
+    // Mirror into pass so the durable store never goes stale. Best-effort:
+    // a pass failure (locked gpg agent, say) must not fail a request that
+    // already has a valid token, and kv above is authoritative either way.
+    if let crate::config::SecretRef::Pass { pass: entry } = cred_ref {
+        let mut updated = seed.clone();
+        updated["access_token"] = Value::String(access.clone());
+        updated["refresh_token"] = Value::String(new_refresh.to_string());
+        updated["expires_at"] = Value::String(iso8601(expires_at));
+        match serde_json::to_string_pretty(&updated) {
+            Ok(body) => {
+                if let Err(e) = secrets.write_pass(entry, &body) {
+                    tracing::warn!(provider = name, error = %e, "pass write-back failed (kv still authoritative)");
+                }
+            }
+            Err(e) => tracing::warn!(provider = name, error = %e, "pass write-back serialize failed"),
+        }
+    }
     Ok(access)
 }
 
@@ -217,9 +239,63 @@ fn form_encode(pairs: &[(&str, &str)]) -> String {
         .join("&")
 }
 
+/// Epoch seconds -> "YYYY-MM-DDTHH:MM:SS.000Z" (the shape OmniRoute archived,
+/// kept so the pass entry stays readable by both tools).
+fn iso8601(epoch: u64) -> String {
+    let days = epoch / 86_400;
+    let secs = epoch % 86_400;
+    // civil-from-days (Howard Hinnant's algorithm), epoch 1970-01-01.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso8601_matches_known_timestamps() {
+        assert_eq!(iso8601(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso8601(1_000_000_000), "2001-09-09T01:46:40.000Z");
+        // leap day
+        assert_eq!(iso8601(1_709_164_800), "2024-02-29T00:00:00.000Z");
+        assert_eq!(iso8601(1_787_635_200), "2026-08-25T05:20:00.000Z");
+    }
+
+    #[test]
+    fn form_encode_escapes_the_device_code_urn() {
+        assert_eq!(
+            form_encode(&[("grant_type", "urn:ietf:params:oauth:grant-type:device_code")]),
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+        );
+        assert_eq!(form_encode(&[("a", "b c")]), "a=b+c");
+    }
+
+    #[test]
+    fn sanitize_strips_non_ascii_and_falls_back() {
+        assert_eq!(sanitize("  fedora \u{1F600} "), "fedora");
+        assert_eq!(sanitize(""), "unknown");
+        assert_eq!(sanitize("Linux 7.1 arm64"), "Linux 7.1 arm64");
+    }
 }

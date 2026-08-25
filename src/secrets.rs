@@ -70,7 +70,6 @@ impl Secrets {
     }
 
     /// Write back an updated pass entry (used for rotated OAuth tokens).
-    #[allow(dead_code)] // wired up when OAuth providers with rotating tokens land
     pub fn write_pass(&self, entry: &str, content: &str) -> Result<()> {
         use std::io::Write;
         let mut child = Command::new("pass")
