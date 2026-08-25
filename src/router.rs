@@ -396,6 +396,12 @@ async fn try_candidate(
         Err(e) => return AttemptResult::Skip(format!("prepare failed: {e:#}")),
     };
 
+    // The Anthropic OAuth endpoint rejects requests missing the Claude Code
+    // system sentinel; real Claude Code traffic already has it (no-op).
+    if provider_cfg.kind == crate::config::ProviderKind::ClaudeOauth {
+        crate::providers::claude::ensure_sentinel(&mut body);
+    }
+
     // Providers may need fields inside the body (kiro's profileArn), which is
     // only known after credentials resolve.
     if let Some(patch) = &prepared.body_patch {

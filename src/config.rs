@@ -320,6 +320,9 @@ pub enum ProviderKind {
     KimiCoding,
     /// Kiro / Amazon Q: CodeWhisperer conversationState + eventstream
     Kiro,
+    /// Anthropic Claude subscription via the Claude Code CLI's OAuth
+    /// credential file (rotating refresh tokens, written back to the file)
+    ClaudeOauth,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,6 +343,10 @@ pub struct ProviderConfig {
     pub api_key: Option<SecretRef>,
     /// OAuth credential blob (JSON in pass) for kinds that need it
     pub credentials: Option<SecretRef>,
+    /// Path to a credential FILE shared with a local CLI (claude-oauth kind;
+    /// default ~/.claude/.credentials.json). pxy reads it fresh per request
+    /// and writes refreshed tokens back.
+    pub credentials_file: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Header used for the credential. Default: authorization bearer.
@@ -478,6 +485,7 @@ impl ProviderConfig {
             embedding_models: Vec::new(),
             api_key: None,
             credentials: None,
+            credentials_file: None,
             headers: BTreeMap::new(),
             auth_header: AuthHeader::default(),
             models: Vec::new(),

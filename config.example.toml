@@ -106,6 +106,29 @@ small_model = "github-free/gpt-5-mini"
 # OAuth providers
 # ---------------------------------------------------------------------------
 
+# Anthropic Claude subscription (Pro/Max) via the local Claude Code CLI's
+# OAuth credential (~/.claude/.credentials.json). pxy reads the file fresh
+# per request and writes refreshed tokens back (rotating refresh tokens, so
+# the write-back is what keeps pxy and the CLI from fighting).
+# RESERVE tier: never generated into [auto] — manual selection only
+# ("claude/<model>"). Non-Claude-Code clients get the CC system sentinel
+# prepended automatically (the OAuth endpoint requires it).
+[providers.claude]
+kind = "claude-oauth"
+format = "anthropic"
+tier = "reserve"
+discover = false
+headers = { user-agent = "claude-cli/2.1.220 (external, cli)" }
+models = [
+  # Fable/Opus/Sonnet 5 reject non-default temperature/top_p/top_k (400) —
+  # sampling is fixed, reasoning is steered by effort. drop_params handles it.
+  { id = "claude-fable-5", context_length = 1000000, max_output_tokens = 128000, tool_call = true, drop_params = ["temperature", "top_p", "top_k"] },
+  { id = "claude-opus-5", context_length = 1000000, max_output_tokens = 128000, tool_call = true, drop_params = ["temperature", "top_p", "top_k"] },
+  { id = "claude-sonnet-5", context_length = 1000000, max_output_tokens = 128000, tool_call = true, drop_params = ["temperature", "top_p", "top_k"] },
+  { id = "claude-sonnet-4-6", context_length = 1000000, max_output_tokens = 64000, tool_call = true },
+  { id = "claude-haiku-4-5-20251001", context_length = 200000, max_output_tokens = 64000, tool_call = true },
+]
+
 # Copilot Pro (yearly): 300 premium requests/month, resets 1st 00:00 UTC, no
 # rollover. Multipliers: sonnet 1x, haiku 0.33x, gpt-5-mini 0x (see
 # github-free below). pxy counts plain requests, so 300 = sonnet-equivalents

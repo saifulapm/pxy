@@ -218,7 +218,7 @@ fn sanitize(s: &str) -> String {
 /// Minimal application/x-www-form-urlencoded encoder (reqwest is built
 /// without the form feature). Unreserved chars pass through; space becomes
 /// '+'; everything else is percent-encoded.
-fn form_encode(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn form_encode(pairs: &[(&str, &str)]) -> String {
     fn enc(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         for b in s.bytes() {

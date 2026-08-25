@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod copilot;
 pub mod kimi;
 pub mod kiro;
@@ -57,5 +58,6 @@ pub async fn prepare(
         ProviderKind::GithubCopilot => copilot::prepare(name, cfg, secrets, state, http, headers).await,
         ProviderKind::KimiCoding => kimi::prepare(name, cfg, secrets, state, http, headers).await,
         ProviderKind::Kiro => kiro::prepare(name, cfg, secrets, state, http, headers).await,
+        ProviderKind::ClaudeOauth => claude::prepare(name, cfg, http, headers).await,
     }
 }
