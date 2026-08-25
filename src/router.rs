@@ -611,6 +611,60 @@ fn remove_param_path(body: &mut Value, path: &str) {
     }
 }
 
+/// A 429 body that names a QUOTA WINDOW gets a cooldown sized to that
+/// window instead of the 3s→120s exponential backoff — re-probing a drained
+/// daily tier every two minutes until midnight is hundreds of wasted calls
+/// (and on some providers failed calls count against quota too).
+///
+/// Deliberately conservative (each exclusion is an OmniRoute post-mortem):
+/// a bare "quota"/"exhausted" is NOT enough — Gemini's transient free-tier
+/// 429 says "You exceeded your current quota" and "Resource has been
+/// exhausted" for what is an rpm throttle. A window word (or an unambiguous
+/// credits phrase) must be present.
+fn quota_window_cooldown(
+    limits: Option<&crate::config::Limits>,
+    body: &str,
+) -> Option<(Duration, &'static str)> {
+    let b = body.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| b.contains(w));
+    // A quota-ish signal must accompany the window word ("daily" alone in
+    // prose must not trip this).
+    if !has(&["quota", "limit", "exceed", "exhaust", "allocation", "credit", "balance", "insufficient"]) {
+        return None;
+    }
+    if has(&["per month", "monthly", "this month", "billing cycle"]) {
+        // Never lock a whole month on a text match; recheck within hours.
+        return Some((Duration::from_secs(6 * 3600), "monthly quota reported exhausted"));
+    }
+    if has(&["per week", "weekly", "this week"]) {
+        return Some((Duration::from_secs(4 * 3600), "weekly quota reported exhausted"));
+    }
+    if has(&["per day", "daily", "today", "free allocation"]) {
+        // Until the provider's next daily reset (+2 min margin). Fail open
+        // to a 6h recheck if the window computation errors.
+        let wait = limits
+            .and_then(|l| {
+                let now = Timestamp::now();
+                let w = crate::usage::current_windows(l, now).ok()?;
+                let secs = w.day_start.as_second() + 86_400 - now.as_second() + 120;
+                u64::try_from(secs).ok()
+            })
+            .map(|s| s.clamp(900, 26 * 3600))
+            .unwrap_or(6 * 3600);
+        return Some((Duration::from_secs(wait), "daily quota reported exhausted"));
+    }
+    if has(&[
+        "insufficient credits",
+        "insufficient balance",
+        "out of credits",
+        "credits exhausted",
+        "insufficient promotional resources",
+    ]) {
+        return Some((Duration::from_secs(3600), "credits reported exhausted"));
+    }
+    None
+}
+
 /// Upstream told us the input exceeds the model's real context window.
 /// Substring set from litellm's ExceptionCheckers (nine phrasings across
 /// OpenAI/Anthropic/Gemini dialects) with its two known false positives
@@ -681,13 +735,22 @@ fn classify_error(
         // Auth/credit failures and delisted models don't heal in seconds, so
         // the retry loop must not wait on them (or re-fire a dead key).
         let retryable = !account_wide && status != 404;
-        app.state.set_cooldown(
-            &cand.provider,
-            model_scope,
-            retry_after,
-            retryable,
-            &format!("{status} {reason}"),
-        );
+        let limits = app.cfg.providers.get(&cand.provider).and_then(|p| p.limits.as_ref());
+        // Header wins; else a quota-window body horizon; else a 402 without
+        // any hint waits an hour (credits don't reappear in 120s); else the
+        // ordinary exponential backoff.
+        let (wait, retryable, why) = match retry_after {
+            Some(d) => (Some(d), retryable, format!("{status} {reason}")),
+            None if status == 429 => match quota_window_cooldown(limits, &err_body) {
+                Some((d, why)) => (Some(d), false, format!("429 {why}")),
+                None => (None, retryable, format!("{status} {reason}")),
+            },
+            None if status == 402 => {
+                (Some(Duration::from_secs(3600)), false, format!("{status} {reason}"))
+            }
+            None => (None, retryable, format!("{status} {reason}")),
+        };
+        app.state.set_cooldown(&cand.provider, model_scope, wait, retryable, &why);
         return AttemptResult::Skip(format!("{status}: {}", truncate(&err_body, 200)));
     }
     let body = serde_json::from_str::<Value>(&err_body)
@@ -1643,6 +1706,37 @@ mod tests {
         assert!(!is_context_window_error(r#"{"error":{"message":"invalid 'user': maximum length"}}"#));
         // Ordinary errors don't match.
         assert!(!is_context_window_error(r#"{"error":{"message":"rate limited"}}"#));
+    }
+
+    #[test]
+    fn quota_window_bodies_classified_conservatively() {
+        let daily = quota_window_cooldown(None, "You have exceeded your daily free allocation")
+            .expect("daily match");
+        assert_eq!(daily.0, Duration::from_secs(6 * 3600), "no limits -> 6h fallback");
+        let monthly =
+            quota_window_cooldown(None, r#"{"error":"monthly quota exceeded"}"#).unwrap();
+        assert_eq!(monthly.0, Duration::from_secs(6 * 3600));
+        let credits =
+            quota_window_cooldown(None, "insufficient promotional resources").unwrap();
+        assert_eq!(credits.0, Duration::from_secs(3600));
+        // Gemini's TRANSIENT free-tier boilerplate must not classify as a
+        // window: no window word, no unambiguous credits phrase.
+        assert!(quota_window_cooldown(
+            None,
+            "You exceeded your current quota, please check your plan and billing details"
+        )
+        .is_none());
+        assert!(quota_window_cooldown(None, "Resource has been exhausted (e.g. check quota)")
+            .is_none());
+        // A window word with no quota signal at all is prose, not a verdict.
+        assert!(quota_window_cooldown(None, "try again later today").is_none());
+
+        // With limits configured, the daily horizon lands before the next
+        // reset (+margin), never past ~26h.
+        let limits = crate::config::Limits::default();
+        let (wait, _) = quota_window_cooldown(Some(&limits), "daily request limit reached").unwrap();
+        assert!(wait >= Duration::from_secs(900) && wait <= Duration::from_secs(26 * 3600 + 120),
+            "got {wait:?}");
     }
 
     #[test]
