@@ -178,8 +178,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 **Free but finite (use before expiry):**
 - `inception` — Mercury 2 diffusion LLM (>1000 tok/s), 100M-token signup grant (added
   2026-08-25), tool calling verified, in `auto`'s finite tier. `mercury-coder` is gated
-  to pre-2026-02 accounts. TODO (needs Saiful in a browser, still pending): flip the
-  training opt-out in Account Settings on platform.inceptionlabs.ai.
+  to pre-2026-02 accounts. Training-data setting: checked by Saiful in Account
+  Settings 2026-08-25 — already in the desired state, nothing to flip. CLOSED.
 - ~~`scaleway`~~ — DISABLED same day it was added (2026-08-25): docs/08 was WRONG about
   the "1M free tokens, no card" claim. Signup REQUIRED a card, and the billing API shows
   zero discounts — no free tier exists; every call bills. Key verified working and kept
