@@ -89,6 +89,14 @@ pub async fn transcriptions(State(app): State<SharedApp>, multipart: Multipart) 
                 .send()
                 .await
         }
+        MediaKind::Dashscope => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&upload.bytes);
+            let mime = super::dashscope::audio_mime(&upload.filename, &upload.content_type);
+            req.header("content-type", "application/json")
+                .json(&super::dashscope::transcription_request(&r.model, &mime, &b64))
+                .send()
+                .await
+        }
         _ => {
             // OpenAI multipart (groq, mistral) — elevenlabs differs only in
             // the model field name.
@@ -134,12 +142,17 @@ pub async fn transcriptions(State(app): State<SharedApp>, multipart: Multipart) 
         Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("reading body: {e}")),
     };
 
-    // Cloudflare wraps the transcript; unwrap to the OpenAI `{text}` shape.
-    // A 200 without a transcript string is an upstream defect, not a success.
-    let (body, content_type) = if status < 400 && r.media.kind == MediaKind::Cloudflare {
-        let text = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|v| v["result"]["text"].as_str().map(String::from));
+    // Native dialects wrap the transcript; unwrap to the OpenAI `{text}`
+    // shape. A 200 without a transcript string is an upstream defect, not a
+    // success.
+    let wrapped_text = |v: &Value| match r.media.kind {
+        MediaKind::Cloudflare => v["result"]["text"].as_str().map(String::from),
+        MediaKind::Dashscope => super::dashscope::transcription_text(v),
+        _ => None,
+    };
+    let unwraps = matches!(r.media.kind, MediaKind::Cloudflare | MediaKind::Dashscope);
+    let (body, content_type) = if status < 400 && unwraps {
+        let text = serde_json::from_slice::<Value>(&bytes).ok().as_ref().and_then(wrapped_text);
         let Some(text) = text else {
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -199,6 +212,10 @@ pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
             let url = format!("{}?output_format=mp3_44100_128", r.url.replace("{voice}", &voice));
             (url, json!({"text": input, "model_id": r.model}))
         }
+        MediaKind::Dashscope => {
+            let voice = resolve_voice(&payload, r.media);
+            (r.url.clone(), super::dashscope::speech_request(&r.model, &input, &voice))
+        }
         _ => {
             let mut body = payload.clone();
             body["model"] = json!(r.model);
@@ -238,6 +255,36 @@ pub async fn speech(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         .and_then(|v| v.to_str().ok())
         .unwrap_or("audio/mpeg")
         .to_string();
+    if r.media.kind == MediaKind::Dashscope {
+        // DashScope answers with a signed OSS URL; fetch and relay the bytes.
+        let v: Value = resp.json().await.unwrap_or_default();
+        let Some(url) = super::dashscope::speech_audio_url(&v) else {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("no audio url in upstream response: {v}"),
+            );
+        };
+        return match app.http.get(&url).timeout(std::time::Duration::from_secs(60)).send().await {
+            Ok(audio) if audio.status().is_success() => {
+                let ct = audio
+                    .headers()
+                    .get("content-type")
+                    .and_then(|h| h.to_str().ok())
+                    .filter(|c| c.starts_with("audio/"))
+                    .unwrap_or("audio/wav")
+                    .to_string();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", ct)
+                    .body(axum::body::Body::from_stream(audio.bytes_stream()))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            }
+            Ok(audio) => {
+                error_response(StatusCode::BAD_GATEWAY, format!("fetching audio: http {}", audio.status()))
+            }
+            Err(e) => error_response(StatusCode::BAD_GATEWAY, format!("fetching audio: {e}")),
+        };
+    }
     if content_type.starts_with("application/json") {
         // JSON-wrapped audio (melotts): {result: {audio: base64}} -> bytes.
         let v: Value = resp.json().await.unwrap_or_default();

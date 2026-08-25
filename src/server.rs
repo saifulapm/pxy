@@ -218,16 +218,10 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
             .into_response();
     };
 
-    let prepared = match crate::providers::prepare(
-        &prov_name,
-        provider_cfg,
-        &app.secrets,
-        &app.state,
-        &app.http,
-    )
-    .await
-    {
-        Ok(p) => p,
+    // Plain API-key auth: `prepare()` insists on base_url, which
+    // embeddings-only providers (voyage, tencent-vl) legitimately lack.
+    let headers = match crate::media::auth_headers(&app, provider_cfg) {
+        Ok(h) => h,
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -244,7 +238,7 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
         .post(&url)
         .timeout(std::time::Duration::from_secs(provider_cfg.timeout_secs))
         .header("content-type", "application/json");
-    for (k, v) in &prepared.headers {
+    for (k, v) in &headers {
         req = req.header(k, v);
     }
     let resp = match req.json(&payload).send().await {

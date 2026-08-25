@@ -168,10 +168,23 @@ models = [
   "deepseek-v4-pro-0813",
   "minimax-m3",
 ]
-# vl-embedding models need a multimodal endpoint, not plain /v1/embeddings
 embedding_models = ["kinfra-text-embedding-0.6b", "kinfra-text-embedding-4b"]
 [providers.tencent.limits]
 total_tokens = 5000000        # 5 activated models x 1M free quota
+
+# Tencent VL (multimodal) embeddings — same key, DIFFERENT path: TokenHub
+# serves them only on /v1/embeddings/multimodal, with content-part input
+# ([{type:"text",...}, {type:"image_url", image_url:{url}}]); the whole input
+# array fuses into ONE embedding (4096-dim on 8b). Verified 2026-08-25.
+# Grant sweep same day: the 5 activated chat models are exactly the ones
+# above; hy-mt2-* = INSUFFICIENT_BALANCE, hy-3d-3.1 = BILLING_PROVISION_FAILED,
+# tripo-3d = no trial quota — 3D/translation are dead without paid billing.
+[providers.tencent-vl]
+tier = "finite"
+embeddings_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/embeddings/multimodal"
+api_key = { pass = "AI/tencent/main" }
+discover = false
+embedding_models = ["kinfra-vl-embedding-2b", "kinfra-vl-embedding-8b"]
 
 # Ollama Cloud — free plan ("light usage" rate limits, enforced upstream;
 # 429s trigger pxy cooldown+failover). Key from ollama.com/settings/keys.
@@ -437,10 +450,25 @@ models = [
   "qwen3.7-plus",
   "qwen3.7-flash",
   "qwen3.8-27b",
+  "qwen3-vl-flash",   # vision (image_url content verified 2026-08-25); own free quota
 ]
-embedding_models = ["qwen3.7-text-embedding"]
+embedding_models = ["qwen3.7-text-embedding", "text-embedding-v4"]
 [providers.alibaba.limits]
 total_tokens = 5000000        # 5 chat models x 1M free quota (90-day expiry!)
+# DashScope native multimodal endpoint: images + TTS + ASR on ONE url
+# (verified live 2026-08-25: qwen-image-3.0, z-image-turbo, qwen3-tts-flash
+# wav-url out, qwen3-asr-flash incl. base64 data-URI in). ⚠️ free-quota
+# status for these models is UNVERIFIED in the console — daily cap kept low
+# until "Free Quota Only" is confirmed; check Model Studio -> each model.
+[providers.alibaba.media]
+kind = "dashscope"
+run_url = "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+image_models = ["qwen-image-3.0", "z-image-turbo"]
+transcription_models = ["qwen3-asr-flash"]
+speech_models = ["qwen3-tts-flash"]
+daily_requests = 20
+[providers.alibaba.media.voices]
+default = "Cherry"
 
 # Fireworks — PAID serverless (pay per token; $1 signup credit only, 10 rpm
 # without a payment method). Kept OUT of [auto] deliberately: it spends real

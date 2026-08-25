@@ -204,8 +204,25 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   only deliberately as paid. ⚠️ docs/08 has now been wrong twice (Vercel, Scaleway) —
   re-verify its remaining claims (Ant Ling, Morph, NVIDIA) against reality before use.
 - `tencent` — TokenHub intl; 5 activated models × 1M tokens, expire **2027-08**.
+  Full activation sweep 2026-08-25: the five chat grants are exactly hy3, glm-5.3,
+  kimi-k3, deepseek-v4-pro-0813, minimax-m3 (all configured). All four kinfra
+  embeddings are active — the VL pair (`kinfra-vl-embedding-2b/8b`, image+text fused
+  into ONE embedding, 2048/4096-dim) lives on a separate path
+  `/v1/embeddings/multimodal` with content-part input, served via the `tencent-vl`
+  provider entry. **Dead without paid billing**: hy-mt2-* translation
+  (INSUFFICIENT_BALANCE), hy-3d-3.1 (BILLING_PROVISION_FAILED on real calls — a
+  max_tokens=1 probe deceptively succeeds), hy-3d-* pipeline stages (upstream
+  unreachable), tripo-3d (no trial quota).
 - `alibaba` — Model Studio; ~5M tokens across Qwen models, expire **~Nov 2026** (90-day).
   ⚠️ Enable "Free Quota Only" in the console or it silently switches to pay-as-you-go.
+  Added 2026-08-25 (all verified live via the native DashScope
+  multimodal-generation endpoint, `kind = "dashscope"` media dialect):
+  `qwen-image-3.0` + `z-image-turbo` (images), `qwen3-tts-flash` (TTS, answers a
+  signed OSS wav URL that pxy fetches and relays), `qwen3-asr-flash` (ASR, accepts
+  base64 data-URIs so multipart translates cleanly), `qwen3-vl-flash` (vision chat,
+  OpenAI-compat), `text-embedding-v4` (2nd embedding pool). ⚠️ Free-quota status of
+  the media models is UNVERIFIED in the console — media daily cap held at 20/day
+  until Saiful checks Model Studio per-model quotas + the Free Quota Only switch.
 
 **Paid reserves (deliberately NOT in `auto`):**
 - `agentrouter` / `agentrouter-openai` — $125 balance, Opus 5 / Opus 4.8 / gpt-5.6-sol /

@@ -421,6 +421,8 @@ pub enum MediaKind {
     Voyage,
     /// Agnes: OpenAI-ish images + async video job (submit then poll).
     Agnes,
+    /// DashScope (Alibaba) multimodal-generation: images/TTS/ASR on one URL.
+    Dashscope,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -28,6 +28,7 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
 
     let body = match r.media.kind {
         MediaKind::Cloudflare => cloudflare_request(&payload),
+        MediaKind::Dashscope => super::dashscope::image_request(&payload, &r.model),
         _ => openai_request(&payload, &r),
     };
 
@@ -74,7 +75,18 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
             Ok(v) => v,
             Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("bad upstream json: {e}")),
         };
-        normalize_json(&body)
+        match r.media.kind {
+            MediaKind::Dashscope => match super::dashscope::image_response(&body) {
+                Some(v) => v,
+                None => {
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("no image in upstream response: {body}"),
+                    );
+                }
+            },
+            _ => normalize_json(&body),
+        }
     };
 
     app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
