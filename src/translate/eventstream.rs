@@ -211,6 +211,48 @@ mod tests {
         assert_eq!(frames[2].payload, b"c");
     }
 
+    /// Real bytes captured from CodeWhisperer (claude-haiku-4.5, "Reply with
+    /// exactly: OK") — the decoder is only trustworthy if it handles the
+    /// actual wire output, not just our own encoder.
+    #[test]
+    fn decodes_a_real_codewhisperer_response() {
+        let bytes = include_bytes!("testdata_kiro_response.bin");
+        let mut d = EventStreamDecoder::new();
+        d.push(bytes);
+        let frames = d.drain();
+
+        let types: Vec<&str> = frames.iter().map(|f| f.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            ["assistantResponseEvent", "contextUsageEvent", "meteringEvent"]
+        );
+
+        let text = String::from_utf8_lossy(&frames[0].payload);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["content"], "OK");
+        assert_eq!(v["modelId"], "claude-haiku-4.5");
+
+        // metering carries the credit cost — the only real usage signal
+        let m: serde_json::Value =
+            serde_json::from_slice(&frames[2].payload).unwrap();
+        assert_eq!(m["unit"], "credit");
+        assert!(m["usage"].as_f64().unwrap() > 0.0);
+    }
+
+    /// The same real response, delivered one byte at a time.
+    #[test]
+    fn decodes_a_real_response_byte_by_byte() {
+        let bytes = include_bytes!("testdata_kiro_response.bin");
+        let mut d = EventStreamDecoder::new();
+        let mut frames = Vec::new();
+        for b in bytes.iter() {
+            d.push(&[*b]);
+            frames.extend(d.drain());
+        }
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].event_type, "assistantResponseEvent");
+    }
+
     #[test]
     fn empty_payload_frame_is_valid() {
         let mut d = EventStreamDecoder::new();
