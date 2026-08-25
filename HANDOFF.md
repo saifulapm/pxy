@@ -110,10 +110,28 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 97 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
+- 114 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
   tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
-  cooldown persistence, drop_params).
+  cooldown persistence, drop_params, context-window failover, tool-capability filtering,
+  Anthropic history sanitizing).
+- **Bug round from docs/09 audit (2026-08-26)** — read docs/09 §1 for full context:
+  - Never mint `{"type":"thinking","signature":""}` (poisoned client history → permanent
+    Anthropic 400s); `translate/anthropic_sanitize.rs` now repairs EVERY Anthropic-bound
+    body at one choke point (unverifiable thinking blocks stripped, tool pairs repaired
+    both directions, empty text blocks, first-message-user, trailing whitespace, empty
+    messages[]). Known residual: a final assistant turn with tool_use whose thinking
+    block was stripped can still 400 when the request has `thinking` enabled.
+  - Anthropic cache tokens (cache_creation/cache_read) now count as input everywhere.
+  - Context-window 400/413/422 on a multi-candidate walk fails over (NO cooldown),
+    peer-skips candidates with the same-or-smaller window, and when context was the
+    ONLY problem the terminal error is an honest 400 (else stays retryable 429).
+  - `tool_call = false` models are skipped for tools requests on multi-candidate walks
+    (single-candidate exempt, upstream answers for itself).
+  - `Retry-After: 5m`-style durations parse; `drop_params` takes dotted paths with
+    empty-parent pruning; `/v1/models` advertises min-over-chain context_length for
+    `auto` (a missing window disables opencode auto-compaction); Claude Code telemetry
+    POSTs to /api/event_logging/batch get a discard stub instead of 404s.
 - **Cooldowns persist across restarts (added 2026-08-25)**: the in-memory map stays
   authoritative at runtime, but every set/clear is mirrored to a sqlite `cooldowns`
   table; `State::open` prunes expired rows and rehydrates the rest (remaining wait,

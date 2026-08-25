@@ -183,12 +183,12 @@ fn trim_trailing_assistant(messages: &mut [Value]) {
         }
         Value::Array(blocks) => {
             // Only the FINAL text block's trailing whitespace matters.
-            if let Some(b) = blocks.iter_mut().rev().find(|b| b["type"] == "text") {
-                if let Some(s) = b["text"].as_str() {
-                    let trimmed = s.trim_end();
-                    if trimmed.len() != s.len() {
-                        b["text"] = json!(trimmed);
-                    }
+            if let Some(b) = blocks.iter_mut().rev().find(|b| b["type"] == "text")
+                && let Some(s) = b["text"].as_str()
+            {
+                let trimmed = s.trim_end();
+                if trimmed.len() != s.len() {
+                    b["text"] = json!(trimmed);
                 }
             }
         }

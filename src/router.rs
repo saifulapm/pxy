@@ -79,16 +79,33 @@ pub async fn handle_chat(
     let input_estimate = estimate_tokens(&payload["messages"])
         + estimate_tokens(&payload["system"])
         + estimate_tokens(&payload["tools"]);
+    let wants_tools = payload["tools"].as_array().is_some_and(|a| !a.is_empty());
 
     let mut skipped: Vec<String> = Vec::new();
     let multi = candidates.len() > 1;
+    // Set when an upstream 400s with a context-window error: our chars/4
+    // estimate under-counted, so every candidate at that context size or
+    // below would fail identically — skip them instead of burning calls.
+    let mut ctx_too_small: Option<u64> = None;
+    // Sticky across walks: ANY non-context obstacle (cooldown, rpm, limits,
+    // a 429/5xx attempt…) means the terminal error must stay retryable —
+    // only when context was the sole problem is a 400 the honest answer.
+    let mut other_failures = false;
 
     for attempt in 0..=MAX_RETRIES {
         skipped.clear();
         let mut saw_rpm_limit = false;
         for cand in &candidates {
-            if let Err(reason) = check_candidate(&app, cand, input_estimate, multi) {
+            if ctx_too_small.is_some_and(|c| cand.model.context_length <= c) {
+                skipped.push(format!("{}: context window too small", cand.full_id()));
+                continue;
+            }
+            if let Err(reason) = check_candidate(&app, cand, input_estimate, wants_tools, multi) {
                 saw_rpm_limit |= reason == "rpm limit";
+                // Filter reasons for context start with "context"; everything
+                // else (cooldown/rpm/limits/disabled) is a non-context
+                // obstacle a later retry might clear.
+                other_failures |= !reason.starts_with("context");
                 skipped.push(format!("{}: {reason}", cand.full_id()));
                 continue;
             }
@@ -99,6 +116,15 @@ pub async fn handle_chat(
                 AttemptResult::Done(outcome) => return outcome,
                 AttemptResult::Skip(reason) => {
                     warn!(candidate = %cand.full_id(), %reason, "failover");
+                    other_failures = true;
+                    skipped.push(format!("{}: {reason}", cand.full_id()));
+                }
+                AttemptResult::SkipContextWindow(reason) => {
+                    // The real tokenizer overruled our estimate. No cooldown
+                    // (a smaller request to this model would work fine).
+                    warn!(candidate = %cand.full_id(), %reason, "failover (context window)");
+                    let c = ctx_too_small.get_or_insert(0);
+                    *c = (*c).max(cand.model.context_length);
                     skipped.push(format!("{}: {reason}", cand.full_id()));
                 }
                 AttemptResult::Fatal(outcome) => return outcome,
@@ -122,6 +148,21 @@ pub async fn handle_chat(
         tokio::time::sleep(wait).await;
     }
 
+    // Honest terminal status: if the only real failures were context-window
+    // 400s, telling the client "rate limited" makes it back off pointlessly —
+    // the request itself is too large and retrying can't fix that.
+    if ctx_too_small.is_some() && !other_failures {
+        return error_outcome(
+            client_format,
+            400,
+            "invalid_request_error",
+            &format!(
+                "input exceeds the context window of every available candidate for '{requested}' \
+                 (tried/skipped: {})",
+                skipped.join("; ")
+            ),
+        );
+    }
     error_outcome(
         client_format,
         429,
@@ -165,17 +206,28 @@ fn retry_wait(soonest: Option<Duration>, saw_rpm_limit: bool) -> Option<Duration
     Some(wait + Duration::from_millis(250))
 }
 
-/// Filter stage: cooldown, rpm, daily/monthly limits, context window.
+/// Filter stage: cooldown, rpm, daily/monthly limits, context window,
+/// tool-calling capability.
 fn check_candidate(
     app: &App,
     cand: &Candidate,
     input_estimate: u64,
+    wants_tools: bool,
     multi_candidate: bool,
 ) -> Result<(), String> {
     let provider = match app.cfg.providers.get(&cand.provider) {
         Some(p) if p.enabled => p,
         _ => return Err("provider disabled".into()),
     };
+
+    // A curated/probed `tool_call = false` is a fact: routing a tools
+    // request there burns the call and returns prose. Unknown stays
+    // eligible (fail open), and an explicitly-addressed single model is
+    // exempt like the cooldown filter — let the upstream answer for itself
+    // rather than synthesizing a retryable 429 for a deterministic no.
+    if multi_candidate && wants_tools && cand.model.tool_call == Some(false) {
+        return Err("model cannot tool-call".into());
+    }
 
     // Single-candidate requests skip the cooldown filter (litellm's
     // single-deployment exemption): blocking your only option converts a
@@ -249,6 +301,10 @@ enum AttemptResult {
     Done(Outcome),
     /// Retryable/skippable failure: try the next candidate.
     Skip(String),
+    /// Upstream 400'd because the input exceeds THIS model's real context
+    /// window (our estimate under-counted): skip it and every candidate
+    /// with the same or smaller window, no cooldown.
+    SkipContextWindow(String),
     /// Fatal for the whole request: return this to the client.
     Fatal(Outcome),
 }
@@ -317,15 +373,13 @@ async fn try_candidate(
     // param, it would corrupt the request pxy itself built, so they're
     // ignored here. (A provider body_patch — kiro's profileArn — merges
     // later and also can't be stripped.)
-    if (!provider_cfg.drop_params.is_empty() || !cand.model.drop_params.is_empty())
-        && let Some(obj) = body.as_object_mut()
-    {
+    if !provider_cfg.drop_params.is_empty() || !cand.model.drop_params.is_empty() {
         for key in provider_cfg.drop_params.iter().chain(&cand.model.drop_params) {
             if key == "model" || key == "stream" {
                 warn!(candidate = %cand.full_id(), key, "drop_params ignores pxy's own key");
                 continue;
             }
-            obj.remove(key);
+            remove_param_path(&mut body, key);
         }
     }
 
@@ -530,6 +584,54 @@ async fn try_candidate(
 /// model lists churn, and one delisted id must not kill the whole chain
 /// (zenmux delisting glm-5.3-free took `auto` down, 2026-08-25). On a
 /// single-candidate request the 404 still passes through raw.
+/// Remove a (possibly dotted) key path from a JSON object, pruning parents
+/// the removal left empty — `thinking.budget_tokens` must not leave a bare
+/// `{"thinking":{}}` behind, which is itself a 400 on some upstreams.
+fn remove_param_path(body: &mut Value, path: &str) {
+    match path.split_once('.') {
+        None => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove(path);
+            }
+        }
+        Some((head, rest)) => {
+            let Some(obj) = body.as_object_mut() else { return };
+            let Some(child) = obj.get_mut(head) else { return };
+            remove_param_path(child, rest);
+            if child.as_object().is_some_and(|c| c.is_empty()) {
+                obj.remove(head);
+            }
+        }
+    }
+}
+
+/// Upstream told us the input exceeds the model's real context window.
+/// Substring set from litellm's ExceptionCheckers (nine phrasings across
+/// OpenAI/Anthropic/Gemini dialects) with its two known false positives
+/// excluded. Only consulted for 400-class responses.
+fn is_context_window_error(body: &str) -> bool {
+    let b = body.to_lowercase();
+    // OpenAI uses this code for an over-long single STRING field, and the
+    // "invalid 'user'" param error contains "maximum length" — neither is
+    // a context-window condition.
+    if b.contains("string_above_max_length") || b.contains("invalid 'user'") {
+        return false;
+    }
+    [
+        "maximum context length",
+        "context length exceeded",
+        "context_length_exceeded",
+        "context window",
+        "prompt is too long",
+        "input is too long",
+        "input tokens exceed",
+        "exceeds the maximum number of tokens",
+        "too many total text bytes",
+    ]
+    .iter()
+    .any(|needle| b.contains(needle))
+}
+
 fn classify_error(
     app: &App,
     cand: &Candidate,
@@ -539,6 +641,19 @@ fn classify_error(
     err_body: String,
     multi: bool,
 ) -> AttemptResult {
+    // Context-window 400s fail over on multi-candidate walks: the estimate
+    // under-counted for THIS model, but larger-window candidates further
+    // down the chain can still serve the request. Single-model requests
+    // get the raw 400 (nothing to fail over to, body passes through below).
+    // 429s are deliberately excluded — token-ish wording there is TPM rate
+    // limiting, which the ordinary skip path already handles.
+    if multi && matches!(status, 400 | 413 | 422) && is_context_window_error(&err_body) {
+        return AttemptResult::SkipContextWindow(format!(
+            "{status}: {}",
+            truncate(&err_body, 200)
+        ));
+    }
+
     // 402 included: aggregators (ZenMux, OpenRouter, DeepSeek) use it for
     // exhausted quota/credits — an account problem, not a request problem.
     let skip = matches!(status, 401 | 402 | 403 | 408 | 409 | 429)
@@ -692,14 +807,15 @@ fn parse_go_duration(s: &str) -> Option<Duration> {
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let v = headers.get("retry-after")?.to_str().ok()?;
-    let secs: u64 = v.trim().parse().ok()?;
+    let v = headers.get("retry-after")?.to_str().ok()?.trim();
+    // Bare seconds (the RFC form) or a duration like "5m" / "2m59s" (groq).
+    let dur = match v.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(_) => parse_go_duration(v)?,
+    };
+    let secs = dur.as_secs();
     // Sanity clamp (litellm): obey only reasonable waits; else exponential backoff.
-    if secs > 0 && secs <= 3600 {
-        Some(Duration::from_secs(secs))
-    } else {
-        None
-    }
+    if secs > 0 && secs <= 3600 { Some(dur) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +1623,254 @@ mod tests {
         }
         assert_eq!(seen.load(Ordering::SeqCst), 1, "a dead key must not be re-fired");
         assert!(started.elapsed() < Duration::from_millis(500), "must fail fast, not back off");
+    }
+
+    #[test]
+    fn context_window_errors_detected() {
+        assert!(is_context_window_error(
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens"}}"#
+        ));
+        assert!(is_context_window_error(r#"{"error":{"message":"prompt is too long: 210503 tokens"}}"#));
+        assert!(is_context_window_error(r#"{"message":"input tokens exceed the configured limit"}"#));
+        // The two known false positives stay out.
+        assert!(!is_context_window_error(r#"{"error":{"code":"string_above_max_length"}}"#));
+        assert!(!is_context_window_error(r#"{"error":{"message":"invalid 'user': maximum length"}}"#));
+        // Ordinary errors don't match.
+        assert!(!is_context_window_error(r#"{"error":{"message":"rate limited"}}"#));
+    }
+
+    #[test]
+    fn retry_after_duration_forms() {
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "30")])),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "5m")])),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "2m30s")])),
+            Some(Duration::from_secs(150))
+        );
+        // Over the sanity clamp or garbage: fall back to exponential backoff.
+        assert_eq!(parse_retry_after(&headers(&[("retry-after", "2h")])), None);
+        assert_eq!(parse_retry_after(&headers(&[("retry-after", "soon")])), None);
+    }
+
+    #[test]
+    fn remove_param_path_prunes_empty_parents() {
+        let mut body = json!({
+            "thinking": {"budget_tokens": 5, "type": "enabled"},
+            "output_config": {"effort": "high"},
+            "top_k": 40,
+        });
+        remove_param_path(&mut body, "thinking.budget_tokens");
+        assert!(body["thinking"]["budget_tokens"].is_null());
+        assert_eq!(body["thinking"]["type"], "enabled", "siblings survive");
+        remove_param_path(&mut body, "output_config.effort");
+        assert!(body.get("output_config").is_none(), "emptied parent pruned");
+        remove_param_path(&mut body, "top_k");
+        assert!(body.get("top_k").is_none());
+        remove_param_path(&mut body, "absent.path");
+    }
+
+    #[tokio::test]
+    async fn context_window_400_fails_over_and_skips_smaller_peers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let small_calls = Arc::new(AtomicUsize::new(0));
+        let counter = small_calls.clone();
+        let router = axum::Router::new()
+            .route("/small", post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        r#"{"error":{"message":"This model's maximum context length is 8000 tokens"}}"#,
+                    )
+                        .into_response()
+                }
+            }))
+            .route("/big", post(|| async {
+                axum::Json(json!({
+                    "id": "x",
+                    "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "fits"},
+                        "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }))
+                .into_response()
+            }));
+        let base = mock_server(router).await;
+        // `tiny` shares small's window: the peer-skip must spare it the call.
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.small]
+                base_url = "{base}/small"
+                models = [{{ id = "m", context_length = 8000 }}]
+                [providers.tiny]
+                base_url = "{base}/small"
+                models = [{{ id = "m", context_length = 4000 }}]
+                [providers.big]
+                base_url = "{base}/big"
+                models = [{{ id = "m", context_length = 1000000 }}]
+                [auto]
+                models = ["small/m", "tiny/m", "big/m"]
+                "#
+            ),
+            "ctx_failover",
+        );
+
+        let payload = json!({"model": "auto", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { status, body, provider } => {
+                assert_eq!(status, 200, "must fail over to the larger window: {body}");
+                assert_eq!(provider.as_deref(), Some("big/m"));
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        // No cooldown: a smaller request to `small` would work fine.
+        assert!(app.state.cooldown("small", "m").is_none());
+        // `tiny` (same route, smaller window) must have been peer-skipped:
+        // only `small`'s own attempt hit the endpoint.
+        assert_eq!(small_calls.load(Ordering::SeqCst), 1, "peer must be spared the call");
+    }
+
+    #[tokio::test]
+    async fn all_context_failures_return_400_not_429() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let router = axum::Router::new().route("/small", post(|| async {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"context length exceeded"}}"#,
+            )
+                .into_response()
+        }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/small"
+                models = [{{ id = "m", context_length = 8000 }}]
+                [providers.b]
+                base_url = "{base}/small"
+                models = [{{ id = "m", context_length = 8000 }}]
+                [auto]
+                models = ["a/m", "b/m"]
+                "#
+            ),
+            "ctx_exhaust",
+        );
+        let payload = json!({"model": "auto", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 400, "not a synthetic 429: {body}");
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_400_plus_rate_limited_peer_stays_retryable() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        // The large-window candidate is only rate limited — the request is
+        // NOT invalid, so the terminal error must stay a retryable 429.
+        let router = axum::Router::new()
+            .route("/limited", post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "3600")],
+                    r#"{"error":{"message":"slow down"}}"#,
+                )
+                    .into_response()
+            }))
+            .route("/small", post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"context length exceeded"}}"#,
+                )
+                    .into_response()
+            }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.big]
+                base_url = "{base}/limited"
+                models = [{{ id = "m", context_length = 1000000 }}]
+                [providers.small]
+                base_url = "{base}/small"
+                models = [{{ id = "m", context_length = 8000 }}]
+                [auto]
+                models = ["big/m", "small/m"]
+                "#
+            ),
+            "ctx_mixed",
+        );
+        let payload = json!({"model": "auto", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 429, "big was merely throttled — not a 400: {body}");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_request_skips_non_tool_models() {
+        use axum::routing::post;
+        let router = axum::Router::new().route("/c", post(|| async {
+            axum::Json(json!({
+                "id": "x",
+                "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }))
+        }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.notools]
+                base_url = "{base}/c"
+                models = [{{ id = "m", tool_call = false }}]
+                [providers.tools]
+                base_url = "{base}/c"
+                models = [{{ id = "m", tool_call = true }}]
+                [auto]
+                models = ["notools/m", "tools/m"]
+                "#
+            ),
+            "tool_filter",
+        );
+        let payload = json!({"model": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "X", "parameters": {}}}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { provider, status, .. } => {
+                assert_eq!(status, 200);
+                assert_eq!(provider.as_deref(), Some("tools/m"), "tool_call=false must be skipped");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
     }
 
     #[tokio::test]

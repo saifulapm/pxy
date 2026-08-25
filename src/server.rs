@@ -48,6 +48,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
             post(crate::media::search::fetch).get(crate::media::search::fetch_get),
         )
         .route("/healthz", get(healthz))
+        // Claude Code posts telemetry batches here; a 404 makes it retry.
+        // Accept and discard (litellm ships the same stub for the same reason).
+        .route(
+            "/api/event_logging/batch",
+            post(|| async { Json(json!({"status": "ok"})) }),
+        )
         .fallback(not_found)
         // axum's default body cap is 2 MB, which rejects any real audio
         // upload before the transcription handler runs.
@@ -282,13 +288,22 @@ async fn count_tokens(Json(payload): Json<Value>) -> Json<Value> {
 async fn models(State(app): State<SharedApp>) -> Json<Value> {
     let created = Timestamp::now().as_second();
     let mut data: Vec<Value> = Vec::new();
-    if !app.catalog.resolve(&app.cfg, "auto").is_empty() {
+    let auto_chain = app.catalog.resolve(&app.cfg, "auto");
+    if !auto_chain.is_empty() {
+        // min() over chain members: any member may serve a request, so the
+        // advertised window must be one they all satisfy. A missing/zero
+        // context window disables opencode's auto-compaction entirely and
+        // the session grows until history purge destroys the context.
+        let ctx = auto_chain.iter().map(|c| c.model.context_length).min().unwrap_or(0);
+        let max_out = auto_chain.iter().map(|c| c.model.max_output_tokens).min().unwrap_or(0);
         data.push(json!({
             "id": "auto",
             "object": "model",
             "created": created,
             "owned_by": "pxy",
             "display_name": "auto",
+            "context_length": ctx,
+            "max_output_tokens": max_out,
         }));
     }
     for cand in app.catalog.models() {
