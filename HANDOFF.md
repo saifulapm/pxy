@@ -20,9 +20,9 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 ### Commands
 ```sh
 pxy serve                     # daemon (systemd runs this)
-pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
+pxy launch claude|opencode|pi|codex # spawn an agent wired to pxy (--dry-run shows the plan)
 pxy models                    # 146 models exposed
-pxy status                    # per-provider usage vs limits
+pxy status [--remote]         # per-provider usage vs limits; --remote adds live balances
 pxy refresh [--write]         # discover catalogs; report drift / regenerate generated.toml
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
@@ -30,8 +30,10 @@ systemctl --user restart pxy  # REQUIRED after any config or pass change (secret
 
 ### Endpoints served
 `POST /v1/chat/completions` (OpenAI) · `POST /v1/messages` + `/v1/messages/count_tokens`
-(Anthropic) · `POST /v1/embeddings` · `GET /v1/models` · `GET /healthz`.
-Both chat protocols translate in both directions, streaming included.
+(Anthropic) · `POST /v1/responses` (OpenAI Responses API — codex) · `POST /v1/embeddings` ·
+`GET /v1/models` · `GET /healthz`.
+Both chat protocols translate in both directions, streaming included. /v1/responses
+wraps the OpenAI path (translate/responses.rs), so routing/accounting apply unchanged.
 
 ## Architecture (src/)
 
@@ -50,6 +52,8 @@ Both chat protocols translate in both directions, streaming included.
 | `translate/eventstream.rs` | AWS vnd.amazon.eventstream binary frame decoder |
 | `translate/kiro.rs` | anthropic<->conversationState; frames -> OpenAI SSE; sha1/uuidv5 |
 | `translate/` | anthropic↔openai (request + streaming response), SSE parser, `<think>` filter |
+| `translate/responses.rs` | OpenAI Responses API (codex) ↔ chat completions, streaming incl. |
+| `translate/aggregate.rs` | SSE stream → complete JSON body (the `force_stream` re-assembly) |
 | `refresh.rs` | catalog discovery: provider /models x models.dev join, drift report |
 | `launch.rs` | per-agent env/config injection |
 
@@ -77,6 +81,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     **HTTP 500 on every call** (both accounts, all three routes, streaming and not, while
     `hy3` on the same key worked). That's an opencode-side outage, not our config. Retry
     later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
+    (Retested 2026-08-25 evening: still 500 on both zen and Go routes.)
 
 **Free, renewable:**
 - `kiro` — AWS CodeWhisperer via Kiro (added 2026-08-25, **Phase 3 #3**, the big one:
@@ -102,7 +107,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   `providers/kimi.rs`). Rotating refresh tokens (serialized, persisted to kv BEFORE use —
   losing one kills the session), 900s access tokens, X-Msh-* device identity, Anthropic
   native. ⚠️ credits exhausted at activation (masked as bare 500s); NOT in `auto` — retest
-  after quota reset. Re-login = curl device flow (see config.example comment).
+  after quota reset (retested 2026-08-25 evening: still 500s, no reset yet).
+  Re-login = curl device flow (see config.example comment).
 - `kilocode` — Kilo Code gateway (added 2026-08-25, **Phase 3 #1 — zero Rust needed**):
   the archived device-flow token is a long-lived JWT (exp ~2031, no refresh), so it's a
   plain bearer + `X-KILOCODE-EDITORNAME` header, with a `cmd` secret extracting the token
@@ -161,7 +167,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 **Free but finite (use before expiry):**
 - `inception` — Mercury 2 diffusion LLM (>1000 tok/s), 100M-token signup grant (added
   2026-08-25), tool calling verified, in `auto`'s finite tier. `mercury-coder` is gated
-  to pre-2026-02 accounts. TODO: flip the training opt-out in Account Settings.
+  to pre-2026-02 accounts. TODO (needs Saiful in a browser, still pending): flip the
+  training opt-out in Account Settings on platform.inceptionlabs.ai.
 - ~~`scaleway`~~ — DISABLED same day it was added (2026-08-25): docs/08 was WRONG about
   the "1M free tokens, no card" claim. Signup REQUIRED a card, and the billing API shows
   zero discounts — no free tier exists; every call bills. Key verified working and kept
@@ -175,10 +182,16 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 **Paid reserves (deliberately NOT in `auto`):**
 - `agentrouter` / `agentrouter-openai` — $125 balance, Opus 5 / Opus 4.8 / gpt-5.6-sol /
   deepseek-v4f. WAF requires the `claude-cli/...` User-Agent (already set).
+  deepseek-v4f now also sits on the Anthropic route with `force_stream = true`
+  (their route rejects it without stream) — but as of 2026-08-25 evening agentrouter
+  has NO deepseek-v4f channel on EITHER route (503 "无可用渠道"); upstream churn,
+  retry later.
 - `tabitoken` — $120 referral credits (added 2026-08-25), Opus 5 / 4.8 (+ `-thinking`
   variants). Same claude-cli UA WAF; speaks Anthropic natively; fronts Kiro/Amazon-Q
   accounts (usage leaks `kiro_credits`). ⚠️ injects ~7k hidden prompt tokens per call,
-  billed to us — use for real sessions, not one-liners. No remote balance endpoint.
+  billed to us — use for real sessions, not one-liners. Remote usage IS readable
+  (earlier "no balance endpoint" note was wrong: /v1/dashboard/billing/usage answers
+  with the claude-cli UA + Bearer — wired into `pxy status --remote`, used $2.40).
 - `gorouter` — $70 referral credits (added 2026-08-25). Same operator as tabitoken
   (identical WAF, models, injection, `kiro_credits`) — same caveats. Combined Opus
   reserve across both: ~$190.
@@ -283,14 +296,25 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    - **Proof the no-auto-delete rule is load-bearing**: `zai/glm-4.7-flash` (our best free
      coding model, 59.2 SWE-bench) does NOT appear in Z.AI's own `/models` listing but
      works fine — verified live. Auto-deletion would have removed it.
-5. **Nice-to-haves identified but not built**:
-   - Read upstream quota headers (`X-Quota-5h/Week/Month` on openadapter, Copilot's, etc.) and
-     cool a provider down when it self-reports exhaustion.
-   - `pxy status` showing remote balances (agentrouter/tokenrouter expose billing endpoints).
-   - Per-model `force_stream` flag (agentrouter's deepseek-v4f needs streaming on its
-     Anthropic route; worked around by routing it via the OpenAI endpoint).
-   - Live model discovery (`pxy models --refresh`) — free model lists churn weekly.
-   - Gemini protocol + `/v1/responses` (would let `pxy launch codex` work).
+5. **Nice-to-haves — ALL RESOLVED 2026-08-25** (one commit each, see git log):
+   - ~~Quota headers~~ DONE: on a SUCCESS response, openadapter's `X-Quota-*` (≥100%)
+     and `x-ratelimit-remaining-*: 0` (reset parsed from plain-secs / Go-duration /
+     epoch dialects) set a provider-wide cooldown. Copilot dropped from the item —
+     it does not report premium quota in response headers (checked the reference).
+   - ~~Remote balances~~ DONE: `pxy status --remote` + per-provider `balance_url`
+     (agentrouter, tokenrouter, tabitoken, gorouter = new-api cents-used shape;
+     openrouter = real credits). new-api gateways return dummy hard limits, so only
+     spend is visible, not remaining balance.
+   - ~~Per-model `force_stream`~~ DONE: streams upstream, re-assembles JSON via
+     `translate/aggregate.rs`. Also fixed the generated-overlay bug it exposed:
+     the overlay was replacing curated ModelSpecs (max_output_tokens, format,
+     pinned contexts) with bare generated entries — curated spec now wins by id.
+   - Live model discovery — covered by `pxy refresh` (stage 1-3, done earlier).
+   - ~~`/v1/responses`~~ DONE: full Responses API endpoint + `pxy launch codex`
+     (wired via `-c` overrides, config.toml untouched). Verified: codex exec ran a
+     real shell-tool round-trip through pxy. **Gemini protocol deliberately NOT
+     built**: no Gemini client installed here, and free Gemini upstream is already
+     served via Google's OpenAI-compat layer — revisit only if gemini-cli lands.
 5. **Housekeeping**: `~/.config/pxy/config.toml` and the systemd unit are not chezmoi-managed
    yet — consider adding them to `~/.dotfiles` (config has no secrets, only pass references).
 

@@ -822,6 +822,6 @@ daily_requests = 1000
 # api_key = { pass = "AI/morph/main" }
 # models = [{ id = "auto", context_length = 262144 }]
 
-# Google AI Studio (Gemini): free gemini-3-flash etc. with tool calling, but the
-# wire format is Gemini-native and the auth header is x-goog-api-key — pxy needs a
-# Gemini translator first (see HANDOFF next steps).
+# Google AI Studio (Gemini): DONE — served by [providers.google] above via
+# Google's OpenAI compat layer (/v1beta/openai/); no Gemini translator needed.
+# (This note previously claimed one was required — that was wrong.)
