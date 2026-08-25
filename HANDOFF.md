@@ -5,7 +5,7 @@ Read this first in a new session, then `docs/07-pxy-design.md` for design ration
 ## What pxy is
 
 A tiny Rust proxy replacing OmniRoute (a heavy Node router that used ~800 MB RAM).
-**pxy uses ~12.5 MB.** One local endpoint over 25 providers, an `auto` model that routes by
+**pxy uses ~12.5 MB.** One local endpoint over 27 providers, an `auto` model that routes by
 priority + quota with automatic failover, and `pxy launch claude|opencode|pi` to wire coding
 agents to it. Repo: `github.com/saifulapm/pxy` (private).
 
@@ -21,7 +21,7 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 ```sh
 pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
-pxy models                    # 122 models exposed
+pxy models                    # 130 models exposed
 pxy status                    # per-provider usage vs limits
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
@@ -58,7 +58,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
 - 24 unit tests: `cargo test`.
 
-## Provider catalog (25 active)
+## Provider catalog (27 active)
 
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
@@ -73,7 +73,11 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
 
 **Free, renewable:**
-- `zai` — Z.AI direct (added 2026-08-25): permanently free `glm-4.7-flash` (59.2 SWE-bench,
+- `google` — AI Studio Gemini free tier (added 2026-08-25) via Google's **OpenAI compat
+  layer** (`/v1beta/openai/` — docs/08's "needs a Gemini translator" was WRONG, 3rd
+  correction). gemini-3-flash-preview (in `auto`), 3.1-flash-lite, 2.5-flash; all 1M ctx,
+  tools verified. No billing on the project → hard 429 stop. Unpublished free limits,
+  rpm=8 client-side. ⚠️ trains on prompts. Key: `AI/google/main` (project 416746239844).
   agentic-tuned, tool calling verified), `glm-4.5-flash`, `glm-4.6v-flash` (vision).
   ONE concurrent request on the free tier (rpm = 5 in config). Key: `AI/zai/main`.
 - `zenmux` — free models; `z-ai/glm-5.3-free` was DELISTED ~2026-08-25 (their free list
@@ -103,6 +107,11 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - `bai` — exactly 1 free model (`mimo-v2.5`), heavily throttled; other 41 need a deposit.
 - `openadapter` — 50/day, 200/month; only 5 small models on the free plan. Counts *failed*
   requests against quota too.
+- `groq` — short-call sidecar (added 2026-08-25), **NEVER in `auto`**: gpt-oss-120b/20b +
+  qwen3.6-27b at 1000 req/day but 8K TPM (context_length pinned to 8192 in config on
+  purpose); `groq/compound(-mini)` at 250/day, 70K TPM with built-in web search — but it
+  REJECTS external tools, so it's a question-answering/search utility, not an agent model.
+  ~3000 tok/s. No card = hard 429 stop. Whisper models on the same key (Phase 2).
 - `cloudflare` — Workers AI on the PAID Workers plan (added 2026-08-25): 10k neurons/day
   free, **overage bills automatically with no block switch**, so pxy enforces
   `daily_tokens = 50000` over cheap models only (worst case ~6k neurons ≈ 60% of free).

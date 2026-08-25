@@ -44,7 +44,8 @@ models = [
   "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",  # 550B, 1M ctx
   "mistral/devstral-latest",                       # free Experiment tier, agentic coder
   "zai/glm-4.7-flash",                             # permanently free, 59.2 SWE-bench; 1 concurrent (rpm 5)
-  "aihubmix/gemini-3.7-flash-free",                # only Gemini in the stack, 1M ctx
+  "google/gemini-3-flash-preview",                 # AI Studio free tier direct, 1M ctx (trains on prompts)
+  "aihubmix/gemini-3.7-flash-free",                # 2nd Gemini pool via aggregator, 1M ctx
   "aihubmix/minimax-m3-free",                      # outlives the openrouter GMI promo
   "aihubmix/ox-alpha",                             # 4th ox-alpha pool, deep fallback
   "agnes/agnes-2.5-flash",                         # free flash tier
@@ -581,15 +582,44 @@ total_tokens = 100000000
 # api_key = { pass = "AI/vercel-gateway/main" }
 # models = ["anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-flash"]
 
-# 5) Groq — 30 RPM / 1K RPD but only 8K TPM (the real ceiling). Org-wide limits.
-#    groq/compound has built-in web search + code execution.
-# [providers.groq]
-# base_url = "https://api.groq.com/openai/v1/chat/completions"
-# api_key = { pass = "AI/groq/main" }
-# models = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "groq/compound"]
-# [providers.groq.limits]
-# rpm = 30
-# daily_requests = 1000
+# 5) Groq — ACTIVE 2026-08-25 as a SHORT-CALL sidecar, NEVER in [auto].
+#    Verified from live headers: gpt-oss/qwen = 1000 req/day but 8K TPM —
+#    context_length below is set to 8192 ON PURPOSE so pxy rejects bigger
+#    requests locally instead of upstream request_too_large. compound(-mini)
+#    = 250 req/day, 70K TPM, built-in web search/code-exec; REJECTS external
+#    tools ("tool calling is not supported"), so ask it questions directly.
+#    ~3000 tok/s. No card on the account = hard 429 stop, no billing risk.
+# Google AI Studio (Gemini API) — free tier, ACTIVE 2026-08-25. docs/08 said
+# this needs a Gemini translator: WRONG (3rd correction) — Google's OpenAI
+# compatibility layer (/v1beta/openai/) does chat + tool calling fine.
+# Free tier = no billing on the project -> hard 429 stop past quota, no
+# billing risk. Google doesn't publish free per-model limits; rpm kept low,
+# upstream 429s handled by cooldown/failover. ⚠️ free tier TRAINS on prompts.
+# Key line 1 of pass entry, project number line 2 (project 416746239844).
+[providers.google]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+api_key = { pass = "AI/google/main" }
+models = [
+  { id = "gemini-3-flash-preview", context_length = 1048576 },
+  { id = "gemini-3.1-flash-lite", context_length = 1048576 },
+  { id = "gemini-2.5-flash", context_length = 1048576 },
+]
+[providers.google.limits]
+rpm = 8
+
+[providers.groq]
+base_url = "https://api.groq.com/openai/v1/chat/completions"
+api_key = { pass = "AI/groq/main" }
+models = [
+  { id = "openai/gpt-oss-120b", context_length = 8192 },
+  { id = "openai/gpt-oss-20b", context_length = 8192 },
+  { id = "qwen/qwen3.6-27b", context_length = 8192 },
+  { id = "groq/compound", context_length = 65536 },
+  { id = "groq/compound-mini", context_length = 65536 },
+]
+[providers.groq.limits]
+rpm = 25
+daily_requests = 1000
 
 # 6) Ant Ling — 500K tokens/day recurring (resets 02:00 UTC+8). Signup may need a
 #    Chinese phone/ID — unverified.

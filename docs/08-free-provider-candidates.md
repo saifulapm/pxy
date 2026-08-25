@@ -16,7 +16,15 @@ Config blocks are staged (commented) in `config.example.toml` and `~/.config/pxy
 - **§8 Scaleway: WRONG.** Signup **required a card**, and the billing API shows **zero
   discounts** on the fresh account — no "1M free tokens" tier exists; every generative-API
   call bills the card. Disabled the same day it was added.
-- Lesson: for any remaining candidate (Ant Ling, Morph, NVIDIA, Groq), verify the free
+- **§3 Google AI Studio: WRONG about needing a Gemini translator.** Google's OpenAI
+  compatibility layer (`generativelanguage.googleapis.com/v1beta/openai/chat/completions`,
+  Bearer auth) handles chat + tool calling fine — added as a plain provider 2026-08-25,
+  zero Rust work. (A native Gemini translator would still be needed only for
+  Gemini-exclusive features like cached content or the Live API.)
+- **§5 Groq: CORRECT** — live `x-ratelimit-*` headers matched this doc exactly
+  (8K TPM on gpt-oss/qwen, 70K TPM + 250 RPD on compound). Also: compound REJECTS
+  external tool definitions (built-in tools only).
+- Lesson: for any remaining candidate (Ant Ling, Morph, NVIDIA), verify the free
   grant **from the account itself** (billing/credits endpoint or a $0-balance test call)
   before wiring it into pxy — don't trust this doc's quota claims.
 
