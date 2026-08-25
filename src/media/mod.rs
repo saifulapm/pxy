@@ -199,8 +199,8 @@ pub fn cool_on_failure(app: &App, provider: &str, model: &str, status: u16) {
     let key = media_key(provider);
     let reason = format!("http {status}");
     match status {
-        401 | 402 | 403 => app.state.set_cooldown(&key, None, None, &reason),
-        408 | 409 | 429 | 500..=599 => app.state.set_cooldown(&key, Some(model), None, &reason),
+        401 | 402 | 403 => app.state.set_cooldown(&key, None, None, false, &reason),
+        408 | 409 | 429 | 500..=599 => app.state.set_cooldown(&key, Some(model), None, true, &reason),
         _ => {}
     }
 }

@@ -83,22 +83,43 @@ pub async fn handle_chat(
     let mut skipped: Vec<String> = Vec::new();
     let multi = candidates.len() > 1;
 
-    for cand in &candidates {
-        if let Err(reason) = check_candidate(&app, cand, input_estimate, multi) {
-            skipped.push(format!("{}: {reason}", cand.full_id()));
-            continue;
+    for attempt in 0..=MAX_RETRIES {
+        skipped.clear();
+        let mut saw_rpm_limit = false;
+        for cand in &candidates {
+            if let Err(reason) = check_candidate(&app, cand, input_estimate, multi) {
+                saw_rpm_limit |= reason == "rpm limit";
+                skipped.push(format!("{}: {reason}", cand.full_id()));
+                continue;
+            }
+
+            match try_candidate(&app, cand, client_format, &payload, stream, input_estimate, &ctx, multi)
+                .await
+            {
+                AttemptResult::Done(outcome) => return outcome,
+                AttemptResult::Skip(reason) => {
+                    warn!(candidate = %cand.full_id(), %reason, "failover");
+                    skipped.push(format!("{}: {reason}", cand.full_id()));
+                }
+                AttemptResult::Fatal(outcome) => return outcome,
+            }
         }
 
-        match try_candidate(&app, cand, client_format, &payload, stream, input_estimate, &ctx, multi)
-            .await
-        {
-            AttemptResult::Done(outcome) => return outcome,
-            AttemptResult::Skip(reason) => {
-                warn!(candidate = %cand.full_id(), %reason, "failover");
-                skipped.push(format!("{}: {reason}", cand.full_id()));
-            }
-            AttemptResult::Fatal(outcome) => return outcome,
+        // The whole chain came up empty. Switching costs nothing so it never
+        // waits (litellm rule); only back off now that we're out of options,
+        // and only when something can actually recover within the wait.
+        if attempt == MAX_RETRIES {
+            break;
         }
+        let Some(wait) = retry_wait(soonest_recovery(&app, &candidates), saw_rpm_limit) else {
+            break;
+        };
+        info!(
+            attempt = attempt + 1,
+            wait_ms = wait.as_millis() as u64,
+            "no candidate available; retrying after backoff"
+        );
+        tokio::time::sleep(wait).await;
     }
 
     error_outcome(
@@ -110,6 +131,38 @@ pub async fn handle_chat(
             skipped.join("; ")
         ),
     )
+}
+
+/// Extra full-chain walks after the first one fails (3 walks total).
+const MAX_RETRIES: u32 = 2;
+/// Longest we'll hold a request waiting for a cooldown to expire. Past this,
+/// fail fast — agents have their own retry logic and a better error message.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
+
+/// Soonest a cooled-down candidate becomes eligible again, as a wait from now.
+/// None when no candidate can recover by waiting: hard limits don't expire in
+/// seconds, and non-retryable cooldowns (auth/credits) don't expire at all in
+/// any sense worth re-firing a dead key over.
+fn soonest_recovery(app: &App, candidates: &[Candidate]) -> Option<Duration> {
+    candidates
+        .iter()
+        .filter_map(|c| app.state.recovery_wait(&c.provider, &c.model.id))
+        .min()
+}
+
+/// How long to sleep before re-walking the chain, or None to give up now.
+fn retry_wait(soonest: Option<Duration>, saw_rpm_limit: bool) -> Option<Duration> {
+    // An rpm window slides continuously; a couple of seconds frees capacity.
+    let rpm_hint = saw_rpm_limit.then_some(Duration::from_secs(2));
+    let wait = match (soonest, rpm_hint) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    if wait > MAX_RETRY_WAIT {
+        return None;
+    }
+    // Epsilon so the cooldown has actually expired when the re-walk checks.
+    Some(wait + Duration::from_millis(250))
 }
 
 /// Filter stage: cooldown, rpm, daily/monthly limits, context window.
@@ -310,7 +363,7 @@ async fn try_candidate(
         Ok(r) => r,
         Err(e) => {
             // Network failures are our-side/transport, not model-specific.
-            app.state.set_cooldown(&cand.provider, None, None, "network error");
+            app.state.set_cooldown(&cand.provider, None, None, true, "network error");
             return AttemptResult::Skip(format!("network: {e}"));
         }
     };
@@ -328,17 +381,51 @@ async fn try_candidate(
     // After the clear: a success response can still carry "you just used the
     // last of your quota" headers, and that cooldown must survive it.
     check_quota_exhaustion(&app.state, &cand.provider, resp.headers());
-    info!(candidate = %cand.full_id(), stream, "routed");
+    if !stream {
+        info!(candidate = %cand.full_id(), stream, "routed");
+    }
 
     if stream {
-        AttemptResult::Done(stream_outcome(
-            app.clone(),
-            cand,
-            client_format,
-            upstream_format,
-            resp,
-            input_estimate,
-        ))
+        // A 200 status is not a commitment yet: hold the response until the
+        // upstream produces a real first event, so a stream that dies before
+        // saying anything fails over instead of reaching the client truncated.
+        match stream_outcome(app.clone(), cand, client_format, upstream_format, resp, input_estimate)
+            .await
+        {
+            Ok(outcome) => AttemptResult::Done(outcome),
+            Err(StreamFailure::ErrorEvent(data)) => {
+                // The stream's first event was the real error: classify it
+                // exactly like an HTTP error status would have been, so a
+                // fatal 4xx still passes through unmodified instead of
+                // becoming a retry storm plus a synthetic 429.
+                match error_event_status(&data) {
+                    Some(status) => {
+                        classify_error(app, cand, client_format, status, None, data, multi)
+                    }
+                    None => {
+                        app.state.set_cooldown(
+                            &cand.provider,
+                            Some(&cand.model.id),
+                            None,
+                            true,
+                            "stream error event",
+                        );
+                        AttemptResult::Skip(format!("stream error event: {}", truncate(&data, 200)))
+                    }
+                }
+            }
+            Err(StreamFailure::Dead(reason)) => {
+                // Same scope as a 5xx: the model misbehaved, not the account.
+                app.state.set_cooldown(
+                    &cand.provider,
+                    Some(&cand.model.id),
+                    None,
+                    true,
+                    "stream died before first event",
+                );
+                AttemptResult::Skip(reason)
+            }
+        }
     } else if upstream_format == WireFormat::Kiro {
         // Kiro has no non-streaming mode; collect the eventstream instead.
         let bytes = match resp.bytes().await {
@@ -448,10 +535,14 @@ fn classify_error(
         // not sideline the provider's other models.
         let account_wide = matches!(status, 401 | 402 | 403);
         let model_scope = (!account_wide).then_some(cand.model.id.as_str());
+        // Auth/credit failures and delisted models don't heal in seconds, so
+        // the retry loop must not wait on them (or re-fire a dead key).
+        let retryable = !account_wide && status != 404;
         app.state.set_cooldown(
             &cand.provider,
             model_scope,
             retry_after,
+            retryable,
             &format!("{status} {reason}"),
         );
         return AttemptResult::Skip(format!("{status}: {}", truncate(&err_body, 200)));
@@ -491,6 +582,7 @@ fn check_quota_exhaustion(state: &State, provider: &str, headers: &reqwest::head
                 provider,
                 None,
                 Some(Duration::from_secs(wait_secs)),
+                false,
                 &format!("{h} at {pct}%"),
             );
             return;
@@ -515,7 +607,7 @@ fn check_quota_exhaustion(state: &State, provider: &str, headers: &reqwest::head
                 wait_secs = wait.as_secs(),
                 "upstream reports rate limit exhausted; cooling down"
             );
-            state.set_cooldown(provider, None, Some(wait), &format!("{rem_h} exhausted"));
+            state.set_cooldown(provider, None, Some(wait), false, &format!("{rem_h} exhausted"));
             return;
         }
     }
@@ -813,14 +905,75 @@ impl StreamCtx {
     }
 }
 
-fn stream_outcome(
+/// Why a stream failed before being committed to the client.
+enum StreamFailure {
+    /// Died without saying anything useful (EOF, transport error, bare
+    /// [DONE]): retryable, walk on.
+    Dead(String),
+    /// The 200 carried an error event as its payload. Carried verbatim so
+    /// the caller can classify by the embedded status — a 400-class error
+    /// must still pass through unmodified, not turn into a synthetic 429.
+    ErrorEvent(String),
+}
+
+/// An SSE data payload that means the 200 status lied. Checked on the FIRST
+/// event only: aggregators sometimes return 200 and then deliver the real
+/// error (or a bare [DONE]) as the only thing in the stream.
+fn stream_error_event(data: &str) -> Option<StreamFailure> {
+    let trimmed = data.trim();
+    if trimmed == "[DONE]" {
+        return Some(StreamFailure::Dead("stream closed with no content".into()));
+    }
+    let v: Value = serde_json::from_str(trimmed).ok()?;
+    let is_err = !v["error"].is_null() || v["type"].as_str() == Some("error");
+    is_err.then(|| StreamFailure::ErrorEvent(trimmed.to_string()))
+}
+
+/// Best-effort HTTP status embedded in a stream error event. Numeric
+/// `code`/`status` fields win (aggregators mirror the upstream status there);
+/// Anthropic error types map to their documented codes.
+fn error_event_status(data: &str) -> Option<u16> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    let err = if v["error"].is_object() { &v["error"] } else { &v };
+    for field in ["code", "status"] {
+        let n = err[field]
+            .as_u64()
+            .or_else(|| err[field].as_str().and_then(|s| s.parse().ok()));
+        if let Some(n) = n.filter(|n| (400..600).contains(n)) {
+            return Some(n as u16);
+        }
+    }
+    match err["type"].as_str() {
+        Some("invalid_request_error") => Some(400),
+        Some("authentication_error") => Some(401),
+        Some("permission_error") => Some(403),
+        Some("not_found_error") => Some(404),
+        Some("request_too_large") => Some(413),
+        Some("rate_limit_error") => Some(429),
+        Some("api_error") => Some(500),
+        Some("overloaded_error") => Some(529),
+        _ => None,
+    }
+}
+
+/// Longest we'll hold a fresh stream waiting for its first event. On expiry
+/// we COMMIT and stream as-is (the pre-hold behavior): an upstream that is
+/// quietly queueing (openrouter emits only `: PROCESSING` keepalive comments
+/// while a free model queues) is alive, and failover before the deadline
+/// happens only on affirmative evidence of death.
+const FIRST_EVENT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Returns Err when the stream died before producing a first event — the
+/// caller treats that as a failed attempt and walks on. Nothing has been
+/// sent to the client at that point, so failover is invisible.
+async fn stream_outcome(
     app: SharedApp,
     cand: &Candidate,
     client_format: ClientFormat,
     upstream_format: WireFormat,
     resp: reqwest::Response,
     input_estimate: u64,
-) -> Outcome {
+) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
         (ClientFormat::Anthropic, WireFormat::Anthropic) => StreamKind::AnthropicPass,
@@ -845,7 +998,7 @@ fn stream_outcome(
         .map(|p| p.parse_think_tags)
         .unwrap_or(false)
         && upstream_format == WireFormat::Openai;
-    let ctx = StreamCtx {
+    let mut ctx = StreamCtx {
         parser: SseParser::new(),
         kiro: (upstream_format == WireFormat::Kiro).then(|| {
             (
@@ -863,7 +1016,49 @@ fn stream_outcome(
         done: false,
     };
 
-    let stream = futures_util::stream::unfold(ctx, |mut ctx| async move {
+    // Pre-commit read: hold processed client bytes until the upstream yields
+    // its first complete event. `sniff` re-parses the raw bytes because
+    // process() consumes them through translators that don't surface events.
+    // Kiro speaks binary frames, not SSE: its proof of life is the first
+    // nonempty processed output instead.
+    let mut sniff = SseParser::new();
+    let mut held: Vec<Bytes> = Vec::new();
+    let deadline = tokio::time::Instant::now() + FIRST_EVENT_DEADLINE;
+    loop {
+        let next = match tokio::time::timeout_at(deadline, ctx.upstream.next()).await {
+            Ok(n) => n,
+            // Deadline: no proof of death, so commit and stream as-is.
+            Err(_) => break,
+        };
+        match next {
+            Some(Ok(bytes)) => {
+                let events = if ctx.kiro.is_none() { sniff.feed(&bytes) } else { Vec::new() };
+                let out = ctx.process(&bytes);
+                if !out.is_empty() {
+                    held.push(out);
+                }
+                if ctx.kiro.is_some() {
+                    if !held.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+                let Some(first) = events.first() else { continue };
+                if let Some(failure) = stream_error_event(&first.data) {
+                    return Err(failure);
+                }
+                break;
+            }
+            Some(Err(e)) => {
+                return Err(StreamFailure::Dead(format!("stream failed before first event: {e}")))
+            }
+            None => return Err(StreamFailure::Dead("stream ended before first event".into())),
+        }
+    }
+    info!(candidate = %cand.full_id(), stream = true, "routed");
+
+    let head = futures_util::stream::iter(held.into_iter().map(Ok::<Bytes, std::io::Error>));
+    let rest = futures_util::stream::unfold(ctx, |mut ctx| async move {
         if ctx.done {
             return None;
         }
@@ -886,10 +1081,10 @@ fn stream_outcome(
         }
     });
 
-    Outcome::Stream {
+    Ok(Outcome::Stream {
         provider: cand.full_id(),
-        body: axum::body::Body::from_stream(stream),
-    }
+        body: axum::body::Body::from_stream(head.chain(rest)),
+    })
 }
 
 /// Non-streaming: move `<think>` spans in every choice's message.content
@@ -1044,6 +1239,271 @@ mod tests {
         let s2 = state("quota_pct_ok");
         check_quota_exhaustion(&s2, "oa", &headers(&[("x-quota-5h", "97%")]));
         assert!(s2.cooldown("oa", "any").is_none());
+    }
+
+    #[test]
+    fn retry_wait_only_when_recovery_is_near() {
+        // Nothing cooling down, no rpm pressure: waiting can't help.
+        assert_eq!(retry_wait(None, false), None);
+        // Cooldown expiring soon: wait it out (plus the epsilon).
+        assert_eq!(retry_wait(Some(Duration::from_secs(2)), false), Some(Duration::from_millis(2250)));
+        // Recovery too far away: fail fast instead of holding the request.
+        assert_eq!(retry_wait(Some(Duration::from_secs(11)), false), None);
+        // rpm windows slide continuously — worth a short wait on their own.
+        assert_eq!(retry_wait(None, true), Some(Duration::from_millis(2250)));
+        // The sooner of the two hints wins.
+        assert_eq!(retry_wait(Some(Duration::from_secs(1)), true), Some(Duration::from_millis(1250)));
+    }
+
+    #[test]
+    fn stream_error_events_detected() {
+        assert!(
+            matches!(stream_error_event("[DONE]"), Some(StreamFailure::Dead(_))),
+            "bare DONE = empty completion"
+        );
+        assert!(matches!(
+            stream_error_event(r#"{"error":{"message":"boom"}}"#),
+            Some(StreamFailure::ErrorEvent(_))
+        ));
+        assert!(matches!(
+            stream_error_event(r#"{"type":"error","error":{"type":"overloaded_error"}}"#),
+            Some(StreamFailure::ErrorEvent(_))
+        ));
+        // Normal first chunks of both dialects pass.
+        assert!(stream_error_event(
+            r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant"}}],"error":null}"#
+        )
+        .is_none());
+        assert!(stream_error_event(r#"{"type":"message_start","message":{"usage":{}}}"#).is_none());
+        // Unparseable data is not our call to fail.
+        assert!(stream_error_event("not json").is_none());
+    }
+
+    #[test]
+    fn error_event_status_dialects() {
+        // Numeric and stringly code/status fields.
+        assert_eq!(error_event_status(r#"{"error":{"code":400,"message":"ctx"}}"#), Some(400));
+        assert_eq!(error_event_status(r#"{"error":{"status":429}}"#), Some(429));
+        assert_eq!(error_event_status(r#"{"error":{"code":"503"}}"#), Some(503));
+        // Non-HTTP numeric codes (openai uses vendor codes) are ignored.
+        assert_eq!(error_event_status(r#"{"error":{"code":20015}}"#), None);
+        // Anthropic error-type mapping, nested and bare.
+        assert_eq!(
+            error_event_status(r#"{"type":"error","error":{"type":"invalid_request_error"}}"#),
+            Some(400)
+        );
+        assert_eq!(
+            error_event_status(r#"{"type":"error","error":{"type":"overloaded_error"}}"#),
+            Some(529)
+        );
+        // No usable status at all.
+        assert_eq!(error_event_status(r#"{"error":{"message":"boom"}}"#), None);
+    }
+
+    // ---- integration: failover ladder against a local mock upstream ----
+
+    async fn mock_server(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn test_app(cfg_toml: &str, name: &str) -> SharedApp {
+        let cfg: Config = toml::from_str(cfg_toml).unwrap();
+        let catalog = Catalog::from_config(&cfg);
+        let dir = std::env::temp_dir().join(format!("pxy-router-it-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(App {
+            catalog,
+            secrets: Secrets::new(),
+            state: State::open(&dir.join("s.sqlite")).unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        })
+    }
+
+    #[tokio::test]
+    async fn dead_stream_fails_over_before_first_event() {
+        use axum::routing::post;
+        // Provider a 200s and immediately ends the body; b streams properly.
+        let router = axum::Router::new()
+            .route("/a", post(|| async { "" }))
+            .route("/b", post(|| async {
+                "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"
+            }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m"]
+                [providers.b]
+                base_url = "{base}/b"
+                models = ["m"]
+                [auto]
+                models = ["a/m", "b/m"]
+                "#
+            ),
+            "dead_stream",
+        );
+
+        let payload = json!({"model": "auto", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Stream { provider, body } => {
+                assert_eq!(provider, "b/m");
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("hello"), "held first chunk must reach the client: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        // The dead model cooled down model-scoped, not provider-wide.
+        assert!(app.state.cooldown("a", "m").is_some());
+        assert!(app.state.cooldown("a", "other").is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_after_backoff_recovers_single_candidate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use axum::response::IntoResponse;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let router = axum::Router::new().route(
+            "/flaky",
+            axum::routing::post(move || {
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "1")],
+                            r#"{"error":{"message":"slow down"}}"#,
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(json!({
+                            "id": "x",
+                            "choices": [{"index": 0,
+                                "message": {"role": "assistant", "content": "recovered"},
+                                "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.c]
+                base_url = "{base}/flaky"
+                models = ["m"]
+                "#
+            ),
+            "retry_after",
+        );
+
+        let started = std::time::Instant::now();
+        let payload = json!({"model": "c/m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 200, "expected recovery, got {body}");
+                assert_eq!(body["choices"][0]["message"]["content"], "recovered");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "exactly one retry");
+        assert!(started.elapsed() >= Duration::from_secs(1), "must honor retry-after");
+    }
+
+    #[tokio::test]
+    async fn auth_failure_never_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use axum::response::IntoResponse;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let router = axum::Router::new().route(
+            "/auth",
+            axum::routing::post(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        r#"{"error":{"message":"invalid api key"}}"#,
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.d]
+                base_url = "{base}/auth"
+                models = ["m"]
+                "#
+            ),
+            "auth_no_retry",
+        );
+
+        let started = std::time::Instant::now();
+        let payload = json!({"model": "d/m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, .. } => assert_eq!(status, 429, "synthetic exhaustion"),
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a dead key must not be re-fired");
+        assert!(started.elapsed() < Duration::from_millis(500), "must fail fast, not back off");
+    }
+
+    #[tokio::test]
+    async fn fatal_stream_error_event_passes_through() {
+        use axum::routing::post;
+        // 200, then the real error as the only stream event: a 400-class
+        // failure must reach the client unmodified, not become a retry storm.
+        let router = axum::Router::new().route("/err", post(|| async {
+            "data: {\"error\":{\"code\":400,\"message\":\"context length exceeded\"}}\n\n"
+        }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.e]
+                base_url = "{base}/err"
+                models = ["m"]
+                "#
+            ),
+            "fatal_stream_error",
+        );
+
+        let payload = json!({"model": "e/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 400);
+                assert_eq!(
+                    body["error"]["message"], "context length exceeded",
+                    "original error body must pass through: {body}"
+                );
+            }
+            Outcome::Stream { .. } => panic!("expected the raw error, got a stream"),
+        }
     }
 
     #[test]

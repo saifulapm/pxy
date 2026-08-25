@@ -76,7 +76,7 @@ pub async fn search(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
                     .into_response();
             }
             Err(e) => {
-                app.state.set_cooldown(&key, None, None, &format!("{e:#}"));
+                app.state.set_cooldown(&key, None, None, true, &format!("{e:#}"));
                 errors.push(format!("{}: {e:#}", p.name));
             }
         }
@@ -227,7 +227,7 @@ async fn fetch_inner(app: SharedApp, params: FetchParams) -> Response {
                     .into_response();
             }
             Err(e) => {
-                app.state.set_cooldown(&key, None, None, &format!("{e:#}"));
+                app.state.set_cooldown(&key, None, None, true, &format!("{e:#}"));
                 errors.push(format!("{}: {e:#}", p.name));
             }
         }

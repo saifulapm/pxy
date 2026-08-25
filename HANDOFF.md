@@ -76,14 +76,32 @@ cap because Workers AI overage bills real money.
 
 Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - **Cooldown scopes**: 401/402/403 → provider-wide; 429/408/409/5xx → `provider/model` only.
-  One flaky model must never sideline an account's other models.
+  One flaky model must never sideline an account's other models. Cooldowns also carry a
+  `retryable` flag: transient (429/5xx/network/stream-death) yes, auth/credits/404 no —
+  the in-request retry loop keys off it (a revoked key must never be re-fired).
+- **In-request retries (added 2026-08-25)**: when a whole chain walk comes up empty,
+  `handle_chat` re-walks up to 2 more times, sleeping until the soonest RETRYABLE cooldown
+  expires (max of both scopes per candidate; +2s hint when rpm-limited). It gives up
+  immediately when nothing can recover by waiting (hard daily caps, dead keys) or the wait
+  exceeds 10s — agents have their own retry logic, fail fast for them. Switching candidates
+  still never sleeps (litellm rule).
+- **Pre-first-event stream commit (added 2026-08-25)**: a 200 on a streaming request is not
+  a commitment. The response is held until the first complete SSE event (kiro: first decoded
+  frame output); EOF/transport error/bare `[DONE]` before that → model-scoped cooldown +
+  failover, invisible to the client (held bytes are prepended on commit). An error-shaped
+  first event is classified by its embedded status via the normal ladder, so a 400-class
+  error still passes through raw. Deadline 10s: past it pxy commits and streams as-is
+  (openrouter queues free models behind `: PROCESSING` keepalives — alive ≠ dead; failover
+  before the deadline needs affirmative evidence of death).
 - **404s fail over on multi-candidate walks only** (added 2026-08-25 after zenmux delisted
   glm-5.3-free and its 404 killed the whole `auto` chain): in `auto`, an upstream 404 skips
   the candidate with a model-scoped cooldown + failover log; an explicit single-model
   request still passes the raw 404 through (Claude Code needs the unmodified body).
 - **Token accounting** comes only from real `usage` fields; never guess.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 47 unit tests: `cargo test` (incl. real-capture kiro eventstream fixtures).
+- 90 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and router
+  integration tests against a local mock upstream: dead-stream failover, retry-after
+  recovery, auth fail-fast, fatal stream-error passthrough).
 
 ## Provider catalog (30 active)
 

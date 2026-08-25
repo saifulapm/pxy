@@ -21,6 +21,11 @@ pub struct State {
 pub struct Cooldown {
     pub until: Instant,
     pub level: u32,
+    /// Whether waiting out this cooldown can plausibly fix the failure.
+    /// Transient errors (429/5xx/network) are; auth/credit failures are not —
+    /// a revoked key does not heal in seconds, and re-firing against it can
+    /// burn quota or trip provider-side abuse limits.
+    pub retryable: bool,
     pub reason: String,
 }
 
@@ -207,6 +212,7 @@ impl State {
         provider: &str,
         model: Option<&str>,
         retry_after: Option<Duration>,
+        retryable: bool,
         reason: &str,
     ) {
         let key = Self::cooldown_key(provider, model);
@@ -223,8 +229,31 @@ impl State {
         };
         map.insert(
             key,
-            Cooldown { until: Instant::now() + dur, level, reason: reason.to_string() },
+            Cooldown { until: Instant::now() + dur, level, retryable, reason: reason.to_string() },
         );
+    }
+
+    /// How long until this (provider, model) pair could become eligible again,
+    /// considering BOTH scopes: eligibility needs both cooldowns expired, so
+    /// the wait is the max of the two. None when nothing is cooling down — or
+    /// when a non-retryable cooldown blocks the pair, because no amount of
+    /// waiting fixes a revoked key or exhausted credits.
+    pub fn recovery_wait(&self, provider: &str, model: &str) -> Option<Duration> {
+        let map = self.cooldowns.lock().unwrap();
+        let now = Instant::now();
+        let mut wait: Option<Duration> = None;
+        for key in [provider.to_string(), Self::cooldown_key(provider, Some(model))] {
+            let Some(cd) = map.get(&key) else { continue };
+            if cd.until <= now {
+                continue;
+            }
+            if !cd.retryable {
+                return None;
+            }
+            let rem = cd.until.saturating_duration_since(now);
+            wait = Some(wait.map_or(rem, |w| w.max(rem)));
+        }
+        wait
     }
 
     /// Success clears both scopes for this model.
@@ -302,7 +331,7 @@ mod tests {
     #[test]
     fn model_cooldown_does_not_block_sibling_models() {
         let s = state("sibling");
-        s.set_cooldown("go", Some("flaky"), None, "503");
+        s.set_cooldown("go", Some("flaky"), None, true, "503");
         assert!(s.cooldown("go", "flaky").is_some());
         assert!(s.cooldown("go", "healthy").is_none(), "sibling model must stay usable");
     }
@@ -310,7 +339,7 @@ mod tests {
     #[test]
     fn provider_cooldown_blocks_all_models() {
         let s = state("provider_wide");
-        s.set_cooldown("acct", None, None, "401 auth error");
+        s.set_cooldown("acct", None, None, false, "401 auth error");
         assert!(s.cooldown("acct", "any-model").is_some());
         assert!(s.cooldown("acct", "other-model").is_some());
     }
@@ -318,9 +347,30 @@ mod tests {
     #[test]
     fn success_clears_both_scopes() {
         let s = state("clear_both");
-        s.set_cooldown("p", None, None, "401");
-        s.set_cooldown("p", Some("m"), None, "429");
+        s.set_cooldown("p", None, None, false, "401");
+        s.set_cooldown("p", Some("m"), None, true, "429");
         s.clear_cooldown("p", "m");
         assert!(s.cooldown("p", "m").is_none());
+    }
+
+    #[test]
+    fn recovery_wait_scopes_and_retryability() {
+        // Both scopes active and retryable: eligibility needs both expired,
+        // so the wait is the longer of the two.
+        let s = state("recovery_max");
+        s.set_cooldown("p", None, Some(Duration::from_secs(2)), true, "network error");
+        s.set_cooldown("p", Some("m"), Some(Duration::from_secs(5)), true, "429");
+        let w = s.recovery_wait("p", "m").expect("both retryable -> wait");
+        assert!(w > Duration::from_secs(4), "must wait out the LONGER scope, got {w:?}");
+
+        // A non-retryable cooldown anywhere in the pair kills the wait.
+        let s2 = state("recovery_auth");
+        s2.set_cooldown("p", None, None, false, "401 auth error");
+        s2.set_cooldown("p", Some("m"), None, true, "429");
+        assert_eq!(s2.recovery_wait("p", "m"), None, "revoked key does not heal by waiting");
+
+        // Nothing cooling down: nothing to wait for.
+        let s3 = state("recovery_none");
+        assert_eq!(s3.recovery_wait("p", "m"), None);
     }
 }
