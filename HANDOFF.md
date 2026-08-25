@@ -150,7 +150,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     **HTTP 500 on every call** (both accounts, all three routes, streaming and not, while
     `hy3` on the same key worked). That's an opencode-side outage, not our config. Retry
     later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
-    (Retested 2026-08-25 evening: still 500 on both zen and Go routes.)
+    (Retested 2026-08-25 evening and 2026-08-26: still 500.)
 
 **Free, renewable:**
 - `kiro` — AWS CodeWhisperer via Kiro (added 2026-08-25, **Phase 3 #3**, the big one:
@@ -176,7 +176,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   `providers/kimi.rs`). Rotating refresh tokens (serialized, persisted to kv BEFORE use —
   losing one kills the session), 900s access tokens, X-Msh-* device identity, Anthropic
   native. ⚠️ credits exhausted at activation (masked as bare 500s); NOT in `auto` — retest
-  after quota reset (retested 2026-08-25 evening: still 500s, no reset yet).
+  after quota reset (retested 2026-08-25 evening and 2026-08-26: still 500s, no reset yet).
   Re-login = curl device flow (see config.example comment).
 - `kilocode` — Kilo Code gateway (added 2026-08-25, **Phase 3 #1 — zero Rust needed**):
   the archived device-flow token is a long-lived JWT (exp ~2031, no refresh), so it's a
@@ -203,6 +203,9 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   credits purchased). ⏰ **GMI Cloud promo until Sep 6 2026**: `minimax/minimax-m3:free`
   (1M ctx, in `auto`) + `minimax-m2.7:free` (196k) — unlimited, tool calling verified,
   $0 cost confirmed per-request. **Remove both + the `auto` entry after Sep 6** (they go paid).
+  Safety net: `[providers.openrouter.promo] expires = "2026-09-06"` IS declared in the live
+  config (verified 2026-08-26), so `pxy refresh --write` drops them from generated chains
+  automatically — only the hand-written entries need the manual edit.
   Free models never touch the credit balance.
 - `aihubmix` — aggregator, free catalog opened ~2026-08 (added 2026-08-25): 50 `-free`
   models on one key, no card. In `auto`: `gemini-3.7-flash-free` (only Gemini in the stack,
@@ -269,9 +272,9 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - `agentrouter` / `agentrouter-openai` — $125 balance, Opus 5 / Opus 4.8 / gpt-5.6-sol /
   deepseek-v4f. WAF requires the `claude-cli/...` User-Agent (already set).
   deepseek-v4f now also sits on the Anthropic route with `force_stream = true`
-  (their route rejects it without stream) — but as of 2026-08-25 evening agentrouter
-  has NO deepseek-v4f channel on EITHER route (503 "无可用渠道"); upstream churn,
-  retry later.
+  (their route rejects it without stream) — but as of 2026-08-25 evening (and still
+  2026-08-26) agentrouter has NO deepseek-v4f channel on EITHER route (503 "无可用渠道");
+  upstream churn, retry later.
 - `tabitoken` — $120 referral credits (added 2026-08-25), Opus 5 / 4.8 (+ `-thinking`
   variants). Same claude-cli UA WAF; speaks Anthropic natively; fronts Kiro/Amazon-Q
   accounts (usage leaks `kiro_credits`). ⚠️ injects ~7k hidden prompt tokens per call,
