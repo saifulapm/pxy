@@ -325,6 +325,9 @@ async fn try_candidate(
     // Success: count the request now; tokens follow when usage is known.
     record_request(app, &cand.provider);
     app.state.clear_cooldown(&cand.provider, &cand.model.id);
+    // After the clear: a success response can still carry "you just used the
+    // last of your quota" headers, and that cooldown must survive it.
+    check_quota_exhaustion(&app.state, &cand.provider, resp.headers());
     info!(candidate = %cand.full_id(), stream, "routed");
 
     if stream {
@@ -460,6 +463,118 @@ fn classify_error(
         body,
         provider: Some(cand.full_id()),
     })
+}
+
+/// Upstream self-reported exhaustion on a SUCCESS response: openadapter's
+/// `X-Quota-5h/Week/Month` used-percentages and the standard
+/// `x-ratelimit-remaining-*` family (groq, mistral, openrouter). Cooling the
+/// provider down now saves the next request from burning into a 429 — which
+/// matters where failed requests count against quota too (openadapter).
+/// Error responses already cool down via classify_error.
+fn check_quota_exhaustion(state: &State, provider: &str, headers: &reqwest::header::HeaderMap) {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+
+    // Percentage-used style. No reset time is reported, so the wait scales
+    // with the window: recheck well before the window could have rolled.
+    for (h, wait_secs) in [
+        ("x-quota-5h", 30 * 60),
+        ("x-quota-week", 2 * 3600),
+        ("x-quota-month", 6 * 3600),
+    ] {
+        let Some(pct) = get(h).and_then(|s| s.trim_end_matches('%').trim().parse::<f64>().ok())
+        else {
+            continue;
+        };
+        if pct >= 100.0 {
+            warn!(provider, header = h, pct, "upstream reports quota exhausted; cooling down");
+            state.set_cooldown(
+                provider,
+                None,
+                Some(Duration::from_secs(wait_secs)),
+                &format!("{h} at {pct}%"),
+            );
+            return;
+        }
+    }
+
+    // Remaining-count style, with an optional reset hint.
+    for (rem_h, reset_h) in [
+        ("x-ratelimit-remaining-requests", "x-ratelimit-reset-requests"),
+        ("x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"),
+        ("x-ratelimit-remaining", "x-ratelimit-reset"),
+    ] {
+        let Some(rem) = get(rem_h).and_then(|s| s.parse::<f64>().ok()) else { continue };
+        if rem <= 0.0 {
+            let wait = get(reset_h)
+                .and_then(parse_reset)
+                .unwrap_or(Duration::from_secs(60))
+                .min(Duration::from_secs(3600));
+            warn!(
+                provider,
+                header = rem_h,
+                wait_secs = wait.as_secs(),
+                "upstream reports rate limit exhausted; cooling down"
+            );
+            state.set_cooldown(provider, None, Some(wait), &format!("{rem_h} exhausted"));
+            return;
+        }
+    }
+}
+
+/// A reset header value in any of the three dialects upstreams use:
+/// plain seconds ("30"), Go-style durations ("2m59.56s" — groq), and epoch
+/// timestamps in seconds or milliseconds (openrouter).
+fn parse_reset(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<f64>() {
+        if n <= 0.0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        let secs = if n >= 1e11 {
+            n / 1000.0 - now // epoch millis
+        } else if n >= 1e9 {
+            n - now // epoch seconds (2001+)
+        } else {
+            n // relative seconds
+        };
+        return (secs > 0.0).then(|| Duration::from_secs_f64(secs));
+    }
+    parse_go_duration(s)
+}
+
+/// "1h30m", "2m59.56s", "250ms" → Duration. None on anything unrecognized.
+fn parse_go_duration(s: &str) -> Option<Duration> {
+    let mut total = 0f64;
+    let mut num = String::new();
+    let mut matched = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        let factor = match c {
+            'h' => 3600.0,
+            'm' if chars.peek() == Some(&'s') => {
+                chars.next();
+                0.001
+            }
+            'm' => 60.0,
+            's' => 1.0,
+            _ => return None,
+        };
+        total += num.parse::<f64>().ok()? * factor;
+        num.clear();
+        matched = true;
+    }
+    if !num.is_empty() || !matched || total < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(total))
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -868,5 +983,85 @@ fn error_outcome(format: ClientFormat, status: u16, etype: &str, message: &str) 
         status,
         body: error_body(format, etype, message),
         provider: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn state(name: &str) -> State {
+        let dir =
+            std::env::temp_dir().join(format!("pxy-router-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        State::open(&dir.join("s.sqlite")).unwrap()
+    }
+
+    #[test]
+    fn go_durations_parse() {
+        assert_eq!(parse_go_duration("2m59.56s"), Some(Duration::from_secs_f64(179.56)));
+        assert_eq!(parse_go_duration("1h30m"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_go_duration("250ms"), Some(Duration::from_millis(250)));
+        assert_eq!(parse_go_duration("7s"), Some(Duration::from_secs(7)));
+        assert_eq!(parse_go_duration("garbage"), None);
+        assert_eq!(parse_go_duration("15"), None); // trailing number, no unit
+    }
+
+    #[test]
+    fn reset_dialects_parse() {
+        assert_eq!(parse_reset("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_reset("6m0s"), Some(Duration::from_secs(360)));
+        // epoch seconds ~1 minute ahead of now
+        let ahead = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let d = parse_reset(&ahead.to_string()).unwrap();
+        assert!(d.as_secs() > 50 && d.as_secs() <= 60, "epoch parse gave {d:?}");
+        // an epoch in the past means "already reset" — no cooldown
+        assert_eq!(parse_reset("1000000000"), None);
+    }
+
+    #[test]
+    fn quota_percent_exhaustion_cools_provider() {
+        let s = state("quota_pct");
+        check_quota_exhaustion(&s, "oa", &headers(&[("x-quota-5h", "100%")]));
+        assert!(s.cooldown("oa", "any").is_some());
+        // below 100% must not cool anything
+        let s2 = state("quota_pct_ok");
+        check_quota_exhaustion(&s2, "oa", &headers(&[("x-quota-5h", "97%")]));
+        assert!(s2.cooldown("oa", "any").is_none());
+    }
+
+    #[test]
+    fn remaining_zero_cools_with_reset_hint() {
+        let s = state("remaining_zero");
+        check_quota_exhaustion(
+            &s,
+            "groq",
+            &headers(&[
+                ("x-ratelimit-remaining-tokens", "0"),
+                ("x-ratelimit-reset-tokens", "7.66s"),
+            ]),
+        );
+        let cd = s.cooldown("groq", "any").expect("cooldown set");
+        assert!(cd.reason.contains("x-ratelimit-remaining-tokens"));
+        // nonzero remaining leaves the provider alone
+        let s2 = state("remaining_ok");
+        check_quota_exhaustion(&s2, "groq", &headers(&[("x-ratelimit-remaining", "42")]));
+        assert!(s2.cooldown("groq", "any").is_none());
     }
 }
