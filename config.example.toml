@@ -591,6 +591,36 @@ total_tokens = 100000000
 #    = 250 req/day, 70K TPM, built-in web search/code-exec; REJECTS external
 #    tools ("tool calling is not supported"), so ask it questions directly.
 #    ~3000 tok/s. No card on the account = hard 429 stop, no billing risk.
+# Kiro (AWS CodeWhisperer) — Phase 3 #3, ACTIVE 2026-08-25. kind = kiro
+# (providers/kiro.rs + translate/kiro.rs): social-login refresh at
+# prod.us-east-1.auth.desktop.kiro.dev, conversationState request bodies, and
+# vnd.amazon.eventstream binary responses decoded back to SSE. base_url and
+# profileArn are derived at runtime from the ARN in the credential, so the
+# region follows the profile automatically.
+# FREE plan: 50 credits/month, resets the 1st (verified via GetUsageLimits).
+# Overage is DISABLED + OVERAGE_INCAPABLE on this account => cannot bill.
+# Model ids MUST match the account's live catalog or Kiro 400s; these came
+# from ListAvailableModels. Credit cost scales with rateMultiplier, so the
+# cheap models go a very long way (qwen3-coder-next 0.05x, minimax-m2.1 0.15x,
+# deepseek-3.2/minimax-m2.5 0.25x, haiku 0.4x, glm-5 0.5x, sonnet-4.5 1.3x).
+# NOT in [auto]: 50 credits/month is scarcer than every free pool above.
+[providers.kiro]
+kind = "kiro"
+format = "kiro"
+credentials = { pass = "AI/kiro/main" }
+models = [
+  { id = "claude-sonnet-4.5", context_length = 200000, max_output_tokens = 64000 },
+  { id = "claude-haiku-4.5", context_length = 200000, max_output_tokens = 64000 },
+  { id = "qwen3-coder-next", context_length = 256000 },
+  { id = "glm-5", context_length = 200000 },
+  { id = "deepseek-3.2", context_length = 164000 },
+  { id = "minimax-m2.5", context_length = 196000 },
+]
+[providers.kiro.limits]
+monthly_requests = 400        # ~50 credits at the cheap models' multipliers
+reset = "00:00"
+reset_tz = "UTC"
+
 # Kimi coding tier — Phase 3 #2, ACTIVE 2026-08-25 (kind = kimi-coding in
 # providers/kimi.rs). ROTATING refresh tokens: the live credential lives in
 # state.sqlite kv (kimi_token:kimi-coding) after the first refresh; pass holds

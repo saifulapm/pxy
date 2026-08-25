@@ -17,7 +17,7 @@ use crate::secrets::Secrets;
 use crate::state::State;
 use crate::translate::sse::SseParser;
 use crate::translate::think::ThinkFilter;
-use crate::translate::{anthropic_to_openai, estimate_tokens, openai_to_anthropic, TokenUsage};
+use crate::translate::{anthropic_to_openai, estimate_tokens, kiro, openai_to_anthropic, TokenUsage};
 use crate::usage::current_windows;
 
 pub struct App {
@@ -221,8 +221,24 @@ async fn try_candidate(
         (ClientFormat::Openai, WireFormat::Anthropic) => {
             openai_to_anthropic::request(payload, cand.model.max_output_tokens)
         }
+        // Kiro takes neither dialect: normalize to Anthropic first (reusing
+        // the existing translator), then build conversationState from it.
+        (ClientFormat::Anthropic, WireFormat::Kiro) => kiro::request(
+            payload,
+            &cand.model.id,
+            "",
+            &now_iso8601(),
+        ),
+        (ClientFormat::Openai, WireFormat::Kiro) => kiro::request(
+            &openai_to_anthropic::request(payload, cand.model.max_output_tokens),
+            &cand.model.id,
+            "",
+            &now_iso8601(),
+        ),
     };
-    body["model"] = json!(cand.model.id);
+    if upstream_format != WireFormat::Kiro {
+        body["model"] = json!(cand.model.id);
+    }
     if stream && upstream_format == WireFormat::Openai && body.get("stream_options").is_none() {
         // Ask OpenAI upstreams to report usage in the final chunk.
         body["stream_options"] = json!({"include_usage": true});
@@ -240,6 +256,16 @@ async fn try_candidate(
         Ok(p) => p,
         Err(e) => return AttemptResult::Skip(format!("prepare failed: {e:#}")),
     };
+
+    // Providers may need fields inside the body (kiro's profileArn), which is
+    // only known after credentials resolve.
+    if let Some(patch) = &prepared.body_patch {
+        if let (Some(dst), Some(src)) = (body.as_object_mut(), patch.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+    }
 
     let initiator_override = ctx
         .initiator
@@ -300,6 +326,28 @@ async fn try_candidate(
             resp,
             input_estimate,
         ))
+    } else if upstream_format == WireFormat::Kiro {
+        // Kiro has no non-streaming mode; collect the eventstream instead.
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => return AttemptResult::Skip(format!("kiro body read: {e}")),
+        };
+        let (openai_body, usage) =
+            kiro::collect_response(&bytes, &cand.model.id, &cand.full_id(), cand.model.context_length);
+        record_tokens(app, &cand.provider, usage);
+        let client_body = match client_format {
+            ClientFormat::Openai => openai_body,
+            // kiro::collect_response returns an OpenAI-shaped body, so this is
+            // the same conversion an OpenAI upstream would need.
+            ClientFormat::Anthropic => {
+                anthropic_to_openai::response(&openai_body, &cand.full_id())
+            }
+        };
+        AttemptResult::Done(Outcome::Json {
+            status: 200,
+            body: client_body,
+            provider: Some(cand.full_id()),
+        })
     } else {
         let mut upstream_body: Value = match resp.json().await {
             Ok(v) => v,
@@ -311,6 +359,7 @@ async fn try_candidate(
         let usage = match upstream_format {
             WireFormat::Openai => TokenUsage::from_openai(&upstream_body["usage"]),
             WireFormat::Anthropic => TokenUsage::from_anthropic(&upstream_body["usage"]),
+            WireFormat::Kiro => unreachable!("kiro handled above"),
         };
         record_tokens(app, &cand.provider, usage);
         let client_body = match (client_format, upstream_format) {
@@ -322,6 +371,7 @@ async fn try_candidate(
             (ClientFormat::Openai, WireFormat::Anthropic) => {
                 openai_to_anthropic::response(&upstream_body, &cand.full_id())
             }
+            (_, WireFormat::Kiro) => unreachable!("kiro handled above"),
         };
         AttemptResult::Done(Outcome::Json {
             status: 200,
@@ -412,6 +462,13 @@ enum StreamKind {
 
 struct StreamCtx {
     parser: SseParser,
+    /// Set for kiro upstreams: binary eventstream is decoded and rewritten as
+    /// OpenAI SSE before the normal pipeline sees it.
+    kiro: Option<(
+        crate::translate::eventstream::EventStreamDecoder,
+        kiro::StreamState,
+        u64,
+    )>,
     kind: StreamKind,
     /// Present when the provider has parse_think_tags (openai upstreams only)
     think: Option<ThinkFilter>,
@@ -461,6 +518,21 @@ fn think_flush_chunk(filter: &mut ThinkFilter) -> Option<String> {
 impl StreamCtx {
     /// Process one upstream chunk; returns bytes for the client.
     fn process(&mut self, bytes: &Bytes) -> Bytes {
+        // Kiro speaks binary frames; rewrite them as OpenAI SSE so everything
+        // below is the ordinary text path.
+        let rewritten;
+        let bytes = match &mut self.kiro {
+            Some((decoder, state, _)) => {
+                decoder.push(bytes);
+                let frames = decoder.drain();
+                if frames.is_empty() {
+                    return Bytes::new();
+                }
+                rewritten = Bytes::from(state.frames_to_sse(frames));
+                &rewritten
+            }
+            None => bytes,
+        };
         let Self { parser, kind, think, usage, .. } = self;
         let events = parser.feed(bytes);
         match kind {
@@ -551,6 +623,34 @@ impl StreamCtx {
 
     /// End-of-stream flush (upstream may end without a terminal marker).
     fn finish(&mut self) -> Bytes {
+        // Kiro never sends a terminating SSE event: synthesize the closing
+        // chunks (incl. buffered tool arguments) and run them through the
+        // client-format pipeline before the normal finish.
+        if let Some((_, state, ctx_len)) = &mut self.kiro {
+            let tail = Bytes::from(state.finish());
+            self.usage = state.usage(*ctx_len);
+            let translated = {
+                let Self { parser, kind, think, usage, .. } = self;
+                let events = parser.feed(&tail);
+                match kind {
+                    StreamKind::OpenaiPass => tail.clone(),
+                    StreamKind::ToAnthropic(st) => {
+                        let mut out = String::new();
+                        for ev in &events {
+                            out.push_str(&st.on_data(&ev.data));
+                        }
+                        // Close the anthropic message properly (message_delta
+                        // + message_stop); the kiro tail alone isn't enough.
+                        out.push_str(&st.finish());
+                        let _ = (think, usage);
+                        Bytes::from(out)
+                    }
+                    _ => tail.clone(),
+                }
+            };
+            record_tokens(&self.app, &self.provider, self.usage);
+            return translated;
+        }
         let out = match &mut self.kind {
             StreamKind::ToAnthropic(state) => {
                 let mut s = String::new();
@@ -587,6 +687,12 @@ fn stream_outcome(
         (ClientFormat::Openai, WireFormat::Anthropic) => {
             StreamKind::ToOpenai(openai_to_anthropic::StreamState::new(&cand.full_id()))
         }
+        // Kiro frames are converted to OpenAI SSE before this point, so the
+        // client side behaves exactly as it would for an OpenAI upstream.
+        (ClientFormat::Openai, WireFormat::Kiro) => StreamKind::OpenaiPass,
+        (ClientFormat::Anthropic, WireFormat::Kiro) => StreamKind::ToAnthropic(
+            anthropic_to_openai::StreamState::new(&cand.full_id(), input_estimate),
+        ),
     };
 
     let parse_think = app
@@ -598,6 +704,13 @@ fn stream_outcome(
         && upstream_format == WireFormat::Openai;
     let ctx = StreamCtx {
         parser: SseParser::new(),
+        kiro: (upstream_format == WireFormat::Kiro).then(|| {
+            (
+                crate::translate::eventstream::EventStreamDecoder::new(),
+                kiro::StreamState::new(&cand.model.id),
+                cand.model.context_length,
+            )
+        }),
         kind,
         think: parse_think.then(ThinkFilter::new),
         usage: TokenUsage::default(),
@@ -650,6 +763,11 @@ fn extract_think_from_response(body: &mut Value) {
             message["content"] = json!(content);
         }
     }
+}
+
+/// RFC3339 timestamp for kiro's `[Context: Current time is ...]` prefix.
+fn now_iso8601() -> String {
+    Timestamp::now().to_string()
 }
 
 fn truncate(s: &str, n: usize) -> String {

@@ -67,7 +67,7 @@ pub async fn prepare(
         .base_url
         .clone()
         .unwrap_or_else(|| DEFAULT_CHAT_URL.to_string());
-    Ok(PreparedRequest { url, headers })
+    Ok(PreparedRequest { url, headers, body_patch: None })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,7 +241,7 @@ fn form_encode(pairs: &[(&str, &str)]) -> String {
 
 /// Epoch seconds -> "YYYY-MM-DDTHH:MM:SS.000Z" (the shape OmniRoute archived,
 /// kept so the pass entry stays readable by both tools).
-fn iso8601(epoch: u64) -> String {
+pub fn iso8601(epoch: u64) -> String {
     let days = epoch / 86_400;
     let secs = epoch % 86_400;
     // civil-from-days (Howard Hinnant's algorithm), epoch 1970-01-01.

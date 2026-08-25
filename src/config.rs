@@ -93,6 +93,8 @@ pub enum WireFormat {
     Openai,
     /// Anthropic messages
     Anthropic,
+    /// AWS CodeWhisperer conversationState + vnd.amazon.eventstream
+    Kiro,
 }
 
 impl Default for WireFormat {
@@ -111,6 +113,8 @@ pub enum ProviderKind {
     GithubCopilot,
     /// Kimi coding tier: rotating refresh tokens + device-id header profile
     KimiCoding,
+    /// Kiro / Amazon Q: CodeWhisperer conversationState + eventstream
+    Kiro,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,5 +1,6 @@
 pub mod copilot;
 pub mod kimi;
+pub mod kiro;
 
 use anyhow::{Context, Result};
 
@@ -11,6 +12,9 @@ use crate::state::State;
 pub struct PreparedRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// Fields the provider must inject into the request body (kiro's
+    /// profileArn), merged after format translation.
+    pub body_patch: Option<serde_json::Value>,
 }
 
 /// Resolve URL + auth headers for a provider. Cheap for API-key providers;
@@ -45,9 +49,10 @@ pub async fn prepare(
                     }
                 }
             }
-            Ok(PreparedRequest { url, headers })
+            Ok(PreparedRequest { url, headers, body_patch: None })
         }
         ProviderKind::GithubCopilot => copilot::prepare(name, cfg, secrets, state, http, headers).await,
         ProviderKind::KimiCoding => kimi::prepare(name, cfg, secrets, state, http, headers).await,
+        ProviderKind::Kiro => kiro::prepare(name, cfg, secrets, state, http, headers).await,
     }
 }

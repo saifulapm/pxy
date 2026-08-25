@@ -5,7 +5,7 @@ Read this first in a new session, then `docs/07-pxy-design.md` for design ration
 ## What pxy is
 
 A tiny Rust proxy replacing OmniRoute (a heavy Node router that used ~800 MB RAM).
-**pxy uses ~12.5 MB.** One local endpoint over 29 providers, an `auto` model that routes by
+**pxy uses ~12.5 MB.** One local endpoint over 30 providers, an `auto` model that routes by
 priority + quota with automatic failover, and `pxy launch claude|opencode|pi` to wire coding
 agents to it. Repo: `github.com/saifulapm/pxy` (private).
 
@@ -21,7 +21,7 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 ```sh
 pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi # spawn an agent wired to pxy (--dry-run shows the plan)
-pxy models                    # 140 models exposed
+pxy models                    # 146 models exposed
 pxy status                    # per-provider usage vs limits
 journalctl --user -u pxy -f   # watch routing decisions ("routed" / "failover" lines)
 systemctl --user restart pxy  # REQUIRED after any config or pass change (secrets are cached)
@@ -44,6 +44,10 @@ Both chat protocols translate in both directions, streaming included.
 | `router.rs` | the engine: filter → attempt → classify → failover; streaming tap |
 | `server.rs` | axum routes |
 | `providers/copilot.rs` | GitHub Copilot two-stage token mint + header profile |
+| `providers/kimi.rs` | Kimi coding: rotating-refresh OAuth, X-Msh-* identity |
+| `providers/kiro.rs` | Kiro/CodeWhisperer: social refresh, ARN->region, profileArn body patch |
+| `translate/eventstream.rs` | AWS vnd.amazon.eventstream binary frame decoder |
+| `translate/kiro.rs` | anthropic<->conversationState; frames -> OpenAI SSE; sha1/uuidv5 |
 | `translate/` | anthropic↔openai (request + streaming response), SSE parser, `<think>` filter |
 | `launch.rs` | per-agent env/config injection |
 
@@ -56,9 +60,9 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   request still passes the raw 404 through (Claude Code needs the unmodified body).
 - **Token accounting** comes only from real `usage` fields; never guess.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 24 unit tests: `cargo test`.
+- 47 unit tests: `cargo test` (incl. real-capture kiro eventstream fixtures).
 
-## Provider catalog (29 active)
+## Provider catalog (30 active)
 
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
@@ -73,6 +77,16 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     later; keep it out of `auto` until it answers. Note it trains on prompts/completions.
 
 **Free, renewable:**
+- `kiro` — AWS CodeWhisperer via Kiro (added 2026-08-25, **Phase 3 #3**, the big one:
+  `providers/kiro.rs` + `translate/kiro.rs` + `translate/eventstream.rs`). **KIRO FREE
+  plan: 50 credits/month, resets the 1st**; overage DISABLED + OVERAGE_INCAPABLE, so it
+  cannot bill. Credits scale by `rateMultiplier`, so cheap models go far: qwen3-coder-next
+  0.05x, minimax-m2.1 0.15x, deepseek-3.2/minimax-m2.5 0.25x, haiku-4.5 0.4x, glm-5 0.5x,
+  sonnet-4.5 1.3x (a small haiku call metered 0.005 credits). Tool calling verified
+  streaming + non-streaming. Model ids MUST match ListAvailableModels or Kiro 400s —
+  the account has NO claude-sonnet-5/gpt-5.6 despite OmniRoute's registry listing them.
+  Not in `auto` (scarcest free pool). Usage is ESTIMATED (kiro sends no token counts,
+  only contextUsagePercentage + a credit figure).
 - `kimi-coding` — Moonshot Kimi coding tier (added 2026-08-25, **Phase 3 #2**, real Rust:
   `providers/kimi.rs`). Rotating refresh tokens (serialized, persisted to kv BEFORE use —
   losing one kills the session), 900s access tokens, X-Msh-* device identity, Anthropic
@@ -91,6 +105,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   correction). gemini-3-flash-preview (in `auto`), 3.1-flash-lite, 2.5-flash; all 1M ctx,
   tools verified. No billing on the project → hard 429 stop. Unpublished free limits,
   rpm=8 client-side. ⚠️ trains on prompts. Key: `AI/google/main` (project 416746239844).
+- `zai` — Z.AI direct (added 2026-08-25): permanently free `glm-4.7-flash` (59.2 SWE-bench,
   agentic-tuned, tool calling verified), `glm-4.5-flash`, `glm-4.6v-flash` (vision).
   ONE concurrent request on the free tier (rpm = 5 in config). Key: `AI/zai/main`.
 - `zenmux` — free models; `z-ai/glm-5.3-free` was DELISTED ~2026-08-25 (their free list
@@ -190,6 +205,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
    tencent kinfra, alibaba qwen, fireworks qwen3-8b, voyage pending).
 3. **Phase 3 — OAuth providers**, one at a time, easiest first (research in docs/06):
    ~~kilocode~~ (DONE 2026-08-25 — token turned out long-lived, plain config, no Rust) →
+   ~~kiro/amazon-q~~ (kiro DONE 2026-08-25 — see catalog; amazon-q is the same
+   protocol under a different connection, add when wanted) →
    ~~kimi-coding~~ (DONE 2026-08-25 — `kind = "kimi-coding"` in providers/kimi.rs: serialized
    rotation-safe refresh persisted to kv, X-Msh-* identity profile, Anthropic endpoint.
    The archived refresh token was dead; re-logged-in via curl device flow. ⚠️ Account

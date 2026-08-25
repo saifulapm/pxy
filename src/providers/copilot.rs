@@ -56,7 +56,7 @@ pub async fn prepare(
         .base_url
         .clone()
         .unwrap_or_else(|| DEFAULT_CHAT_URL.to_string());
-    Ok(PreparedRequest { url, headers })
+    Ok(PreparedRequest { url, headers, body_patch: None })
 }
 
 async fn current_token(
