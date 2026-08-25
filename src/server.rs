@@ -30,6 +30,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/models", get(models))
@@ -99,6 +100,66 @@ async fn chat_completions(
     let ctx = client_ctx(&headers);
     let outcome = router::handle_chat(app, ClientFormat::Openai, payload, ctx).await;
     outcome_response(outcome, ClientFormat::Openai)
+}
+
+/// OpenAI Responses API (codex-cli): translate to a chat-completions call and
+/// rewrite the outcome — streamed chat chunks become Responses SSE events;
+/// JSON becomes a `response` object. Errors pass through in their chat shape
+/// (codex reads `{"error": {...}}` fine).
+async fn responses(
+    State(app): State<SharedApp>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    use futures_util::StreamExt;
+
+    let ctx = client_ctx(&headers);
+    let model = payload["model"].as_str().unwrap_or("auto").to_string();
+    let chat_payload = crate::translate::responses::request(&payload);
+    let outcome = router::handle_chat(app, ClientFormat::Openai, chat_payload, ctx).await;
+    match outcome {
+        Outcome::Json { status, body, provider } => {
+            let body = if status == 200 {
+                crate::translate::responses::response(&body, provider.as_deref().unwrap_or(&model))
+            } else {
+                body
+            };
+            outcome_response(Outcome::Json { status, body, provider }, ClientFormat::Openai)
+        }
+        Outcome::Stream { provider, body } => {
+            let state = crate::translate::responses::StreamState::new(Timestamp::now().as_second());
+            let parser = crate::translate::sse::SseParser::new();
+            let upstream = body.into_data_stream();
+            let stream = futures_util::stream::unfold(
+                (upstream, parser, state, false),
+                |(mut upstream, mut parser, mut state, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    match upstream.next().await {
+                        Some(Ok(bytes)) => {
+                            let mut out = String::new();
+                            for ev in parser.feed(&bytes) {
+                                out.push_str(&state.on_data(&ev.data));
+                            }
+                            Some((
+                                Ok::<_, std::io::Error>(bytes::Bytes::from(out)),
+                                (upstream, parser, state, false),
+                            ))
+                        }
+                        _ => {
+                            let tail = bytes::Bytes::from(state.finish());
+                            Some((Ok(tail), (upstream, parser, state, true)))
+                        }
+                    }
+                },
+            );
+            outcome_response(
+                Outcome::Stream { provider, body: axum::body::Body::from_stream(stream) },
+                ClientFormat::Openai,
+            )
+        }
+    }
 }
 
 async fn messages(

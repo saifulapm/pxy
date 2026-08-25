@@ -29,7 +29,8 @@ pub fn launch(
         "claude" => launch_claude(cfg, &catalog, &model, dry_run, extra_args),
         "opencode" => launch_opencode(cfg, &catalog, &model, dry_run, extra_args),
         "pi" => launch_pi(cfg, &catalog, &model, dry_run, extra_args),
-        other => anyhow::bail!("unknown agent '{other}' (supported: claude, opencode, pi)"),
+        "codex" => launch_codex(cfg, &model, dry_run, extra_args),
+        other => anyhow::bail!("unknown agent '{other}' (supported: claude, opencode, pi, codex)"),
     }
 }
 
@@ -156,6 +157,34 @@ fn launch_opencode(
     cmd.env("PXY_API_KEY", &cfg.server.api_key);
 
     exec_or_print(cmd, dry_run, "opencode wired via OPENCODE_CONFIG_CONTENT")
+}
+
+// ---------------------------------------------------------------------------
+// codex
+// ---------------------------------------------------------------------------
+
+/// codex is wired entirely through `-c` config overrides (parsed as TOML), so
+/// ~/.codex/config.toml is never touched. wire_api = "responses" points it at
+/// pxy's /v1/responses endpoint.
+fn launch_codex(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String]) -> Result<()> {
+    let mut cmd = Command::new("codex");
+    for (k, v) in [
+        ("model_provider", "\"pxy\"".to_string()),
+        ("model_providers.pxy.name", "\"pxy\"".to_string()),
+        (
+            "model_providers.pxy.base_url",
+            format!("\"{}/v1\"", cfg.base_url()),
+        ),
+        ("model_providers.pxy.env_key", "\"PXY_API_KEY\"".to_string()),
+        ("model_providers.pxy.wire_api", "\"responses\"".to_string()),
+    ] {
+        cmd.arg("-c").arg(format!("{k}={v}"));
+    }
+    cmd.arg("-m").arg(model);
+    cmd.args(extra_args);
+    cmd.env("PXY_API_KEY", &cfg.server.api_key);
+
+    exec_or_print(cmd, dry_run, "codex wired via -c model_providers.pxy overrides")
 }
 
 // ---------------------------------------------------------------------------
