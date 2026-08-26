@@ -51,6 +51,9 @@ models = [
   "kilocode/tencent/hy3:free",                     # hy3 pool #3 (295B reasoning)
   "kilocode/minimax/minimax-m3:free",              # M3 pool #4, 1M ctx
   "agnes/agnes-2.5-flash",                         # free flash tier
+  "tokenharbor/mimo-v2.5:free",                    # tokenharbor free tier, tools verified 2026-08-26
+  "tokenharbor/deepseek-v4-flash:free",            # deepseek-v4-flash pool #4
+  "tokenharbor/qwen3.8-27b:free",                  # qwen3.8-27b pool #2
 
   # --- deeper Go fallbacks (still very high allowance) ---
   "opencode-go-github/deepseek-v4-flash",          # 7,600 / 5h
@@ -404,6 +407,26 @@ models = [
   # grok-4.5 120, qwen3.8-max 160, glm-5.3 220.
   "kimi-k3",
   "glm-5.3",
+]
+
+# TokenHarbor — OpenAI-compatible aggregator (tokenharbor.ai), ACTIVE 2026-08-26.
+# Free tier = ONLY the three `:free` ids below ("rolling 7-day allowance, then
+# rate-limit error; never billed" per the /models blurbs). Paid models are
+# deliberately NOT listed — the key is live-billing-capable. Tool calling
+# verified on all three 2026-08-26; mimo reports prompt-cache hits.
+# No balance_url: TokenHarbor has no billing endpoint (every /v1/usage-shaped
+# path 404s). The allowance is reported in undocumented response headers on
+# successful free calls (`x-th-plan`, `x-th-free-used-pct`, `x-th-free-resets`),
+# which the router snapshots into state.sqlite for `pxy status --remote` and the
+# panel; 100% there cools the provider until the window rolls.
+[providers.tokenharbor]
+base_url = "https://tokenharbor.ai/v1/chat/completions"
+api_key = { pass = "AI/tokenharbor/main" }
+discover = false   # /models also lists ~17 paid models; keep discovery off
+models = [
+  { id = "mimo-v2.5:free", context_length = 196608, tool_call = true },
+  { id = "deepseek-v4-flash:free", context_length = 131072, tool_call = true },
+  { id = "qwen3.8-27b:free", context_length = 131072, tool_call = true },
 ]
 
 # ZenMux — has 8 zero-priced models (catalog probe 2026-08-24), notably

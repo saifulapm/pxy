@@ -678,6 +678,7 @@ async fn try_candidate(
     // After the clear: a success response can still carry "you just used the
     // last of your quota" headers, and that cooldown must survive it.
     check_quota_exhaustion(&app.state, &cand.provider, resp.headers());
+    record_free_allowance(&app.state, &cand.provider, resp.headers());
     if !stream {
         info!(candidate = %cand.full_id(), stream, "routed");
     }
@@ -987,6 +988,64 @@ fn classify_error(
         body,
         provider: Some(cand.full_id()),
     })
+}
+
+/// kv key holding a provider's last-seen rolling-allowance snapshot.
+pub fn free_quota_key(provider: &str) -> String {
+    format!("free_quota:{provider}")
+}
+
+/// TokenHarbor meters its free tier as a personal rolling 7x24h allowance,
+/// priced by the list-price value of the work — pxy cannot compute that, and
+/// there is no balance endpoint to poll (every /v1/usage-shaped path 404s).
+/// The only readout is a set of undocumented headers on a successful free
+/// completion, so remember the last one: `pxy status --remote` reports the
+/// snapshot with its age instead of a number nobody can fetch.
+///
+/// At 100% used the provider is cooled until the window actually rolls: the
+/// exhaustion 429 names no window the body classifier recognizes, so the
+/// generic ladder would keep re-probing a pool that cannot answer for days.
+fn record_free_allowance(state: &State, provider: &str, headers: &reqwest::header::HeaderMap) {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    let Some(pct) =
+        get("x-th-free-used-pct").and_then(|s| s.trim_end_matches('%').trim().parse::<f64>().ok())
+    else {
+        return;
+    };
+    let resets = get("x-th-free-resets").unwrap_or_default();
+    let plan = get("x-th-plan").unwrap_or_default();
+    let _ = state.kv_set(
+        &free_quota_key(provider),
+        &json!({
+            "usedPct": pct,
+            "resetsAt": resets,
+            "plan": plan,
+            "observedAt": Timestamp::now().to_string(),
+        })
+        .to_string(),
+    );
+    if pct >= 100.0 {
+        let wait = resets
+            .parse::<Timestamp>()
+            .ok()
+            .map(|t| t.as_second() - Timestamp::now().as_second())
+            .filter(|secs| *secs > 0)
+            .map(|secs| Duration::from_secs(secs as u64))
+            .unwrap_or(Duration::from_secs(3600));
+        warn!(
+            provider,
+            pct,
+            wait_secs = wait.as_secs(),
+            "upstream reports the free allowance spent; cooling down until it rolls"
+        );
+        state.set_cooldown(
+            provider,
+            None,
+            Some(wait),
+            false,
+            &format!("free allowance spent (resets {resets})"),
+        );
+    }
 }
 
 /// Upstream self-reported exhaustion on a SUCCESS response: openadapter's
@@ -1819,6 +1878,45 @@ mod tests {
         let s2 = state("quota_pct_ok");
         check_quota_exhaustion(&s2, "oa", &headers(&[("x-quota-5h", "97%")]));
         assert!(s2.cooldown("oa", "any").is_none());
+    }
+
+    #[test]
+    fn free_allowance_headers_are_remembered_and_cool_at_100() {
+        let s = state("free_quota");
+        record_free_allowance(
+            &s,
+            "th",
+            &headers(&[
+                ("x-th-plan", "free"),
+                ("x-th-free-used-pct", "12"),
+                ("x-th-free-resets", "2099-09-02T10:08:33.419881+00:00"),
+            ]),
+        );
+        let snap: Value =
+            serde_json::from_str(&s.kv_get(&free_quota_key("th")).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["usedPct"], 12.0);
+        assert_eq!(snap["plan"], "free");
+        assert_eq!(snap["resetsAt"], "2099-09-02T10:08:33.419881+00:00");
+        assert!(snap["observedAt"].as_str().is_some());
+        // A partly-spent allowance is a readout, not a verdict.
+        assert!(s.cooldown("th", "any").is_none());
+
+        // Spent: cool until the window actually rolls, and don't retry into it.
+        record_free_allowance(
+            &s,
+            "th",
+            &headers(&[
+                ("x-th-free-used-pct", "100"),
+                ("x-th-free-resets", "2099-09-02T10:08:33.419881+00:00"),
+            ]),
+        );
+        let cd = s.cooldown("th", "any").expect("provider cooled");
+        assert!(!cd.retryable);
+        // Far-future reset -> a wait measured in days, not the 1h fallback.
+        assert!(cd.until.saturating_duration_since(std::time::Instant::now()).as_secs() > 86_400);
+        // A provider that reports nothing must not get a phantom row.
+        record_free_allowance(&s, "other", &headers(&[("x-quota-5h", "3%")]));
+        assert!(s.kv_get(&free_quota_key("other")).unwrap().is_none());
     }
 
     #[test]

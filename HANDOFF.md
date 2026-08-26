@@ -240,7 +240,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   merges later and can't be stripped. Curated `drop_params` survives the generated
   overlay like tool_call/force_stream.
 
-## Provider catalog (30 active)
+## Provider catalog (31 active)
 
 **Paid subscriptions (already yours):**
 - `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
@@ -326,6 +326,21 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   1M ctx), `minimax-m3-free`, `ox-alpha` (plain id, free while in stealth). Kim-series free
   pool usually exhausted ("insufficient promotional resources" — retry); `gpt-5.5-free`
   doesn't route. No published rate limits. Key: `AI/aihubmix/main`.
+- `tokenharbor` — TokenHarbor aggregator (added 2026-08-26): free tier is the three `:free`
+  ids only (mimo-v2.5, deepseek-v4-flash, qwen3.8-27b — tools verified). The allowance is a
+  personal **rolling 7×24h window started by your first free call**, metered by the
+  list-price value of the work, so pxy cannot compute it and there is no billing endpoint
+  to poll (every `/v1/usage`-shaped path 404s). The only readout is a set of undocumented
+  headers on a successful free completion — `x-th-plan`, `x-th-free-used-pct`,
+  `x-th-free-resets` — captured by `record_free_allowance` (router.rs) into state.sqlite kv
+  `free_quota:<provider>`. `pxy status --remote` reports that snapshot **with its age**
+  ("seen 3h ago"): it is only as current as pxy's last call there, so traffic sent outside
+  pxy (their connect CLI, the web chat) reads low — the Copilot-counter trap again.
+  `--json` carries it in `remote.<name>.data` (`usedPct`/`resetsAt`), which the desktop
+  panel meters via `remote_meter` in `bin/pxy-panel-scan`. At 100% the provider is cooled
+  non-retryably until `x-th-free-resets`, because the exhaustion 429 names no window the
+  body classifier recognizes and the generic ladder would re-probe a dead pool for days.
+  ⚠️ The key is live-billing-capable — paid ids are deliberately absent from the config.
 - `opencode-zen` — 9 free models, served anonymously (`Bearer public` works!). Shares the Go key.
 - `ollama` — free plan: gpt-oss:120b/20b, nemotron-3-*, gemma4:31b only. Flagships need Pro.
 - `mistral` (free Experiment tier, phone-verified, opts into data training) + `codestral`

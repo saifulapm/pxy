@@ -611,8 +611,24 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
             .filter(|(n, p)| p.enabled && wanted(n))
             .filter_map(|(n, p)| p.balance_url.as_ref().map(|u| (n, p, u)))
             .collect();
-        if targets.is_empty() && !json_out {
-            let _ = writeln!(out, "\nno balance_url configured on any provider");
+        // Providers that report their allowance in RESPONSE HEADERS instead of
+        // at a URL (tokenharbor's rolling 7x24h free tier): the router's last
+        // snapshot is the only readout there is. It costs no HTTP, so it can
+        // never be fresher than the last call pxy routed — the age is part of
+        // the line, and a snapshot from before an out-of-band session
+        // (tokenharbor's own CLI, their web chat) will read low.
+        let snapshots: Vec<(String, String, Value)> = cfg
+            .providers
+            .iter()
+            .filter(|(n, p)| p.enabled && wanted(n))
+            .filter_map(|(n, _)| {
+                let raw = state.kv_get(&crate::router::free_quota_key(n)).ok().flatten()?;
+                let snap: Value = serde_json::from_str(&raw).ok()?;
+                Some((n.clone(), free_quota_summary(&snap, now), snap))
+            })
+            .collect();
+        if targets.is_empty() && snapshots.is_empty() && !json_out {
+            let _ = writeln!(out, "\nno remote quota source on any provider");
             return Ok(());
         }
         let fetches = targets.iter().map(|(name, p, url)| {
@@ -632,9 +648,18 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
                     json!({"summary": line, "data": body.unwrap_or(Value::Null)}),
                 );
             }
+            for (name, line, snap) in snapshots {
+                // A live endpoint, where one exists, outranks a remembered
+                // header.
+                json_remote.entry(name).or_insert(json!({"summary": line, "data": snap}));
+            }
         } else {
             let _ = writeln!(out, "\nremote balances:");
-            for (name, line, _) in results {
+            let reported: Vec<String> = results.iter().map(|(n, _, _)| n.clone()).collect();
+            for (name, line, _) in &results {
+                let _ = writeln!(out, "  {name:<20} {line}");
+            }
+            for (name, line, _) in snapshots.iter().filter(|(n, _, _)| !reported.contains(n)) {
                 let _ = writeln!(out, "  {name:<20} {line}");
             }
         }
@@ -717,6 +742,34 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         }
     }
     Ok(())
+}
+
+/// A remembered allowance snapshot as one line. The age is not decoration:
+/// this number is only as current as the last request pxy routed there.
+fn free_quota_summary(snap: &Value, now: Timestamp) -> String {
+    let pct = snap["usedPct"].as_f64().unwrap_or(0.0);
+    let plan = snap["plan"].as_str().filter(|s| !s.is_empty()).unwrap_or("free");
+    // Printed as sent: at a few hundred tokens into a 7-day allowance the
+    // interesting digit is often the fractional one.
+    let mut line = format!("{plan} tier {pct}% of the rolling allowance used");
+    let resets = snap["resetsAt"].as_str().unwrap_or("");
+    if !resets.is_empty() {
+        let stamp = &resets[..resets.len().min(16)];
+        line.push_str(&format!(" · resets {}", stamp.replace('T', " ")));
+    }
+    let age = snap["observedAt"]
+        .as_str()
+        .and_then(|s| s.parse::<Timestamp>().ok())
+        .map(|t| (now.as_second() - t.as_second()).max(0))
+        .unwrap_or(0);
+    let age = match age {
+        s if s < 90 => format!("{s}s"),
+        s if s < 5400 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    };
+    line.push_str(&format!(" · seen {age} ago (from response headers)"));
+    line
 }
 
 /// One provider's balance: a human summary line plus, when the endpoint
@@ -842,6 +895,22 @@ mod tests {
         assert_eq!(client_agent(&h).as_deref(), Some("claude"));
         let h = headers(&[("x-api-key", "pxy-local:opencode")]);
         assert_eq!(client_agent(&h).as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn free_quota_snapshot_line_carries_age_and_reset() {
+        let now: Timestamp = "2026-08-26T12:00:00Z".parse().unwrap();
+        let line = free_quota_summary(
+            &json!({
+                "usedPct": 12.0, "plan": "free",
+                "resetsAt": "2026-09-02T10:08:33.419881+00:00",
+                "observedAt": "2026-08-26T09:30:00Z",
+            }),
+            now,
+        );
+        assert!(line.contains("free tier 12% of the rolling allowance used"), "{line}");
+        assert!(line.contains("resets 2026-09-02 10:08"), "{line}");
+        assert!(line.contains("seen 2h ago"), "{line}");
     }
 
     #[test]
