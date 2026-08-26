@@ -22,7 +22,9 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 pxy serve                     # daemon (systemd runs this)
 pxy launch claude|opencode|pi|codex|fx # spawn an agent wired to pxy (--dry-run shows the plan)
 pxy models                    # 146 models exposed
-pxy status [--remote]         # per-provider usage vs limits; --remote adds live balances
+pxy status [--remote] [--json] [--provider X]... # usage vs limits; --remote live balances; --json for the panel
+pxy route [MODEL|--clear]     # pin the auto route to one model (chain stays as fallback); no arg shows it
+pxy explain <model> [--json]  # why each candidate would (not) be routed; --json for the panel
 pxy doctor                    # config/daemon/credentials/agents health, exit 1 on FAIL
 pxy explain <model>           # why each candidate would (not) be routed right now
 pxy refresh [--write]         # discover catalogs; report drift / regenerate generated.toml
@@ -52,6 +54,47 @@ wraps the OpenAI path (translate/responses.rs), so routing/accounting apply unch
 `<provider>#media` / `search#<name>` / `fetch#<name>` keys (own rows in `pxy status`) so
 they never touch chat budgets; cloudflare's media pool has a hard `daily_requests = 30`
 cap because Workers AI overage bills real money.
+
+**Per-agent model accounting (added 2026-08-26):** the desktop usage panel needs
+"tokens by model" per agent, but auto-routed agents only ever log "auto" —
+pxy is the only party that knows which model answered. So:
+- `pxy launch <agent>` tags requests by suffixing the api key
+  (`pxy-local:claude` etc., `tagged_key` in launch.rs — one mechanism for all
+  five agents; only some can be taught a custom header). server.rs
+  `client_agent()` parses it back (explicit `x-pxy-agent` header wins), and
+  the agent rides `ClientContext` into the router.
+- Every chat record_request/record_tokens also upserts
+  `model_usage(day, agent, provider, model, requests, input_tokens,
+  output_tokens)` in state.sqlite (day = LOCAL date — the panel groups by
+  local days). Enforcement windows are untouched; embeddings/media stay out.
+- `pxy status --json [--provider X ...]` emits `{providers, modelUsage,
+  remote}`; `--provider` limits the table and the remote HTTP but never
+  modelUsage (readers slice by agent). fetch_balance now also returns the raw
+  balance body, so `remote.<name>.data` carries e.g. opencode Go's
+  rolling/weekly/monthly percent+resetsAt for the panel's meters.
+- Consumers: `~/.dotfiles/bin/opencode-usage-scan` (new OpenCode panel tab:
+  local opencode.db + pxy agent=opencode rows + both Go accounts' windows as
+  extraLimits) and `codex-usage-scan` (native turns whose session_meta says
+  `model_provider: "pxy"` count prompts/sessions only; their TOKENS come from
+  pxy agent=codex rows — matching by model=="auto" would double-count
+  concrete `pxy launch codex -m X` sessions). Claude Code needs nothing: it
+  logs the RESOLVED model from pxy's response echo already. agent=pi/fx rows
+  are recorded but have no panel consumer yet. CLI logging goes to stderr so
+  `status --json` stdout stays parseable.
+
+**Auto-route pin (added 2026-08-26):** `pxy route <model>` pins the auto route
+to one model — the pin is walked FIRST on every auto request and the
+configured chain stays behind it as fallback, so pinning never costs the
+failover safety auto exists for. The pin lives in state.sqlite kv
+(`route_pin`, canonical `provider/model`), is read per request
+(router::resolve_candidates — no daemon restart to take effect), and degrades
+to the plain chain when it stops resolving. Explicit model requests ignore it.
+`pxy explain` reflects it (`[pinned]` marker; `--json` for machines);
+`pxy status` reports it plus active cooldowns. The desktop **pxy panel**
+(`~/.dotfiles/shell/Modules/Bar/widgets/Pxy*.qml` + `bin/pxy-panel-scan`)
+drives the same verb: route picker over the live walk order with
+per-candidate verdicts, cooldown list, per-provider limit meters (remote
+balances included), daemon health + restart.
 
 ## Architecture (src/)
 

@@ -6,3 +6,4 @@
 - [Vacuous test assertions](vacuous-test-assertions.md) — "skips X" tests with shared mock routes pass without the feature; demand call counters
 - [Stream chunk rewriters](stream-chunk-rewriters.md) — mut-index panics on empty choices (include_usage chunk); copied hold logic drops char-boundary guard
 - [Catalog bare-id order](catalog-bare-id-order.md) — provider map is alphabetical BTreeMap not config order; trace resolve changes against live config's colliding claude-* ids
+- [status --json consumers](status-json-consumers.md) — dotfiles scanners parse whole stdout; check pxy-dedupe rules (auto-only skip double-counts) and tracing-to-stdout purity

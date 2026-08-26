@@ -21,3 +21,13 @@ or reorders a path reaching the bare-id fallback must be traced against the
 real config (`~/.config/pxy/config.toml` + `generated.toml`), where
 agentrouter/gorouter/tabitoken/kiro/github all list overlapping `claude-*`
 bare ids. Cheap live check: `cargo run -- explain <id>`.
+
+Second trap, confirmed 2026-08-26 (route-pin review): `resolve_concrete` for
+"provider/model" FABRICATES an eligible candidate (default ctx 128k) for ANY
+model id when the provider exists+enabled — it never checks the provider's
+model list. So "resolves to nothing" / "resolves.is_empty()" guards (route
+pin validation, degrade-to-chain claims) only fire on provider-level removal,
+not model removal/typos. Any new feature that stores a resolved id and
+replays it later (pin, aliases) inherits phantom-model candidates whose
+upstream 400 can be Fatal (no failover). Verify with
+`pxy explain <provider>/not-a-real-model --json`.

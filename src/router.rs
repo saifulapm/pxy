@@ -44,6 +44,10 @@ pub struct ClientContext {
     pub initiator: Option<String>,
     /// anthropic-beta headers, forwarded verbatim to anthropic upstreams
     pub anthropic_beta: Option<String>,
+    /// Which coding agent sent this request ("claude", "codex", …), parsed
+    /// from the x-pxy-agent header or the api-key suffix `pxy launch` sets.
+    /// Only feeds the per-model usage stats — never routing.
+    pub agent: Option<String>,
 }
 
 /// Outcome handed to the HTTP layer.
@@ -57,6 +61,45 @@ pub enum Outcome {
         provider: String,
         body: axum::body::Body,
     },
+}
+
+/// kv key holding the auto-route pin, set from `pxy route` / the desktop
+/// panel. Read per request so a pin takes effect without a daemon restart.
+pub const ROUTE_PIN_KEY: &str = "route_pin";
+
+/// Candidates for a request, honoring the auto-route pin: on auto requests a
+/// pinned model is walked FIRST, with the configured chain behind it as
+/// fallback — pinning must never cost the failover safety auto exists for.
+/// Explicit model requests are untouched, and a pin that no longer resolves
+/// (config edit, provider disabled) degrades to the plain chain.
+pub fn resolve_candidates(
+    catalog: &Catalog,
+    cfg: &Config,
+    state: &State,
+    requested: &str,
+) -> Vec<Candidate> {
+    let auto = requested == "auto" || requested == "claude/auto";
+    let mut chain = catalog.resolve(cfg, requested);
+    if !auto {
+        return chain;
+    }
+    let Some(pin) = state.kv_get(ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty()) else {
+        return chain;
+    };
+    let pinned = catalog.resolve(cfg, &pin);
+    // is_listed, not just resolves: resolve() fabricates a candidate for any
+    // id under an enabled provider, and a pin gone stale (config edit,
+    // refresh dropping the model) must degrade to the chain, not put a
+    // phantom at the head of every auto walk.
+    if pinned.is_empty() || !pinned.iter().all(|c| catalog.is_listed(&c.full_id())) {
+        warn!(pin, "route pin is not in the catalog; using the chain");
+        return chain;
+    }
+    let pinned_ids: Vec<String> = pinned.iter().map(|c| c.full_id()).collect();
+    chain.retain(|c| !pinned_ids.contains(&c.full_id()));
+    let mut out = pinned;
+    out.extend(chain);
+    out
 }
 
 pub async fn handle_chat(
@@ -74,7 +117,7 @@ pub async fn handle_chat(
         return usage_outcome(usage_report(&app), client_format, stream);
     }
 
-    let candidates = app.catalog.resolve(&app.cfg, &requested);
+    let candidates = resolve_candidates(&app.catalog, &app.cfg, &app.state, &requested);
     if candidates.is_empty() {
         return error_outcome(
             client_format,
@@ -629,7 +672,8 @@ async fn try_candidate(
     }
 
     // Success: count the request now; tokens follow when usage is known.
-    record_request(app, &cand.provider);
+    let agent = ctx.agent.as_deref().unwrap_or("");
+    record_request(app, agent, &cand.provider, &cand.model.id);
     app.state.clear_cooldown(&cand.provider, &cand.model.id);
     // After the clear: a success response can still carry "you just used the
     // last of your quota" headers, and that cooldown must survive it.
@@ -644,6 +688,7 @@ async fn try_candidate(
         // saying anything fails over instead of reaching the client truncated.
         match stream_outcome(
             app.clone(),
+            agent,
             cand,
             client_format,
             upstream_format,
@@ -695,7 +740,7 @@ async fn try_candidate(
         };
         let (openai_body, usage) =
             kiro::collect_response(&bytes, &cand.model.id, &cand.full_id(), cand.model.context_length);
-        record_tokens(app, &cand.provider, usage);
+        record_tokens(app, agent, &cand.provider, &cand.model.id, usage);
         let client_body = match client_format {
             ClientFormat::Openai => openai_body,
             // kiro::collect_response returns an OpenAI-shaped body, so this is
@@ -743,7 +788,7 @@ async fn try_candidate(
             WireFormat::Anthropic => TokenUsage::from_anthropic(&upstream_body["usage"]),
             WireFormat::Kiro => unreachable!("kiro handled above"),
         };
-        record_tokens(app, &cand.provider, usage);
+        record_tokens(app, agent, &cand.provider, &cand.model.id, usage);
         let client_body = match (client_format, upstream_format) {
             (ClientFormat::Openai, WireFormat::Openai)
             | (ClientFormat::Anthropic, WireFormat::Anthropic) => upstream_body,
@@ -1100,7 +1145,9 @@ struct StreamCtx {
     /// extracts text-embedded tool calls (free models emit them as prose).
     tooltext: Option<ToolTextFilter>,
     usage: TokenUsage,
+    agent: String,
     provider: String,
+    model: String,
     app: SharedApp,
     upstream: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
     done: bool,
@@ -1226,7 +1273,7 @@ impl Drop for StreamCtx {
         {
             self.usage = kiro_usage;
         }
-        record_tokens(&self.app, &self.provider, self.usage);
+        record_tokens(&self.app, &self.agent, &self.provider, &self.model, self.usage);
     }
 }
 
@@ -1386,7 +1433,7 @@ impl StreamCtx {
                     _ => tail.clone(),
                 }
             };
-            record_tokens(&self.app, &self.provider, self.usage);
+            record_tokens(&self.app, &self.agent, &self.provider, &self.model, self.usage);
             return translated;
         }
         let out = match &mut self.kind {
@@ -1412,7 +1459,7 @@ impl StreamCtx {
                 None => Bytes::new(),
             },
         };
-        record_tokens(&self.app, &self.provider, self.usage);
+        record_tokens(&self.app, &self.agent, &self.provider, &self.model, self.usage);
         out
     }
 }
@@ -1480,6 +1527,7 @@ const FIRST_EVENT_DEADLINE: Duration = Duration::from_secs(10);
 /// sent to the client at that point, so failover is invisible.
 async fn stream_outcome(
     app: SharedApp,
+    agent: &str,
     cand: &Candidate,
     client_format: ClientFormat,
     upstream_format: WireFormat,
@@ -1524,7 +1572,9 @@ async fn stream_outcome(
         think: parse_think.then(ThinkFilter::new),
         tooltext: tool_names.map(ToolTextFilter::new),
         usage: TokenUsage::default(),
+        agent: agent.to_string(),
         provider: cand.provider.clone(),
+        model: cand.model.id.clone(),
         app,
         upstream: resp.bytes_stream().boxed(),
         done: false,
@@ -1633,23 +1683,31 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn record_request(app: &App, provider: &str) {
-    record_usage_inner(app, provider, TokenUsage::default(), true);
+fn record_request(app: &App, agent: &str, provider: &str, model: &str) {
+    record_usage_inner(app, agent, provider, model, TokenUsage::default(), true);
 }
 
-fn record_tokens(app: &App, provider: &str, usage: TokenUsage) {
+fn record_tokens(app: &App, agent: &str, provider: &str, model: &str, usage: TokenUsage) {
     if usage.input == 0 && usage.output == 0 {
         return;
     }
-    record_usage_inner(app, provider, usage, false);
+    record_usage_inner(app, agent, provider, model, usage, false);
 }
 
 /// Embeddings count as one request + input tokens against the same windows.
+/// No model stats: the usage panel only reads chat traffic.
 pub fn record_embedding_usage(app: &App, provider: &str, tokens: u64) {
-    record_usage_inner(app, provider, TokenUsage { input: tokens, output: 0 }, true);
+    record_usage_inner(app, "", provider, "", TokenUsage { input: tokens, output: 0 }, true);
 }
 
-fn record_usage_inner(app: &App, provider: &str, usage: TokenUsage, request: bool) {
+fn record_usage_inner(
+    app: &App,
+    agent: &str,
+    provider: &str,
+    model: &str,
+    usage: TokenUsage,
+    request: bool,
+) {
     let default_limits = crate::config::Limits::default();
     let limits = app
         .cfg
@@ -1667,6 +1725,14 @@ fn record_usage_inner(app: &App, provider: &str, usage: TokenUsage, request: boo
         };
         if let Err(e) = res {
             warn!(provider, error = %e, "usage recording failed");
+        }
+    }
+    if !model.is_empty() {
+        let agent = if agent.is_empty() { "other" } else { agent };
+        if let Err(e) =
+            app.state.record_model_usage(agent, provider, model, request, usage.input, usage.output)
+        {
+            warn!(provider, model, error = %e, "model usage recording failed");
         }
     }
 }
@@ -1835,6 +1901,65 @@ mod tests {
             http: reqwest::Client::new(),
             cfg,
         })
+    }
+
+    #[test]
+    fn route_pin_walks_first_with_chain_fallback() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.a]
+            base_url = "http://127.0.0.1:1/a"
+            models = ["m1"]
+            [providers.b]
+            base_url = "http://127.0.0.1:1/b"
+            models = ["m2"]
+            [auto]
+            models = ["a/m1", "b/m2"]
+            "#,
+            "route_pin",
+        );
+
+        // No pin: config order.
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+            .iter()
+            .map(|c| c.full_id())
+            .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"]);
+
+        // Pinned: the pin leads, the rest of the chain follows, no duplicate.
+        app.state.kv_set(ROUTE_PIN_KEY, "b/m2").unwrap();
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+            .iter()
+            .map(|c| c.full_id())
+            .collect();
+        assert_eq!(ids, ["b/m2", "a/m1"], "pin first, chain as fallback");
+
+        // Explicit model requests ignore the pin entirely.
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "a/m1")
+            .iter()
+            .map(|c| c.full_id())
+            .collect();
+        assert_eq!(ids, ["a/m1"]);
+
+        // A pin that stopped resolving degrades to the plain chain.
+        app.state.kv_set(ROUTE_PIN_KEY, "gone/nope").unwrap();
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+            .iter()
+            .map(|c| c.full_id())
+            .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"]);
+
+        // A pin under a REAL provider but to an unlisted model does too:
+        // resolve() fabricates a candidate for it, and without the is_listed
+        // gate that phantom would lead every auto walk (and a 400 "unknown
+        // model" is Fatal — no failover).
+        app.state.kv_set(ROUTE_PIN_KEY, "a/ghost").unwrap();
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+            .iter()
+            .map(|c| c.full_id())
+            .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"], "phantom pin must not enter the walk");
     }
 
     #[tokio::test]

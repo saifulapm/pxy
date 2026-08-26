@@ -84,7 +84,38 @@ fn client_ctx(headers: &HeaderMap) -> ClientContext {
             .get("anthropic-beta")
             .and_then(|v| v.to_str().ok())
             .map(String::from),
+        agent: client_agent(headers),
     }
+}
+
+/// Which coding agent sent this request, for the per-model usage stats.
+/// An explicit x-pxy-agent header wins; otherwise `pxy launch` smuggles the
+/// agent name as a `:agent` suffix on the api key (uniform across agents —
+/// every one of them sends the key somewhere, while only some can be taught
+/// to send a custom header). The key itself is a soft gate and never checked,
+/// so any suffix shape is safe to accept.
+fn client_agent(headers: &HeaderMap) -> Option<String> {
+    let name_ok = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 32
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if let Some(v) = headers.get("x-pxy-agent").and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        if name_ok(v) {
+            return Some(v.to_string());
+        }
+    }
+    for header in ["authorization", "x-api-key"] {
+        let Some(value) = headers.get(header).and_then(|v| v.to_str().ok()) else { continue };
+        let token = value.strip_prefix("Bearer ").unwrap_or(value).trim();
+        if let Some((_, agent)) = token.rsplit_once(':') {
+            if name_ok(agent) {
+                return Some(agent.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn outcome_response(outcome: Outcome, client_format: ClientFormat) -> Response {
@@ -462,15 +493,22 @@ async fn not_found() -> Response {
 
 /// `pxy status`: reads config + sqlite (works while the daemon runs — WAL).
 /// With `remote`, also queries each provider's `balance_url` (concurrent).
-pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
+/// With `json`, emits one machine-readable object instead of the table — the
+/// desktop usage panel reads this. `only` restricts both the table and the
+/// remote fetches to the named providers (remote checks cost real HTTP).
+pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[String]) -> Result<()> {
     use std::io::Write;
     let state = PxyState::open(&crate::config::data_dir().join("state.sqlite"))?;
     let now = Timestamp::now();
+    let wanted = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let _ = writeln!(out, "{:<20} {:>10} {:>14} {:>12} {:>14} {:>16}", "provider", "day reqs", "day tokens", "month reqs", "month tokens", "total tokens");
+    let mut json_providers = serde_json::Map::new();
+    if !json_out {
+        let _ = writeln!(out, "{:<20} {:>10} {:>14} {:>12} {:>14} {:>16}", "provider", "day reqs", "day tokens", "month reqs", "month tokens", "total tokens");
+    }
     for (name, p) in &cfg.providers {
-        if !p.enabled {
+        if !p.enabled || !wanted(name) {
             continue;
         }
         let default_limits = crate::config::Limits::default();
@@ -478,11 +516,25 @@ pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
         let Ok(w) = current_windows(limits, now) else { continue };
         let day = state.usage(name, "day", w.day_start).unwrap_or_default();
         let month = state.usage(name, "month", w.month_start).unwrap_or_default();
+        let total = state.usage_total(name).unwrap_or_default();
+        if json_out {
+            json_providers.insert(
+                name.clone(),
+                json!({
+                    "day": {"requests": day.requests, "tokens": day.tokens,
+                            "requestLimit": limits.daily_requests, "tokenLimit": limits.daily_tokens},
+                    "month": {"requests": month.requests, "tokens": month.tokens,
+                              "requestLimit": limits.monthly_requests, "tokenLimit": limits.monthly_tokens},
+                    "total": {"requests": total.requests, "tokens": total.tokens,
+                              "tokenLimit": limits.total_tokens},
+                }),
+            );
+            continue;
+        }
         let fmt_limit = |used: u64, limit: Option<u64>| match limit {
             Some(l) => format!("{used}/{l}"),
             None => format!("{used}"),
         };
-        let total = state.usage_total(name).unwrap_or_default();
         if writeln!(
             out,
             "{:<20} {:>10} {:>14} {:>12} {:>14} {:>16}",
@@ -500,21 +552,25 @@ pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
     }
 
     // Media + service pools use synthetic usage keys (provider#media,
-    // search#name, fetch#name) with default UTC windows.
+    // search#name, fetch#name) with default UTC windows. Table only — the
+    // JSON consumer (the usage panel) reads chat providers and model rows.
     let mut service_rows: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
     for (name, p) in &cfg.providers {
-        if let Some(m) = p.media.as_ref().filter(|_| p.enabled) {
+        if let Some(m) = p.media.as_ref().filter(|_| p.enabled && wanted(name)) {
             service_rows.push((crate::media::media_key(name), m.daily_requests, None));
         }
     }
     for (scope, svc) in [("search", &cfg.search), ("fetch", &cfg.fetch)] {
-        for p in svc.providers.iter().filter(|p| p.enabled) {
+        for p in svc.providers.iter().filter(|p| p.enabled && wanted(&p.name)) {
             service_rows.push((
                 format!("{scope}#{}", p.name),
                 p.daily_requests,
                 p.monthly_requests,
             ));
         }
+    }
+    if json_out {
+        service_rows.clear();
     }
     let default_limits = crate::config::Limits::default();
     if let Ok(w) = current_windows(&default_limits, now) {
@@ -542,6 +598,7 @@ pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
         }
     }
 
+    let mut json_remote = serde_json::Map::new();
     if remote {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
@@ -551,10 +608,10 @@ pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
         let targets: Vec<(&String, &crate::config::ProviderConfig, &String)> = cfg
             .providers
             .iter()
-            .filter(|(_, p)| p.enabled)
+            .filter(|(n, p)| p.enabled && wanted(n))
             .filter_map(|(n, p)| p.balance_url.as_ref().map(|u| (n, p, u)))
             .collect();
-        if targets.is_empty() {
+        if targets.is_empty() && !json_out {
             let _ = writeln!(out, "\nno balance_url configured on any provider");
             return Ok(());
         }
@@ -563,21 +620,109 @@ pub async fn print_status(cfg: &Config, remote: bool) -> Result<()> {
             let secrets = &secrets;
             let state = &state;
             async move {
-                let line = fetch_balance(name, p, url, secrets, state, http).await;
-                (name.to_string(), line)
+                let (line, body) = fetch_balance(name, p, url, secrets, state, http).await;
+                (name.to_string(), line, body)
             }
         });
         let results = futures_util::future::join_all(fetches).await;
-        let _ = writeln!(out, "\nremote balances:");
-        for (name, line) in results {
-            let _ = writeln!(out, "  {name:<20} {line}");
+        if json_out {
+            for (name, line, body) in results {
+                json_remote.insert(
+                    name,
+                    json!({"summary": line, "data": body.unwrap_or(Value::Null)}),
+                );
+            }
+        } else {
+            let _ = writeln!(out, "\nremote balances:");
+            for (name, line, _) in results {
+                let _ = writeln!(out, "  {name:<20} {line}");
+            }
+        }
+    }
+
+    // The pin and the bench: what the auto route is doing right now, and who
+    // is sitting out. Both are read from the same sqlite the daemon writes,
+    // so this works with the daemon down too (a stale in-memory-only rpm
+    // window is the only thing the CLI can't see).
+    let route_pin = state.kv_get(crate::router::ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty());
+    // Whether the pin actually steers routing right now — a pin gone stale
+    // (model dropped from the catalog) is ignored by resolve_candidates, and
+    // reporting it as simply "pinned" would have the panel lie about the walk.
+    let route_pin_active = route_pin.as_deref().is_some_and(|p| {
+        let catalog = Catalog::from_config(cfg);
+        let resolved = catalog.resolve(cfg, p);
+        !resolved.is_empty() && resolved.iter().all(|c| catalog.is_listed(&c.full_id()))
+    });
+    let cooldowns: Vec<Value> = state
+        .active_cooldowns()
+        .into_iter()
+        .map(|(key, cd)| {
+            let left = cd.until.saturating_duration_since(std::time::Instant::now());
+            json!({
+                "key": key,
+                "reason": cd.reason,
+                "retryable": cd.retryable,
+                "secondsLeft": left.as_secs(),
+            })
+        })
+        .collect();
+
+    if json_out {
+        // Model rows travel whole regardless of --provider: that flag exists
+        // to keep remote HTTP cheap, while the reader slices model rows by
+        // AGENT — filtering them by provider would drop an agent's usage on
+        // every provider outside the filter.
+        let model_usage: Vec<Value> = state
+            .model_usage_rows()?
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "day": r.day, "agent": r.agent, "provider": r.provider, "model": r.model,
+                    "requests": r.requests,
+                    "inputTokens": r.input_tokens, "outputTokens": r.output_tokens,
+                })
+            })
+            .collect();
+        let mut root = serde_json::Map::new();
+        root.insert("port".into(), json!(cfg.server.port));
+        root.insert("routePin".into(), json!(route_pin));
+        root.insert("routePinActive".into(), json!(route_pin_active));
+        root.insert("cooldowns".into(), Value::Array(cooldowns));
+        root.insert("providers".into(), Value::Object(json_providers));
+        root.insert("modelUsage".into(), Value::Array(model_usage));
+        if remote {
+            root.insert("remote".into(), Value::Object(json_remote));
+        }
+        let _ = writeln!(out, "{}", Value::Object(root));
+    } else {
+        if let Some(pin) = &route_pin {
+            if route_pin_active {
+                let _ = writeln!(out, "\nauto route pinned to: {pin} (chain is the fallback)");
+            } else {
+                let _ = writeln!(out, "\nauto route pin '{pin}' is STALE (not in the catalog) — chain priority in effect");
+            }
+        }
+        if !cooldowns.is_empty() {
+            let _ = writeln!(out, "\ncooling down:");
+            for cd in &cooldowns {
+                let _ = writeln!(
+                    out,
+                    "  {:<28} {}s left — {}{}",
+                    cd["key"].as_str().unwrap_or("?"),
+                    cd["secondsLeft"].as_u64().unwrap_or(0),
+                    cd["reason"].as_str().unwrap_or(""),
+                    if cd["retryable"].as_bool() == Some(false) { " (non-retryable)" } else { "" },
+                );
+            }
         }
     }
     Ok(())
 }
 
-/// One provider's balance line. Never errors — a broken endpoint reports
-/// itself in place of a number.
+/// One provider's balance: a human summary line plus, when the endpoint
+/// answered, its parsed body (for `--json` consumers, which normalize the
+/// provider-specific shape themselves). Never errors — a broken endpoint
+/// reports itself in place of a number.
 async fn fetch_balance(
     name: &str,
     p: &crate::config::ProviderConfig,
@@ -585,7 +730,7 @@ async fn fetch_balance(
     secrets: &Secrets,
     state: &PxyState,
     http: &reqwest::Client,
-) -> String {
+) -> (String, Option<Value>) {
     // Copilot's quota endpoint wants the long-lived GitHub token, not the
     // minted Copilot bearer the generic prepare() path would send.
     if p.kind == crate::config::ProviderKind::GithubCopilot {
@@ -593,12 +738,13 @@ async fn fetch_balance(
             Ok(v) => {
                 let prem = &v["quota_snapshots"]["premium_interactions"];
                 if !prem.is_object() {
-                    return format!(
+                    let line = format!(
                         "no premium quota (plan: {})",
                         v["copilot_plan"].as_str().unwrap_or("?")
                     );
+                    return (line, Some(v));
                 }
-                format!(
+                let line = format!(
                     "premium {:.1}/{} left ({:.0}%) · resets {}{}",
                     prem["quota_remaining"].as_f64().unwrap_or(0.0),
                     prem["entitlement"].as_u64().unwrap_or(0),
@@ -609,14 +755,15 @@ async fn fetch_balance(
                     } else {
                         ""
                     },
-                )
+                );
+                (line, Some(v))
             }
-            Err(e) => format!("{e:#}"),
+            Err(e) => (format!("{e:#}"), None),
         };
     }
     let prepared = match crate::providers::prepare(name, p, secrets, state, http).await {
         Ok(pr) => pr,
-        Err(e) => return format!("credential error: {e:#}"),
+        Err(e) => return (format!("credential error: {e:#}"), None),
     };
     let mut req = http.get(url);
     for (k, v) in &prepared.headers {
@@ -631,21 +778,22 @@ async fn fetch_balance(
     }
     let resp = match req.send().await {
         Ok(r) => r,
-        Err(e) => return format!("network: {e}"),
+        Err(e) => return (format!("network: {e}"), None),
     };
     let status = resp.status().as_u16();
     let body: Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return format!("HTTP {status}: non-JSON body"),
+        Err(_) => return (format!("HTTP {status}: non-JSON body"), None),
     };
     if status >= 400 {
-        return format!("HTTP {status}");
+        return (format!("HTTP {status}"), None);
     }
     // OpenRouter: dollars, with the grant total alongside.
     if let (Some(credits), Some(usage)) =
         (body["data"]["total_credits"].as_f64(), body["data"]["total_usage"].as_f64())
     {
-        return format!("${:.2} left of ${credits:.2}", credits - usage);
+        let line = format!("${:.2} left of ${credits:.2}", credits - usage);
+        return (line, Some(body));
     }
     // opencode Go: percent used per window (GET /zen/go/v1/usage).
     if body["usage"]["monthly"].is_object() {
@@ -655,17 +803,63 @@ async fn fetch_balance(
             format!("{pct}%{}", if limited { "!" } else { "" })
         };
         let resets = body["usage"]["monthly"]["resetsAt"].as_str().unwrap_or("?");
-        return format!(
+        let line = format!(
             "5h {} · wk {} · mo {} (mo resets {})",
             win("rolling"),
             win("weekly"),
             win("monthly"),
             &resets[..resets.len().min(10)],
         );
+        return (line, Some(body));
     }
     // OpenAI/new-api dashboard billing: total_usage in cents.
     if let Some(cents) = body["total_usage"].as_f64() {
-        return format!("used ${:.2}", cents / 100.0);
+        return (format!("used ${:.2}", cents / 100.0), Some(body));
     }
-    format!("unrecognized shape: {}", &body.to_string().chars().take(120).collect::<String>())
+    let line =
+        format!("unrecognized shape: {}", &body.to_string().chars().take(120).collect::<String>());
+    (line, Some(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn agent_from_key_suffix_in_either_auth_header() {
+        let h = headers(&[("authorization", "Bearer pxy-local:claude")]);
+        assert_eq!(client_agent(&h).as_deref(), Some("claude"));
+        let h = headers(&[("x-api-key", "pxy-local:opencode")]);
+        assert_eq!(client_agent(&h).as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn explicit_header_beats_key_suffix() {
+        let h = headers(&[
+            ("x-pxy-agent", "pi"),
+            ("authorization", "Bearer pxy-local:claude"),
+        ]);
+        assert_eq!(client_agent(&h).as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn plain_key_or_garbage_suffix_yields_no_agent() {
+        let h = headers(&[("authorization", "Bearer pxy-local")]);
+        assert_eq!(client_agent(&h), None);
+        // A real token with colons (JSON-ish, spaces) must not fake an agent.
+        let h = headers(&[("authorization", "Bearer sk-x:not an agent!")]);
+        assert_eq!(client_agent(&h), None);
+        assert_eq!(client_agent(&HeaderMap::new()), None);
+    }
 }

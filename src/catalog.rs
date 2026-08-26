@@ -74,6 +74,15 @@ impl Catalog {
         &self.models
     }
 
+    /// Whether this exact provider/model pair is actually cataloged — listed
+    /// on its provider, or a member of the auto chain. resolve() deliberately
+    /// fabricates a spec for any id under a known provider (an explicit
+    /// request should still route); the auto-route pin must be stricter, or a
+    /// typo'd/stale pin becomes a phantom that every auto request walks first.
+    pub fn is_listed(&self, full_id: &str) -> bool {
+        self.models.iter().chain(self.auto.iter()).any(|c| c.full_id() == full_id)
+    }
+
     /// Resolve a requested model id to an ordered candidate list.
     ///
     /// - "auto" -> the configured auto chain (config order = priority)

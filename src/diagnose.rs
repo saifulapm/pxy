@@ -22,20 +22,56 @@ fn state() -> Result<State> {
 // pxy explain <model>
 // ---------------------------------------------------------------------------
 
-pub fn explain(cfg: &Config, requested: &str) -> Result<()> {
+pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
     let catalog = Catalog::from_config(cfg);
-    let candidates = catalog.resolve(cfg, requested);
-    if candidates.is_empty() {
-        println!("'{requested}' resolves to nothing (not in any provider's model list).");
-        return Ok(());
-    }
     // Persisted cooldowns rehydrate at open; rpm windows are daemon-memory
     // only and reported as unknown.
     let st = state()?;
+    // Same resolution the daemon runs, pin included: explain must describe
+    // the walk a request would actually take, not the config-only chain.
+    let candidates = crate::router::resolve_candidates(&catalog, cfg, &st, requested);
+    let pin = st
+        .kv_get(crate::router::ROUTE_PIN_KEY)
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty());
+    let pinned_ids: std::collections::HashSet<String> = pin
+        .as_deref()
+        .map(|p| catalog.resolve(cfg, p).iter().map(|c| c.full_id()).collect())
+        .unwrap_or_default();
+    let is_auto = requested == "auto" || requested == "claude/auto";
+    // A stale pin (resolve_candidates ignored it) must not be reported as
+    // steering the walk: when active, the pin leads — so check the head.
+    let pin_active = is_auto
+        && candidates.first().is_some_and(|c| pinned_ids.contains(&c.full_id()));
+    if candidates.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"requested": requested, "routePin": pin, "routePinActive": false, "candidates": []})
+            );
+        } else {
+            println!("'{requested}' resolves to nothing (not in any provider's model list).");
+        }
+        return Ok(());
+    }
     let default_limits = crate::config::Limits::default();
     let now = Timestamp::now();
 
-    println!("'{requested}' -> {} candidate(s), walked in order:\n", candidates.len());
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    if !json {
+        match (&pin, pin_active) {
+            (Some(p), true) => println!(
+                "'{requested}' -> {} candidate(s) (pin '{p}' first), walked in order:\n",
+                candidates.len()
+            ),
+            (Some(p), false) if is_auto => println!(
+                "'{requested}' -> {} candidate(s); pin '{p}' is STALE (not in the catalog), walked in chain order:\n",
+                candidates.len()
+            ),
+            _ => println!("'{requested}' -> {} candidate(s), walked in order:\n", candidates.len()),
+        }
+    }
     for (i, cand) in candidates.iter().enumerate() {
         let mut skips: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
@@ -88,14 +124,36 @@ pub fn explain(cfg: &Config, requested: &str) -> Result<()> {
             None => skips.push("provider missing from config".into()),
         }
 
-        let verdict = if skips.is_empty() { "ELIGIBLE" } else { "would skip" };
-        println!("{:>2}. {}  [{verdict}]", i + 1, cand.full_id());
+        let eligible = skips.is_empty();
+        let pinned = pin_active && pinned_ids.contains(&cand.full_id());
+        if json {
+            records.push(serde_json::json!({
+                "position": i + 1,
+                "id": cand.full_id(),
+                "provider": cand.provider,
+                "model": cand.model.id,
+                "pinned": pinned,
+                "eligible": eligible,
+                "skips": skips,
+                "notes": notes,
+            }));
+            continue;
+        }
+        let verdict = if eligible { "ELIGIBLE" } else { "would skip" };
+        let pin_mark = if pinned { "  [pinned]" } else { "" };
+        println!("{:>2}. {}  [{verdict}]{pin_mark}", i + 1, cand.full_id());
         for s in &skips {
             println!("      ✗ {s}");
         }
         for n in &notes {
             println!("      · {n}");
         }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"requested": requested, "routePin": pin, "routePinActive": pin_active, "candidates": records})
+        );
     }
     Ok(())
 }

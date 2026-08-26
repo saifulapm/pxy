@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use jiff::Timestamp;
+use jiff::{Timestamp, Zoned};
 use rusqlite::Connection;
 
 /// Persistent + in-memory runtime state.
@@ -50,6 +50,17 @@ pub struct UsageRow {
     pub tokens: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelUsageRow {
+    pub day: String,
+    pub agent: String,
+    pub provider: String,
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 impl State {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -70,6 +81,16 @@ impl State {
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (provider, window, window_start)
+            );
+            CREATE TABLE IF NOT EXISTS model_usage (
+                day TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, agent, provider, model)
             );
             CREATE TABLE IF NOT EXISTS kv (
                 k TEXT PRIMARY KEY,
@@ -174,6 +195,63 @@ impl State {
         Ok(())
     }
 
+    /// Per-(agent, provider, model) daily counters, separate from the
+    /// enforcement windows above: routing never reads these. They exist so
+    /// "tokens by model" can be answered for auto-routed traffic — the agents'
+    /// own logs only know they asked for "auto". Day is the LOCAL calendar
+    /// date, matching how the usage panel groups its days.
+    pub fn record_model_usage(
+        &self,
+        agent: &str,
+        provider: &str,
+        model: &str,
+        request: bool,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        let day = Zoned::now().date().to_string();
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO model_usage (day, agent, provider, model, requests, input_tokens, output_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(day, agent, provider, model) DO UPDATE SET
+               requests = requests + excluded.requests,
+               input_tokens = input_tokens + excluded.input_tokens,
+               output_tokens = output_tokens + excluded.output_tokens",
+            rusqlite::params![
+                day,
+                agent,
+                provider,
+                model,
+                request as i64,
+                input_tokens as i64,
+                output_tokens as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every model_usage row, oldest day first (for `pxy status --json`).
+    pub fn model_usage_rows(&self) -> Result<Vec<ModelUsageRow>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare(
+            "SELECT day, agent, provider, model, requests, input_tokens, output_tokens
+             FROM model_usage ORDER BY day, agent, provider, model",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ModelUsageRow {
+                day: r.get(0)?,
+                agent: r.get(1)?,
+                provider: r.get(2)?,
+                model: r.get(3)?,
+                requests: r.get::<_, i64>(4)? as u64,
+                input_tokens: r.get::<_, i64>(5)? as u64,
+                output_tokens: r.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Lifetime totals (the "total" window, key independent of time).
     pub fn usage_total(&self, provider: &str) -> Result<UsageRow> {
         self.usage_keyed(provider, "total", TOTAL_WINDOW_START)
@@ -219,6 +297,12 @@ impl State {
              ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             [k, v],
         )?;
+        Ok(())
+    }
+
+    pub fn kv_delete(&self, k: &str) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute("DELETE FROM kv WHERE k = ?1", [k])?;
         Ok(())
     }
 
@@ -414,6 +498,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pxy-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         State::open(&dir.join("s.sqlite")).unwrap()
+    }
+
+    #[test]
+    fn model_usage_accumulates_per_agent_and_model() {
+        let s = state("model_usage");
+        s.record_model_usage("codex", "zenmux", "glm-5.3", true, 0, 0).unwrap();
+        s.record_model_usage("codex", "zenmux", "glm-5.3", false, 100, 20).unwrap();
+        s.record_model_usage("opencode", "zenmux", "glm-5.3", true, 5, 1).unwrap();
+        let rows = s.model_usage_rows().unwrap();
+        assert_eq!(rows.len(), 2, "one row per (agent, model): {rows:?}");
+        let codex = rows.iter().find(|r| r.agent == "codex").unwrap();
+        assert_eq!((codex.requests, codex.input_tokens, codex.output_tokens), (1, 100, 20));
+        let oc = rows.iter().find(|r| r.agent == "opencode").unwrap();
+        assert_eq!((oc.requests, oc.input_tokens, oc.output_tokens), (1, 5, 1));
     }
 
     #[test]

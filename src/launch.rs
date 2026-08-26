@@ -37,6 +37,15 @@ pub fn launch(
     }
 }
 
+/// The api key with the agent's name smuggled on as a `:agent` suffix. The
+/// server never validates the key (soft gate, loopback only) but does parse
+/// the suffix back out in client_ctx(), which is how per-model usage stats
+/// know WHICH agent asked for "auto". One mechanism for every agent — they
+/// all send the key, while only some can be taught a custom header.
+fn tagged_key(cfg: &Config, agent: &str) -> String {
+    format!("{}:{agent}", cfg.server.api_key)
+}
+
 fn exec_or_print(mut cmd: Command, dry_run: bool, note: &str) -> Result<()> {
     if dry_run {
         println!("would exec: {:?}", cmd.get_program());
@@ -86,7 +95,7 @@ fn launch_claude(
     // Base URL WITHOUT /v1 — Claude Code appends /v1/messages itself.
     cmd.env("ANTHROPIC_BASE_URL", cfg.base_url());
     // Must be non-empty or Claude Code stops at its login gate.
-    cmd.env("ANTHROPIC_AUTH_TOKEN", &cfg.server.api_key);
+    cmd.env("ANTHROPIC_AUTH_TOKEN", tagged_key(cfg, "claude"));
     cmd.env("ANTHROPIC_MODEL", model);
     let small = cfg.launch.small_model.clone().unwrap_or_else(|| model.to_string());
     cmd.env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &small);
@@ -160,7 +169,7 @@ fn launch_opencode(
     cmd.args(extra_args);
     cmd.env_remove("OPENCODE_CONFIG_CONTENT");
     cmd.env("OPENCODE_CONFIG_CONTENT", config_content.to_string());
-    cmd.env("PXY_API_KEY", &cfg.server.api_key);
+    cmd.env("PXY_API_KEY", tagged_key(cfg, "opencode"));
 
     exec_or_print(cmd, dry_run, "opencode wired via OPENCODE_CONFIG_CONTENT")
 }
@@ -188,7 +197,7 @@ fn launch_codex(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String])
     }
     cmd.arg("-m").arg(model);
     cmd.args(extra_args);
-    cmd.env("PXY_API_KEY", &cfg.server.api_key);
+    cmd.env("PXY_API_KEY", tagged_key(cfg, "codex"));
 
     exec_or_print(cmd, dry_run, "codex wired via -c model_providers.pxy overrides")
 }
@@ -216,7 +225,7 @@ fn launch_fx(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String]) ->
             cmd.env_remove(&key);
         }
     }
-    cmd.env("AI_GATEWAY_API_KEY", &cfg.server.api_key);
+    cmd.env("AI_GATEWAY_API_KEY", tagged_key(cfg, "fx"));
     cmd.env("FX_GATEWAY_BASE_URL", cfg.base_url());
     cmd.env("FX_GATEWAY_CHAT_URL", format!("{}/v3/ai/language-model", cfg.base_url()));
     cmd.env("FX_MODEL", model);
@@ -242,7 +251,7 @@ fn launch_pi(
     let mut cmd = Command::new("pi");
     cmd.arg("--provider").arg("pxy").arg("--model").arg(model);
     cmd.args(extra_args);
-    cmd.env("PXY_API_KEY", &cfg.server.api_key);
+    cmd.env("PXY_API_KEY", tagged_key(cfg, "pi"));
 
     exec_or_print(
         cmd,
