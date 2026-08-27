@@ -750,20 +750,64 @@ models = [{ id = "mercury-2", context_length = 128000, tool_call = true }]
 [providers.inception.limits]
 total_tokens = 100000000
 
-# 3) NVIDIA NIM — ~40 RPM free, 100+ models, no card. ToS: prototyping/dev only.
-#    Note openai/gpt-oss-* here does NOT support tool calling.
-# [providers.nvidia]
-# base_url = "https://integrate.api.nvidia.com/v1/chat/completions"
-# api_key = { pass = "AI/nvidia/main" }
-# models = [
-#   "zai/glm-5.2",
-#   "moonshotai/kimi-k2.6",
-#   "qwen/qwen3.5-397b-a17b",
-#   "mistralai/devstral-2-123b-instruct-2512",
-#   "nvidia/nemotron-3-ultra-550b",
-# ]
-# [providers.nvidia.limits]
-# rpm = 40
+# 3) NVIDIA NIM — ACTIVE 2026-08-27 (~40 RPM free dev tier, no card; ToS:
+#    prototyping/dev only). The catalog is KEY-TIER DEPENDENT (OmniRoute #2463):
+#    our key lists 84 models, but some listed ids still 404 "not found for
+#    account" (kimi-k2.6) and GLM/Qwen need a "Public API Endpoints" permission
+#    we don't have — hence discover off + curated list. Most of the ~40 "Free
+#    Endpoint" cards on build.nvidia.com are NOT chat: video/driving/broadcast
+#    microservices, safety classifiers, translation and TTS. Everything below is
+#    a real chat model, tool-verified live 2026-08-27/28 except v4-flash (every
+#    probe hit a busy worker; refresh will assert it later).
+#    No rate-limit headers or quota API → client-side rpm. NIM quirks: 400s on
+#    `prompt_cache_key` (Codex injects it; OmniRoute #7617 — dropped provider-
+#    wide); 200-then-empty-stream EOFs and per-model "Worker local total request
+#    limit" 503s → both just failover (laguna-xs is chronically oversubscribed,
+#    seen at 497/32). ultra-550b answers slowly (>60s with reasoning), and
+#    muse-glimmer returns a 500 rather than a 400 once its window is exceeded.
+#    ⚠️ context_length here is measured against the LIVE API (oversized probe →
+#    NIM states its own ceiling), NOT build.nvidia.com: that page's spec panel
+#    disagrees for four models, e.g. it claims 262144 for nemotron-3-nano-30b
+#    which really serves 1M. Do not "fix" these from the website.
+[providers.nvidia]
+base_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+embeddings_url = "https://integrate.api.nvidia.com/v1/embeddings"
+api_key = { pass = "AI/nvidia/main" }
+parse_think_tags = true
+drop_params = ["prompt_cache_key"]
+discover = false
+models = [
+  { id = "deepseek-ai/deepseek-v4-pro-0813", context_length = 1048576, tool_call = true },
+  { id = "deepseek-ai/deepseek-v4-flash-0731", context_length = 1048576 },
+  { id = "moonshotai/kimi-k3", context_length = 1048576, tool_call = true },
+  { id = "nvidia/nemotron-3-ultra-550b-a55b", context_length = 1048576, tool_call = true },
+  { id = "nvidia/nemotron-3-super-120b-a12b", context_length = 1000000, tool_call = true },
+  { id = "nvidia/nemotron-3.5-lightning-30b-a3b", context_length = 1000000, tool_call = true },
+  { id = "nvidia/nemotron-3-nano-30b-a3b", context_length = 1000000, tool_call = true },
+  # omni-modal: image/video/speech in, text out
+  { id = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", context_length = 1000000, tool_call = true },
+  { id = "minimaxai/minimax-m3", context_length = 262144, tool_call = true },
+  { id = "mistralai/mistral-nemotron", context_length = 262144, tool_call = true },
+  { id = "stepfun-ai/step-3.7-flash", context_length = 262144, tool_call = true },
+  { id = "poolside/laguna-xs-2.1", context_length = 262144, tool_call = true },
+  # diffusion LLM (fast, parallel decode); answers real prompts fine but
+  # returns EMPTY content when the reply would be a token or two ("say OK")
+  { id = "google/diffusiongemma-26b-a4b-it", context_length = 250000, tool_call = true },
+  # gpt-oss DOES tool-call here (the old staged note claiming otherwise was
+  # wrong). gpt-oss-20b works too — omitted as a strictly weaker twin of 120b.
+  { id = "openai/gpt-oss-120b", context_length = 131072, tool_call = true },
+  { id = "meta/muse-glimmer-30b", context_length = 131072, tool_call = true },
+]
+# nemotron-3-embed-1b (2048-dim) is the ONLY embedding model here that speaks
+# plain OpenAI shape. nv-embedqa-*, arctic-embed-l and the nemoretriever VL
+# models need NVIDIA's proprietary `input_type` and answer 200 with an EMPTY
+# vector without it — a silent corruption, so they stay unlisted.
+# Call it as "nvidia/nvidia/nemotron-3-embed-1b": pxy strips the first segment
+# as the provider, so the single-prefix form loses the vendor half of the id
+# and NVIDIA answers with a body pxy renders as {}.
+embedding_models = ["nvidia/nemotron-3-embed-1b"]
+[providers.nvidia.limits]
+rpm = 40
 
 # 4) Vercel AI Gateway — REJECTED 2026-08-25: the $5/month grant needs the Vercel
 #    Pro plan ($20/mo); Hobby accounts 403 on every call, even -free models.
