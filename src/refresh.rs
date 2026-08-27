@@ -68,6 +68,10 @@ impl Tri {
 pub struct Caps {
     pub tool_call: Option<bool>,
     pub context: Option<u64>,
+    /// `YYYY-MM-DD` (occasionally `YYYY-MM`). Orders `auto` by recency.
+    pub release_date: Option<String>,
+    /// Open-weight models are preferred inside a context bucket.
+    pub open_weights: Option<bool>,
 }
 
 /// One model as offered by one provider.
@@ -132,6 +136,8 @@ pub async fn fetch_capabilities(http: &reqwest::Client) -> Result<HashMap<String
             let caps = Caps {
                 tool_call: rec["tool_call"].as_bool(),
                 context: rec["limit"]["context"].as_u64(),
+                release_date: rec["release_date"].as_str().map(str::to_string),
+                open_weights: rec["open_weights"].as_bool(),
             };
             // First writer wins: providers are iterated in a stable order and
             // the facts are about the MODEL, not the reseller.
@@ -460,7 +466,7 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
             cred_failures
         );
     }
-    generate(cfg, secrets, &http, found, out_path).await
+    generate(cfg, secrets, &http, found, &caps, out_path).await
 }
 
 /// Build and write `generated.toml`.
@@ -469,6 +475,7 @@ async fn generate(
     secrets: &Secrets,
     http: &reqwest::Client,
     discovered: BTreeMap<String, Vec<Discovered>>,
+    caps: &HashMap<String, Caps>,
     out_path: &std::path::Path,
 ) -> Result<()> {
     let state = State::open(&crate::config::data_dir().join("state.sqlite"))?;
@@ -532,12 +539,24 @@ async fn generate(
             {
                 continue;
             }
-            models.insert(d.id.clone(), d.context.unwrap_or(crate::config::default_context()));
+            // `or_insert`, not `insert`: for a model config.toml already lists,
+            // the hand-written ModelSpec wins WHOLESALE at load time
+            // (Config::apply_generated), so writing the discovered window here
+            // would record a number the router never uses — and `auto` is now
+            // ordered by context, so it would order the chain by fiction.
+            // aihubmix lists coding-kimi-k3-free at 1M; the curated entry pins
+            // it to 262k, and 262k is what a request gets.
+            models
+                .entry(d.id.clone())
+                .or_insert_with(|| d.context.unwrap_or(crate::config::default_context()));
         }
 
-        // Candidates for `auto`: reserve tiers never qualify, whatever their
-        // ranking — a preference list must not be able to start spending money.
-        if pcfg.tier != Tier::Reserve {
+        // Candidates for `auto`: FREE pools only. Subscriptions have an
+        // allowance somebody paid for (opencode Go), reserves are real money or
+        // promotional balances that drain (agentrouter, gorouter), and finite
+        // grants don't renew — none of them belong in the default route, so no
+        // ranking can put them there.
+        if pcfg.tier == Tier::Free {
             for (id, ctx) in &models {
                 let canon = canonical(id);
                 let rank = rank_of(&canon);
@@ -564,12 +583,17 @@ async fn generate(
                 if tools != Tri::Yes {
                     continue;
                 }
+                let known = caps.get(&canon);
                 candidates.push(Candidate {
                     provider: name.clone(),
                     id: id.clone(),
-                    canonical: canon,
-                    tier: pcfg.tier,
                     context: *ctx,
+                    // Unknown openness is NOT openness: an unlabelled model
+                    // sorts with the proprietary ones rather than jumping the
+                    // queue on a missing field.
+                    open_weights: known.and_then(|c| c.open_weights).unwrap_or(false),
+                    release: known.and_then(|c| c.release_date.clone()),
+                    canonical: canon,
                     rank,
                 });
             }
@@ -586,15 +610,21 @@ async fn generate(
         );
     }
 
-    // Tier first (free pools before paid), preference order within a tier,
-    // then widest context. Ranked models always precede unranked ones.
+    // Widest context bucket first, open weights before proprietary inside a
+    // bucket, then newest release. The preference list is the LAST word, not
+    // the first: it breaks ties between models that are otherwise equivalent
+    // instead of overriding the automatic order.
     candidates.sort_by(|a, b| {
-        a.tier
-            .cmp(&b.tier)
+        context_bucket(b.context)
+            .cmp(&context_bucket(a.context))
+            .then(b.open_weights.cmp(&a.open_weights))
+            // `None` (models.dev doesn't know the model) sorts last, because
+            // reversing the comparison puts the smaller `None` at the end.
+            .then(b.release.cmp(&a.release))
             .then(a.rank.is_none().cmp(&b.rank.is_none()))
             .then(a.rank.cmp(&b.rank))
-            .then(b.context.cmp(&a.context))
             .then(a.provider.cmp(&b.provider))
+            .then(a.id.cmp(&b.id))
     });
 
     // Cap pools per model so one popular model can't crowd out the chain, and
@@ -755,10 +785,27 @@ struct Candidate {
     provider: String,
     id: String,
     canonical: String,
-    tier: Tier,
     context: u64,
+    open_weights: bool,
+    /// models.dev `release_date`; `None` when the model is unknown to it.
+    release: Option<String>,
     /// Index into the preference list; None = unranked (sorts after ranked).
     rank: Option<usize>,
+}
+
+/// Lower edge of each context bucket, widest first.
+const CONTEXT_BUCKETS: [u64; 7] = [1_000_000, 500_000, 256_000, 131_072, 65_536, 32_768, 8_192];
+
+/// Group a context window so that ordering is decided by openness and recency
+/// rather than by noise: 1,048,756 vs 1,048,576 vs 1,000,000 are all "1M", and
+/// letting the exact number rank them puts whichever provider rounds highest on
+/// top of the chain for no reason.
+fn context_bucket(ctx: u64) -> u64 {
+    CONTEXT_BUCKETS
+        .iter()
+        .copied()
+        .find(|edge| ctx >= *edge)
+        .unwrap_or(0)
 }
 
 /// Today as YYYY-MM-DD, for promo expiry.
@@ -797,23 +844,26 @@ fn render_generated(
         }
         out.push_str("]\n\n");
     }
-    out.push_str("[auto]\nmodels = [\n");
-    let mut last_tier: Option<Tier> = None;
+    out.push_str(concat!(
+        "# FREE-tier pools only: subscriptions, promotional balances and finite\n",
+        "# grants are never generated into `auto`. Ordered by context bucket\n",
+        "# (widest first), then open weights before proprietary, then newest\n",
+        "# release; the [preferences] list only breaks ties below all of that.\n",
+        "[auto]\nmodels = [\n",
+    ));
     for c in auto {
-        if last_tier != Some(c.tier) {
-            out.push_str(&format!("  # --- {:?} ---\n", c.tier).to_lowercase());
-            last_tier = Some(c.tier);
-        }
-        let note = match c.rank {
-            Some(r) => format!("preference #{}", r + 1),
-            None => "unranked".to_string(),
+        let rank = match c.rank {
+            Some(r) => format!(", preference #{}", r + 1),
+            None => String::new(),
         };
         out.push_str(&format!(
-            "  \"{}/{}\",{}# {note}, ctx={}\n",
+            "  \"{}/{}\",{}# ctx={}, {}, {}{rank}\n",
             c.provider,
             c.id,
             " ".repeat(46usize.saturating_sub(c.provider.len() + c.id.len())),
-            c.context
+            c.context,
+            c.release.as_deref().unwrap_or("release ?"),
+            if c.open_weights { "open" } else { "proprietary" },
         ));
     }
     out.push_str("]\n");
@@ -876,68 +926,98 @@ mod tests {
         assert_ne!(Tri::Unknown, Tri::No);
     }
 
-    fn cand(provider: &str, id: &str, tier: Tier, rank: Option<usize>, ctx: u64) -> Candidate {
+    fn cand(id: &str, ctx: u64, open: bool, release: Option<&str>, rank: Option<usize>) -> Candidate {
         Candidate {
-            provider: provider.into(),
+            provider: "p".into(),
             id: id.into(),
             canonical: canonical(id),
-            tier,
             context: ctx,
+            open_weights: open,
+            release: release.map(str::to_string),
             rank,
         }
     }
 
-    /// The ordering contract: cost class outranks preference, so a ranking can
-    /// never move a paid pool above a free one.
+    /// The generated ordering: context bucket, then open weights, then recency,
+    /// and only then the hand-written preference list.
     fn sort_for_test(mut v: Vec<Candidate>) -> Vec<String> {
         v.sort_by(|a, b| {
-            a.tier
-                .cmp(&b.tier)
+            context_bucket(b.context)
+                .cmp(&context_bucket(a.context))
+                .then(b.open_weights.cmp(&a.open_weights))
+                .then(b.release.cmp(&a.release))
                 .then(a.rank.is_none().cmp(&b.rank.is_none()))
                 .then(a.rank.cmp(&b.rank))
-                .then(b.context.cmp(&a.context))
                 .then(a.provider.cmp(&b.provider))
+                .then(a.id.cmp(&b.id))
         });
-        v.into_iter().map(|c| format!("{}/{}", c.provider, c.id)).collect()
+        v.into_iter().map(|c| c.id).collect()
     }
 
     #[test]
-    fn tier_outranks_preference() {
-        // "best" is the top preference but only on a finite pool; a lower-ranked
-        // model on a free pool must still come first.
-        let order = sort_for_test(vec![
-            cand("finite-pool", "best", Tier::Finite, Some(0), 100),
-            cand("free-pool", "second", Tier::Free, Some(1), 100),
-        ]);
-        assert_eq!(order, ["free-pool/second", "finite-pool/best"]);
+    fn context_bucket_groups_near_equal_windows() {
+        // The three spellings of "1M" that our providers actually report.
+        for ctx in [1_048_756, 1_048_576, 1_000_000] {
+            assert_eq!(context_bucket(ctx), 1_000_000, "ctx={ctx}");
+        }
+        assert_eq!(context_bucket(991_000), 500_000);
+        assert_eq!(context_bucket(262_144), 256_000);
+        assert_eq!(context_bucket(200_000), 131_072);
+        assert_eq!(context_bucket(8_191), 0);
     }
 
     #[test]
-    fn preference_orders_within_a_tier_and_ranked_beats_unranked() {
+    fn widest_context_bucket_leads_and_beats_everything_else() {
+        // A newer, open-weight model in a smaller bucket still sorts below.
         let order = sort_for_test(vec![
-            cand("p", "unranked-huge", Tier::Free, None, 1_000_000),
-            cand("p", "third", Tier::Free, Some(2), 100),
-            cand("p", "first", Tier::Free, Some(0), 100),
+            cand("small-new-open", 262_144, true, Some("2026-08-20"), Some(0)),
+            cand("huge-old-closed", 1_000_000, false, Some("2025-01-01"), None),
         ]);
-        assert_eq!(order, ["p/first", "p/third", "p/unranked-huge"]);
+        assert_eq!(order, ["huge-old-closed", "small-new-open"]);
     }
 
     #[test]
-    fn reserve_tier_is_ordered_last() {
+    fn open_weights_lead_their_bucket_then_newest_release() {
         let order = sort_for_test(vec![
-            cand("money", "top-model", Tier::Reserve, Some(0), 100),
-            cand("free", "meh", Tier::Free, None, 100),
+            cand("closed-newest", 1_048_576, false, Some("2026-08-13"), None),
+            cand("open-older", 1_000_000, true, Some("2026-06-01"), None),
+            cand("open-newest", 1_048_576, true, Some("2026-07-30"), None),
         ]);
-        assert_eq!(order, ["free/meh", "money/top-model"]);
+        assert_eq!(order, ["open-newest", "open-older", "closed-newest"]);
+    }
+
+    #[test]
+    fn preference_only_breaks_ties() {
+        // Same bucket, same openness, same date: the list decides. It must not
+        // be able to lift a model over a wider-context or newer one.
+        let order = sort_for_test(vec![
+            cand("unranked", 1_000_000, true, Some("2026-06-01"), None),
+            cand("ranked-second", 1_000_000, true, Some("2026-06-01"), Some(1)),
+            cand("ranked-first", 1_000_000, true, Some("2026-06-01"), Some(0)),
+            cand("newer-unranked", 1_000_000, true, Some("2026-07-01"), None),
+        ]);
+        assert_eq!(
+            order,
+            ["newer-unranked", "ranked-first", "ranked-second", "unranked"]
+        );
+    }
+
+    #[test]
+    fn unknown_release_date_sorts_last_not_first() {
+        let order = sort_for_test(vec![
+            cand("undated", 1_000_000, true, None, Some(0)),
+            cand("dated", 1_000_000, true, Some("2025-01-01"), None),
+        ]);
+        assert_eq!(order, ["dated", "undated"]);
     }
 
     #[test]
     fn pool_cap_limits_duplicates_of_one_model() {
         let cands = vec![
-            cand("a", "kimi-k3", Tier::Free, Some(0), 100),
-            cand("b", "kimi-k3:free", Tier::Free, Some(0), 100),
-            cand("c", "moonshotai/kimi-k3", Tier::Free, Some(0), 100),
-            cand("d", "kimi-k3-free", Tier::Free, Some(0), 100),
+            cand("kimi-k3", 100, true, None, Some(0)),
+            cand("kimi-k3:free", 100, true, None, Some(0)),
+            cand("moonshotai/kimi-k3", 100, true, None, Some(0)),
+            cand("kimi-k3-free", 100, true, None, Some(0)),
         ];
         let mut seen: HashMap<String, usize> = HashMap::new();
         let kept: Vec<_> = cands

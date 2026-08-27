@@ -120,9 +120,11 @@ impl ModelChain {
     }
 }
 
-/// Bare model names (no provider), best first. Ordering INSIDE a tier only:
-/// a preferred model on a paid pool still sits below the free tier, so a
-/// ranking can never quietly start spending money.
+/// Bare model names (no provider), best first. A TIE-BREAKER only: `auto` is
+/// ordered by context bucket, then open weights, then release date, and this
+/// list decides between models that come out equal on all three. It can never
+/// lift a narrower or older model above a wider or newer one — and, since only
+/// free pools are generated at all, never start spending money.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
@@ -132,8 +134,10 @@ pub struct Preferences {
     /// it, one popular model with 4 pools crowds out everything below it.
     #[serde(default = "default_max_pools")]
     pub max_pools_per_model: usize,
-    /// How many models NOT on the preference list may ride along as a
-    /// resilience tail. They sit below every ranked model in their tier.
+    /// How many models NOT on the preference list may enter `auto` — with an
+    /// empty list, the chain length. Kept tight because `/v1/models` advertises
+    /// the MINIMUM context over the chain: a long tail of small-window models
+    /// would tell agents that `auto` holds 32k.
     #[serde(default = "default_max_unranked")]
     pub max_unranked: usize,
     /// Model ids (or bare names) that must never enter `auto`, whatever
@@ -150,20 +154,24 @@ fn default_max_pools() -> usize {
     3
 }
 
-/// Cost class. Decides `auto` ordering, and whether a provider may be in
-/// `auto` at all. Never inferred — a vendor's billing behaviour is a curated
-/// fact, so `metered`/`reserve` must be set by hand.
+/// Cost class. Decides whether a provider may be in `auto` at all: only `free`
+/// is generated into the chain. Never inferred — a vendor's billing behaviour
+/// is a curated fact, so anything but `free` must be set by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tier {
-    /// Free and renewing; the default home of the auto chain.
+    /// Free and renewing; the only tier `auto` is generated from.
     #[default]
     Free,
-    /// A subscription already paid for, with a usage allowance.
+    /// A subscription already paid for, with a usage allowance. Manual only:
+    /// an allowance spent by background auto traffic is an allowance not there
+    /// when it's wanted (opencode Go).
     Subscription,
-    /// A finite grant that does not renew — spend after renewables.
+    /// A finite grant that does not renew. Manual only — reach for it
+    /// deliberately, don't let `auto` drain it.
     Finite,
-    /// Real money per token, or a balance that can be drained. NEVER in `auto`.
+    /// Real money per token, or a promotional balance that drains
+    /// (agentrouter, gorouter). Manual only.
     Reserve,
 }
 

@@ -71,34 +71,31 @@ models = [
 ]
 
 # ---------------------------------------------------------------------------
-# Model quality ranking for `pxy refresh --write`. Bare model names, best
-# first, no provider. Ordering applies WITHIN a cost tier: a preferred model
-# on a paid pool still sits below the free tier, so this list can never
-# quietly start spending money.
+# `pxy refresh --write` generates the auto chain from FREE-tier providers only
+# (subscriptions, promotional balances and finite grants are manual-only), and
+# orders it by context bucket (widest first) -> open weights before proprietary
+# -> newest release date.
+#
+# `models` below is a TIE-BREAKER applied after all three: bare model names,
+# best first, no provider. It picks between models that come out equal on
+# context, openness and release date — it can never lift a narrower or older
+# model up the chain. Empty = the automatic order stands.
 # ---------------------------------------------------------------------------
 [preferences]
-models = [
-  "ox-alpha",             # frontier agentic coder, 1M ctx
-  "hy3",                  # Hunyuan 3, 295B reasoning
-  "kimi-k3",              # 1M ctx
-  "glm-5.3",
-  "minimax-m3",           # 1M ctx
-  "gemini-3.7-flash",     # widest context of the Gemini line
-  "gemini-3-flash",
-  "deepseek-v4-flash-vision-exp",
-  "nemotron-3-ultra-550b-a55b",
-  "glm-4.7-flash",        # 59.2 SWE-bench; note z.ai does not list it
-  "devstral",
-  "mercury-2",
-]
+models = []
 max_pools_per_model = 3
-max_unranked = 12          # resilience tail below the ranked models
+# Chain length (with `models` empty, every candidate is "unranked"). 24 keeps
+# the whole chain inside the 1M-context bucket, which matters: /v1/models
+# advertises the MINIMUM context over the chain, so a tail of small-window
+# models would tell agents `auto` holds 32k and break their auto-compaction.
+max_unranked = 24
 # Listed by a provider but verified not to work — never let discovery re-add
 # these (checked 2026-08-25).
 deny = [
   "kilo-auto/free",        # kilocode's router id errors on every call
   "openrouter/free",       # same shape, same problem
   "gpt-5.5-free",          # aihubmix lists it; it never routes
+  "ox-alpha",              # withdrawn from the free pools
 ]
 
 [launch]

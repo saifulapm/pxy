@@ -497,10 +497,31 @@ groq + mistral (STT), agnes (images/video).
    `pxy refresh` = dry-run report; `pxy refresh --write` = regenerate
    `~/.config/pxy/generated.toml` (model lists + auto chain), which Config::load
    overlays onto config.toml at startup. Restart pxy after a --write.
-   - `[preferences]` in config.toml: bare model names best-first, `max_pools_per_model`,
-     `max_unranked` tail, `deny` list for listed-but-broken ids. **Tier-first ordering**
-     (free -> subscription -> finite; reserve NEVER generated), preference order within
-     a tier — a ranking can never start spending money.
+   - **Auto chain ordering (rewritten 2026-08-27, replaces tier-first + preference-first):**
+     only `tier = "free"` providers are generated at all — subscriptions (opencode Go,
+     Copilot), promotional balances (agentrouter, gorouter, tabitoken) and finite grants
+     (inception, tencent, alibaba, tokenrouter, kiro) are **manual-only** now, not a
+     lower tier of `auto`. Within that, the order is **context bucket (widest first)
+     -> open weights before proprietary -> newest `release_date`**, with `open_weights`
+     and `release_date` joined from models.dev (it carries both for 127/130 of our
+     free-tier models; unknown openness counts as proprietary, unknown date sorts last).
+     Contexts are BUCKETED (1M / 500k / 256k / 131k / 65k / 32k / 8k) because 1,048,756
+     vs 1,000,000 is not a real difference and exact numbers would rank pools by
+     rounding. `[preferences] models` is now a TIE-BREAKER applied AFTER all three, not
+     the primary key — it can no longer lift a narrower or older model up the chain, and
+     with the list empty the automatic order stands alone.
+   - `max_unranked` is effectively the CHAIN LENGTH while `models` is empty; it is 24 on
+     purpose, which is exactly the 1M-context bucket. `/v1/models` advertises the MIN
+     context over the chain, so a longer tail would tell agents `auto` holds 32k.
+     Verified after the change: `auto` advertises 1,000,000.
+   - ⚠️ **Generation must use the CURATED context, not the discovered one.** `models` is
+     seeded from config.toml and discovery now `or_insert`s (never overwrites), because
+     `Config::apply_generated` gives the hand-written ModelSpec wholesale priority at
+     load. Overwriting made generated.toml claim aihubmix/coding-kimi-k3-free was 1M
+     when the router pins it to 262k — harmless while tier/rank drove the sort, but it
+     put four fake-1M models at the head of the chain the moment context became the
+     primary key, and dropped advertised `auto` context to 131k.
+   - `max_pools_per_model` (3) and `deny` (listed-but-broken ids) are unchanged.
    - Per-provider: `tier`, `discover`, `models_url`, `id_field`, `[providers.X.promo]`
      (`expires = "YYYY-MM-DD"`, fails closed on bad dates).
    - Per-model: `tool_call = true|false` — a CURATED fact that beats discovery and
