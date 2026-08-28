@@ -57,8 +57,12 @@ pub fn openai(events: &[SseEvent]) -> Value {
             if let Some(t) = delta["content"].as_str() {
                 acc.content.get_or_insert_with(String::new).push_str(t);
             }
-            if let Some(t) = delta["reasoning_content"].as_str() {
-                acc.reasoning.get_or_insert_with(String::new).push_str(t);
+            // `reasoning` is the z-ai/GLM spelling of `reasoning_content`;
+            // normalised here so the response translators see one field.
+            for key in ["reasoning_content", "reasoning"] {
+                if let Some(t) = delta[key].as_str() {
+                    acc.reasoning.get_or_insert_with(String::new).push_str(t);
+                }
             }
             for tc in delta["tool_calls"].as_array().into_iter().flatten() {
                 let tidx = tc["index"].as_u64().unwrap_or(0);

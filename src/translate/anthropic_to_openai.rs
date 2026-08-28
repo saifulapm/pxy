@@ -282,18 +282,28 @@ fn repair_tool_pairs(messages: &mut Vec<Value>) {
 // Non-streaming response: openai -> anthropic
 // ---------------------------------------------------------------------------
 
+/// Chain-of-thought text from a message or delta. OpenAI-compatible upstreams
+/// disagree on the field: most say `reasoning_content`, the z-ai/GLM family
+/// says `reasoning`. Reading only the first name drops the entire thinking
+/// phase — the client gets no bytes at all while the model reasons, and Claude
+/// Code calls 20s of silence a stalled stream.
+fn reasoning_text(v: &Value) -> Option<&str> {
+    ["reasoning_content", "reasoning"]
+        .into_iter()
+        .find_map(|k| v[k].as_str())
+        .filter(|s| !s.is_empty())
+}
+
 pub fn response(openai: &Value, model: &str) -> Value {
     let choice = &openai["choices"][0];
     let message = &choice["message"];
     let mut content: Vec<Value> = Vec::new();
 
-    if let Some(reason) = message["reasoning_content"].as_str() {
-        if !reason.is_empty() {
-            // No signature field: a fabricated `signature: ""` gets stored in
-            // client history and poisons every later replay to a real
-            // Anthropic upstream (400 invalid signature, forever).
-            content.push(json!({"type": "thinking", "thinking": reason}));
-        }
+    if let Some(reason) = reasoning_text(message) {
+        // No signature field: a fabricated `signature: ""` gets stored in
+        // client history and poisons every later replay to a real
+        // Anthropic upstream (400 invalid signature, forever).
+        content.push(json!({"type": "thinking", "thinking": reason}));
     }
     if let Some(text) = message["content"].as_str() {
         if !text.is_empty() {
@@ -411,10 +421,8 @@ impl StreamState {
         let choice = &chunk["choices"][0];
         let delta = &choice["delta"];
 
-        if let Some(reason) = delta["reasoning_content"].as_str() {
-            if !reason.is_empty() {
-                out.push_str(&self.text_delta(reason, 1));
-            }
+        if let Some(reason) = reasoning_text(delta) {
+            out.push_str(&self.text_delta(reason, 1));
         }
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
