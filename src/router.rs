@@ -1,4 +1,4 @@
-//! The auto-routing engine: candidate filtering, fallback walk, error
+//! The routing engine: candidate filtering, fallback walk, error
 //! classification, usage recording. Synthesis of the OmniRoute + litellm
 //! research (docs/03, docs/05).
 
@@ -64,24 +64,25 @@ pub enum Outcome {
     },
 }
 
-/// kv key holding the auto-route pin, set from `pxy route` / the desktop
-/// panel. Read per request so a pin takes effect without a daemon restart.
+/// kv key holding the route pin, set from `pxy route` / the desktop panel.
+/// Read per request so a pin takes effect without a daemon restart.
 pub const ROUTE_PIN_KEY: &str = "route_pin";
 
-/// Candidates for a request, honoring the auto-route pin: on auto requests a
-/// pinned model is walked FIRST, with the configured chain behind it as
-/// fallback — pinning must never cost the failover safety auto exists for.
-/// Explicit model requests are untouched, and a pin that no longer resolves
-/// (config edit, provider disabled) degrades to the plain chain.
+/// Candidates for a request, honoring the route pin: on a GROUP request the
+/// pinned model is walked FIRST, with the group's chain behind it as fallback —
+/// pinning must never cost the failover safety a group exists for. One pin
+/// covers every group: an agent is launched with a fixed model id, so the pin
+/// is the only way to steer a running session. Explicit model requests are
+/// untouched, and a pin that no longer resolves (config edit, provider
+/// disabled) degrades to the plain chain.
 pub fn resolve_candidates(
     catalog: &Catalog,
     cfg: &Config,
     state: &State,
     requested: &str,
 ) -> Vec<Candidate> {
-    let auto = requested == "auto" || requested == "claude/auto";
     let mut chain = catalog.resolve(cfg, requested);
-    if !auto {
+    if !catalog.is_group(requested) {
         return chain;
     }
     let Some(pin) = state.kv_get(ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty()) else {
@@ -91,9 +92,9 @@ pub fn resolve_candidates(
     // is_listed, not just resolves: resolve() fabricates a candidate for any
     // id under an enabled provider, and a pin gone stale (config edit,
     // refresh dropping the model) must degrade to the chain, not put a
-    // phantom at the head of every auto walk.
+    // phantom at the head of every group walk.
     if pinned.is_empty() || !pinned.iter().all(|c| catalog.is_listed(&c.full_id())) {
-        warn!(pin, "route pin is not in the catalog; using the chain");
+        warn!(pin, "route pin is not in the catalog; using the group chain");
         return chain;
     }
     let pinned_ids: Vec<String> = pinned.iter().map(|c| c.full_id()).collect();
@@ -109,7 +110,11 @@ pub async fn handle_chat(
     payload: Value,
     ctx: ClientContext,
 ) -> Outcome {
-    let requested = payload["model"].as_str().unwrap_or("auto").to_string();
+    let requested = payload["model"]
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| app.cfg.default_route());
     let stream = payload["stream"].as_bool().unwrap_or(false);
 
     // In-band magic prompt: a last user message of exactly "@@usage" is
@@ -679,7 +684,7 @@ async fn try_candidate(
     // A streaming upstream returns headers as soon as it accepts the request,
     // so silence here means it is not answering at all. With a chain to fall
     // back on, waiting out timeout_secs (600s by default) for that is the
-    // wrong trade — one dead provider at the head of `auto` would strand
+    // wrong trade — one dead provider at the head of a group would strand
     // every request. An explicitly named model still gets the full timeout:
     // there is nothing to fail over to. Non-streaming is exempt because its
     // headers legitimately arrive only once the whole answer is generated.
@@ -869,9 +874,9 @@ async fn try_candidate(
 /// everything else 4xx -> fatal, pass upstream error through unmodified
 /// (Claude Code's auto-retry needs the raw body).
 ///
-/// Exception: on a multi-candidate walk (`auto`), a 404 also skips. Free
+/// Exception: on a multi-candidate walk (a group), a 404 also skips. Free
 /// model lists churn, and one delisted id must not kill the whole chain
-/// (zenmux delisting glm-5.3-free took `auto` down, 2026-08-25). On a
+/// (zenmux delisting glm-5.3-free took the chain down, 2026-08-25). On a
 /// single-candidate request the 404 still passes through raw.
 /// Remove a (possibly dotted) key path from a JSON object, pruning parents
 /// the removal left empty — `thinking.budget_tokens` must not leave a bare
@@ -2439,14 +2444,14 @@ mod tests {
             [providers.b]
             base_url = "http://127.0.0.1:1/b"
             models = ["m2"]
-            [auto]
+            [groups.free]
             models = ["a/m1", "b/m2"]
             "#,
             "route_pin",
         );
 
         // No pin: config order.
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
             .iter()
             .map(|c| c.full_id())
             .collect();
@@ -2454,7 +2459,7 @@ mod tests {
 
         // Pinned: the pin leads, the rest of the chain follows, no duplicate.
         app.state.kv_set(ROUTE_PIN_KEY, "b/m2").unwrap();
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
             .iter()
             .map(|c| c.full_id())
             .collect();
@@ -2469,7 +2474,7 @@ mod tests {
 
         // A pin that stopped resolving degrades to the plain chain.
         app.state.kv_set(ROUTE_PIN_KEY, "gone/nope").unwrap();
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
             .iter()
             .map(|c| c.full_id())
             .collect();
@@ -2477,10 +2482,10 @@ mod tests {
 
         // A pin under a REAL provider but to an unlisted model does too:
         // resolve() fabricates a candidate for it, and without the is_listed
-        // gate that phantom would lead every auto walk (and a 400 "unknown
+        // gate that phantom would lead every group walk (and a 400 "unknown
         // model" is Fatal — no failover).
         app.state.kv_set(ROUTE_PIN_KEY, "a/ghost").unwrap();
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "auto")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
             .iter()
             .map(|c| c.full_id())
             .collect();
@@ -2507,14 +2512,14 @@ mod tests {
                 [providers.b]
                 base_url = "{base}/b"
                 models = ["m"]
-                [auto]
+                [groups.free]
                 models = ["a/m", "b/m"]
                 "#
             ),
             "dead_stream",
         );
 
-        let payload = json!({"model": "auto", "stream": true,
+        let payload = json!({"model": "free", "stream": true,
             "messages": [{"role": "user", "content": "hi"}]});
         let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
             .await;
@@ -2709,7 +2714,7 @@ mod tests {
             "#,
             "usage_magic",
         );
-        let payload = json!({"model": "auto",
+        let payload = json!({"model": "free",
             "messages": [{"role": "user", "content": [{"type": "text", "text": " @@usage "}]}]});
         match handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
             .await
@@ -2722,7 +2727,7 @@ mod tests {
             Outcome::Stream { .. } => panic!("expected json"),
         }
         // Streaming OpenAI dialect gets protocol-correct SSE.
-        let payload = json!({"model": "auto", "stream": true,
+        let payload = json!({"model": "free", "stream": true,
             "messages": [{"role": "user", "content": "@@usage"}]});
         match handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await {
             Outcome::Stream { provider, body } => {
@@ -2850,14 +2855,14 @@ mod tests {
                 [providers.big]
                 base_url = "{base}/big"
                 models = [{{ id = "m", context_length = 1000000 }}]
-                [auto]
+                [groups.free]
                 models = ["small/m", "tiny/m", "big/m"]
                 "#
             ),
             "ctx_failover",
         );
 
-        let payload = json!({"model": "auto", "messages": [{"role": "user", "content": "hi"}]});
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
         let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
             .await;
         match out {
@@ -2896,13 +2901,13 @@ mod tests {
                 [providers.b]
                 base_url = "{base}/small"
                 models = [{{ id = "m", context_length = 8000 }}]
-                [auto]
+                [groups.free]
                 models = ["a/m", "b/m"]
                 "#
             ),
             "ctx_exhaust",
         );
-        let payload = json!({"model": "auto", "messages": [{"role": "user", "content": "hi"}]});
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
         let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
         match out {
             Outcome::Json { status, body, .. } => {
@@ -2946,13 +2951,13 @@ mod tests {
                 [providers.small]
                 base_url = "{base}/small"
                 models = [{{ id = "m", context_length = 8000 }}]
-                [auto]
+                [groups.free]
                 models = ["big/m", "small/m"]
                 "#
             ),
             "ctx_mixed",
         );
-        let payload = json!({"model": "auto", "messages": [{"role": "user", "content": "hi"}]});
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
         let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
         match out {
             Outcome::Json { status, body, .. } => {
@@ -2985,13 +2990,13 @@ mod tests {
                 [providers.tools]
                 base_url = "{base}/c"
                 models = [{{ id = "m", tool_call = true }}]
-                [auto]
+                [groups.free]
                 models = ["notools/m", "tools/m"]
                 "#
             ),
             "tool_filter",
         );
-        let payload = json!({"model": "auto",
+        let payload = json!({"model": "free",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "function", "function": {"name": "X", "parameters": {}}}]});
         let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;

@@ -172,7 +172,10 @@ async fn responses(
     use futures_util::StreamExt;
 
     let ctx = client_ctx(&headers);
-    let model = payload["model"].as_str().unwrap_or("auto").to_string();
+    let model = payload["model"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| app.cfg.default_route());
     let chat_payload = crate::translate::responses::request(&payload);
     let outcome = router::handle_chat(app, ClientFormat::Openai, chat_payload, ctx).await;
     match outcome {
@@ -230,7 +233,9 @@ async fn ai_language_model(
     use futures_util::StreamExt;
 
     let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let model = hdr("ai-language-model-id").unwrap_or("auto").to_string();
+    let model = hdr("ai-language-model-id")
+        .map(str::to_string)
+        .unwrap_or_else(|| app.cfg.default_route());
     let stream = hdr("ai-language-model-streaming") != Some("false");
     let ctx = client_ctx(&headers);
 
@@ -288,7 +293,6 @@ async fn ai_language_model(
 /// will send back in `ai-language-model-id`.
 async fn fx_models(State(app): State<SharedApp>) -> Json<Value> {
     let mut data: Vec<Value> = Vec::new();
-    let auto_chain = app.catalog.resolve(&app.cfg, "auto");
     let mut push = |id: String, ctx: u64, max_out: u64, tools: bool| {
         let mut tags = vec![json!("tool-use")];
         if !tools {
@@ -303,10 +307,9 @@ async fn fx_models(State(app): State<SharedApp>) -> Json<Value> {
             "max_tokens": max_out,
         }));
     };
-    if !auto_chain.is_empty() {
-        let ctx = auto_chain.iter().map(|c| c.model.context_length).min().unwrap_or(0);
-        let max_out = auto_chain.iter().map(|c| c.model.max_output_tokens).min().unwrap_or(0);
-        push("auto".into(), ctx, max_out, true);
+    for (name, group) in app.catalog.groups() {
+        let (ctx, max_out) = crate::catalog::chain_limits(&group.chain);
+        push(name.clone(), ctx, max_out, true);
     }
     for cand in app.catalog.models() {
         push(
@@ -499,10 +502,9 @@ fn codex_model_entry(slug: &str, display: &str, context: u64) -> Value {
 /// picker filter and would double every row here.
 fn codex_models(app: &SharedApp) -> Json<Value> {
     let mut models: Vec<Value> = Vec::new();
-    let auto_chain = app.catalog.resolve(&app.cfg, "auto");
-    if !auto_chain.is_empty() {
-        let ctx = auto_chain.iter().map(|c| c.model.context_length).min().unwrap_or(0);
-        models.push(codex_model_entry("auto", "auto", ctx));
+    for (name, group) in app.catalog.groups() {
+        let (ctx, _) = crate::catalog::chain_limits(&group.chain);
+        models.push(codex_model_entry(name, &group.label, ctx));
     }
     for cand in app.catalog.models() {
         let id = cand.full_id();
@@ -518,20 +520,19 @@ async fn models(State(app): State<SharedApp>, headers: HeaderMap) -> Json<Value>
     }
     let created = Timestamp::now().as_second();
     let mut data: Vec<Value> = Vec::new();
-    let auto_chain = app.catalog.resolve(&app.cfg, "auto");
-    if !auto_chain.is_empty() {
-        // min() over chain members: any member may serve a request, so the
-        // advertised window must be one they all satisfy. A missing/zero
-        // context window disables opencode's auto-compaction entirely and
-        // the session grows until history purge destroys the context.
-        let ctx = auto_chain.iter().map(|c| c.model.context_length).min().unwrap_or(0);
-        let max_out = auto_chain.iter().map(|c| c.model.max_output_tokens).min().unwrap_or(0);
+    // Groups lead the list: they are the ids an agent is normally launched
+    // with, and a picker shows them first. chain_limits() is a min() over the
+    // members — a missing/zero context window disables opencode's
+    // auto-compaction entirely and the session grows until history purge
+    // destroys the context.
+    for (name, group) in app.catalog.groups() {
+        let (ctx, max_out) = crate::catalog::chain_limits(&group.chain);
         data.push(json!({
-            "id": "auto",
+            "id": name,
             "object": "model",
             "created": created,
             "owned_by": "pxy",
-            "display_name": "auto",
+            "display_name": group.label,
             "context_length": ctx,
             "max_output_tokens": max_out,
         }));
@@ -757,19 +758,25 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         }
     }
 
-    // The pin and the bench: what the auto route is doing right now, and who
-    // is sitting out. Both are read from the same sqlite the daemon writes,
-    // so this works with the daemon down too (a stale in-memory-only rpm
-    // window is the only thing the CLI can't see).
+    // The pin and the bench: what the route is doing right now, and who is
+    // sitting out. Both are read from the same sqlite the daemon writes, so
+    // this works with the daemon down too (a stale in-memory-only rpm window
+    // is the only thing the CLI can't see).
+    let catalog = Catalog::from_config(cfg);
     let route_pin = state.kv_get(crate::router::ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty());
     // Whether the pin actually steers routing right now — a pin gone stale
     // (model dropped from the catalog) is ignored by resolve_candidates, and
     // reporting it as simply "pinned" would have the panel lie about the walk.
     let route_pin_active = route_pin.as_deref().is_some_and(|p| {
-        let catalog = Catalog::from_config(cfg);
         let resolved = catalog.resolve(cfg, p);
         !resolved.is_empty() && resolved.iter().all(|c| catalog.is_listed(&c.full_id()))
     });
+    // The routable group ids, so the desktop panel can walk each chain without
+    // parsing config.toml itself.
+    let groups: Vec<Value> = catalog
+        .groups()
+        .map(|(name, g)| json!({"name": name, "label": g.label, "size": g.chain.len()}))
+        .collect();
     let cooldowns: Vec<Value> = state
         .active_cooldowns()
         .into_iter()
@@ -804,6 +811,7 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         root.insert("port".into(), json!(cfg.server.port));
         root.insert("routePin".into(), json!(route_pin));
         root.insert("routePinActive".into(), json!(route_pin_active));
+        root.insert("groups".into(), Value::Array(groups));
         root.insert("cooldowns".into(), Value::Array(cooldowns));
         root.insert("providers".into(), Value::Object(json_providers));
         root.insert("modelUsage".into(), Value::Array(model_usage));
@@ -812,11 +820,18 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         }
         let _ = writeln!(out, "{}", Value::Object(root));
     } else {
+        if !groups.is_empty() {
+            let names: Vec<String> = groups
+                .iter()
+                .map(|g| format!("{} ({})", g["name"].as_str().unwrap_or("?"), g["size"]))
+                .collect();
+            let _ = writeln!(out, "\ngroups: {}", names.join(", "));
+        }
         if let Some(pin) = &route_pin {
             if route_pin_active {
-                let _ = writeln!(out, "\nauto route pinned to: {pin} (chain is the fallback)");
+                let _ = writeln!(out, "route pinned to: {pin} (the group chain is the fallback)");
             } else {
-                let _ = writeln!(out, "\nauto route pin '{pin}' is STALE (not in the catalog) — chain priority in effect");
+                let _ = writeln!(out, "route pin '{pin}' is STALE (not in the catalog) — group chain priority in effect");
             }
         }
         if !cooldowns.is_empty() {
@@ -868,6 +883,17 @@ fn free_quota_summary(snap: &Value, now: Timestamp) -> String {
 /// answered, its parsed body (for `--json` consumers, which normalize the
 /// provider-specific shape themselves). Never errors — a broken endpoint
 /// reports itself in place of a number.
+/// (dollars left, dollars granted) from a new-api console body (aihubmix's
+/// `GET /api/user/self`). Quota is an integer count of 1/500000 USD; `quota` is
+/// what is LEFT and `used_quota` what has been spent, so the grant is their
+/// sum — the same two numbers OpenRouter reports, in a different currency.
+fn newapi_balance(body: &Value) -> Option<(f64, f64)> {
+    const UNITS_PER_USD: f64 = 500_000.0;
+    let left = body["data"]["quota"].as_f64()?;
+    let used = body["data"]["used_quota"].as_f64()?;
+    Some((left / UNITS_PER_USD, (left + used) / UNITS_PER_USD))
+}
+
 async fn fetch_balance(
     name: &str,
     p: &crate::config::ProviderConfig,
@@ -906,19 +932,32 @@ async fn fetch_balance(
             Err(e) => (format!("{e:#}"), None),
         };
     }
-    let prepared = match crate::providers::prepare(name, p, secrets, state, http).await {
-        Ok(pr) => pr,
-        Err(e) => return (format!("credential error: {e:#}"), None),
-    };
+    // A dedicated billing credential bypasses the chat auth entirely: new-api
+    // consoles (aihubmix) answer 401 to the inference key no matter how it is
+    // framed, and want their Manage Key raw — no `Bearer`.
     let mut req = http.get(url);
-    for (k, v) in &prepared.headers {
-        req = req.header(k, v);
-    }
-    // Providers whose chat route wants x-api-key (gorouter, tabitoken) still
-    // gate billing behind a Bearer header; mirror the key into both.
-    if !prepared.headers.iter().any(|(k, _)| k == "authorization") {
-        if let Some((_, key)) = prepared.headers.iter().find(|(k, _)| k == "x-api-key") {
-            req = req.header("authorization", format!("Bearer {key}"));
+    if let Some(sref) = &p.balance_key {
+        match secrets.resolve_key(sref) {
+            Ok(k) => req = req.header("authorization", k),
+            Err(e) => return (format!("balance_key error: {e:#}"), None),
+        }
+        for (k, v) in &p.headers {
+            req = req.header(k, v);
+        }
+    } else {
+        let prepared = match crate::providers::prepare(name, p, secrets, state, http).await {
+            Ok(pr) => pr,
+            Err(e) => return (format!("credential error: {e:#}"), None),
+        };
+        for (k, v) in &prepared.headers {
+            req = req.header(k, v);
+        }
+        // Providers whose chat route wants x-api-key (gorouter, tabitoken)
+        // still gate billing behind a Bearer header; mirror the key into both.
+        if !prepared.headers.iter().any(|(k, _)| k == "authorization") {
+            if let Some((_, key)) = prepared.headers.iter().find(|(k, _)| k == "x-api-key") {
+                req = req.header("authorization", format!("Bearer {key}"));
+            }
         }
     }
     let resp = match req.send().await {
@@ -939,6 +978,9 @@ async fn fetch_balance(
     {
         let line = format!("${:.2} left of ${credits:.2}", credits - usage);
         return (line, Some(body));
+    }
+    if let Some((left, grant)) = newapi_balance(&body) {
+        return (format!("${left:.2} left of ${grant:.2}"), Some(body));
     }
     // opencode Go: percent used per window (GET /zen/go/v1/usage).
     if body["usage"]["monthly"].is_object() {
@@ -995,6 +1037,22 @@ mod tests {
     /// Only codex gets the manifest dialect, and it announces itself with
     /// `originator` — `codex_cli_rs` in the TUI, `codex_exec` under
     /// `codex exec`. Every other client keeps the OpenAI list.
+    /// aihubmix reports quota in units of 1/500000 USD, and reports what is
+    /// LEFT rather than what was granted — reading `quota` as dollars would
+    /// show a $10 balance as $10,000,000.
+    #[test]
+    fn newapi_quota_units_convert_to_dollars() {
+        // $10 left, $2 already spent -> a $12 grant.
+        let body = json!({"data": {"quota": 5_000_000, "used_quota": 1_000_000}});
+        let (left, grant) = newapi_balance(&body).unwrap();
+        assert!((left - 10.0).abs() < 1e-9, "left = {left}");
+        assert!((grant - 12.0).abs() < 1e-9, "grant = {grant}");
+        // A body without both halves is not a new-api balance: falling through
+        // lets the other shapes (and the "unrecognized" line) have their turn.
+        assert!(newapi_balance(&json!({"data": {"quota": 5_000_000}})).is_none());
+        assert!(newapi_balance(&json!({"data": {"total_credits": 10.0}})).is_none());
+    }
+
     #[test]
     fn codex_is_recognised_by_originator() {
         assert!(is_codex(&headers(&[("originator", "codex_cli_rs")])));

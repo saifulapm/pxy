@@ -197,8 +197,8 @@ impl State {
 
     /// Per-(agent, provider, model) daily counters, separate from the
     /// enforcement windows above: routing never reads these. They exist so
-    /// "tokens by model" can be answered for auto-routed traffic — the agents'
-    /// own logs only know they asked for "auto". Day is the LOCAL calendar
+    /// "tokens by model" can be answered for group-routed traffic — the agents'
+    /// own logs only know they asked for a group name. Day is the LOCAL calendar
     /// date, matching how the usage panel groups its days.
     pub fn record_model_usage(
         &self,

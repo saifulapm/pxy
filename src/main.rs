@@ -34,7 +34,7 @@ enum Command {
     Launch {
         /// Agent: claude | opencode | pi | codex | fx
         agent: String,
-        /// Model to use (pxy model id, e.g. "auto" or "provider/model")
+        /// Model to use (a group name, or "provider/model")
         #[arg(long, short)]
         model: Option<String>,
         /// Print what would be done without launching
@@ -44,24 +44,28 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// List available models
-    Models,
+    /// List available models (group names first, then every provider/model)
+    Models {
+        /// Emit one JSON array with each entry's details instead of bare ids
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose the installation: config, daemon, credentials, agent binaries
     Doctor,
     /// Explain how a model id resolves and why candidates would be skipped
     Explain {
-        /// Model id ("auto", "provider/model", or a bare id)
+        /// Model id (a group name, "provider/model", or a bare id)
         model: String,
         /// Emit one JSON object instead of the text report
         #[arg(long)]
         json: bool,
     },
-    /// Pin the auto route to one model (chain stays as fallback), or show it
+    /// Pin one model ahead of every group chain, or show the current pin
     Route {
         /// Model id to pin ("provider/model" or a bare id); omit to show the
         /// current pin
         model: Option<String>,
-        /// Remove the pin — auto follows the configured chain again
+        /// Remove the pin — group requests follow their configured chain again
         #[arg(long)]
         clear: bool,
     },
@@ -81,10 +85,10 @@ enum Command {
     },
     /// Discover live provider catalogs; report drift and optionally regenerate
     Refresh {
-        /// Write generated.toml (model lists + auto chain). Without this the
+        /// Write models.toml (every model of every provider). Without this the
         /// command only reports.
         #[arg(long)]
-        write: bool,
+        generate: bool,
     },
     /// Web search via the configured search providers
     Search {
@@ -174,18 +178,9 @@ fn main() -> Result<()> {
             let cfg = config::Config::load(&cfg_path)?;
             launch::launch(&cfg, &agent, model.as_deref(), dry_run, &args)
         }
-        Command::Models => {
+        Command::Models { json } => {
             let cfg = config::Config::load(&cfg_path)?;
-            use std::io::Write;
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            for m in catalog::Catalog::from_config(&cfg).model_ids() {
-                // stop quietly when the pipe closes (e.g. `pxy models | head`)
-                if writeln!(out, "{m}").is_err() {
-                    break;
-                }
-            }
-            Ok(())
+            models(&cfg, json)
         }
         Command::Doctor => block_on_current(diagnose::doctor(&cfg_path)),
         Command::Explain { model, json } => {
@@ -196,15 +191,15 @@ fn main() -> Result<()> {
             let cfg = config::Config::load(&cfg_path)?;
             route(&cfg, model.as_deref(), clear)
         }
-        Command::Refresh { write } => {
+        Command::Refresh { generate } => {
             // Baseline only: generation must never consume its own output.
             let cfg = config::Config::load_base(&cfg_path)?;
             let secrets = secrets::Secrets::new();
-            let out = config::generated_path(&cfg_path);
+            let out = config::models_path(&cfg_path);
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(refresh::run(&cfg, &secrets, write, &out))
+                .block_on(refresh::run(&cfg, &secrets, generate, &out))
         }
         Command::Status { remote, json, providers } => {
             let cfg = config::Config::load(&cfg_path)?;
@@ -246,33 +241,92 @@ fn main() -> Result<()> {
     }
 }
 
-/// `pxy route [MODEL] [--clear]` — the auto-route pin. The pin lives in the
-/// daemon's sqlite kv and is read per request, so no restart is needed; the
-/// desktop pxy panel drives this same verb.
+/// `pxy models [--json]` — group names first, then every "provider/model". The
+/// JSON form carries what a picker wants to show next to an id (provider, tier,
+/// window, tool calling, free-ness); the desktop panel reads it.
+fn models(cfg: &config::Config, json: bool) -> Result<()> {
+    use std::io::Write;
+    let catalog = catalog::Catalog::from_config(cfg);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if !json {
+        for m in catalog.model_ids() {
+            // stop quietly when the pipe closes (e.g. `pxy models | head`)
+            if writeln!(out, "{m}").is_err() {
+                break;
+            }
+        }
+        return Ok(());
+    }
+    let mut rows: Vec<serde_json::Value> = catalog
+        .groups()
+        .map(|(name, group)| {
+            let (ctx, max_out) = catalog::chain_limits(&group.chain);
+            serde_json::json!({
+                "id": name, "kind": "group", "label": group.label,
+                "size": group.chain.len(),
+                "contextLength": ctx, "maxOutputTokens": max_out,
+                "members": group.chain.iter().map(|c| c.full_id()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    // Which groups route to a model is the fact a picker most wants: it is the
+    // difference between "one of my free pools" and "real money per token".
+    let membership = |full_id: &str| -> Vec<String> {
+        catalog
+            .groups()
+            .filter(|(_, g)| g.chain.iter().any(|c| c.full_id() == full_id))
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    for cand in catalog.models() {
+        let id = cand.full_id();
+        let tier = cfg.providers.get(&cand.provider).map(|p| p.tier.as_str());
+        rows.push(serde_json::json!({
+            "id": id,
+            "kind": "model",
+            "provider": cand.provider,
+            "model": cand.model.id,
+            "name": cand.model.name,
+            "tier": tier,
+            "contextLength": cand.model.context_length,
+            "maxOutputTokens": cand.model.max_output_tokens,
+            "toolCall": cand.model.tool_call,
+            "free": cand.model.free,
+            "groups": membership(&id),
+        }));
+    }
+    let _ = writeln!(out, "{}", serde_json::Value::Array(rows));
+    Ok(())
+}
+
+/// `pxy route [MODEL] [--clear]` — the route pin: one model walked ahead of
+/// whichever group chain a request asks for. The pin lives in the daemon's
+/// sqlite kv and is read per request, so no restart is needed; the desktop pxy
+/// panel drives this same verb.
 fn route(cfg: &config::Config, model: Option<&str>, clear: bool) -> Result<()> {
     let st = state::State::open(&config::data_dir().join("state.sqlite"))?;
-    // "claude/auto" is auto on the request side (the Claude Code discovery
-    // mirror), so it means "clear" here too — pinning would grab whatever
-    // happens to lead the chain today and freeze it.
-    if clear || model == Some("auto") || model == Some("claude/auto") {
+    let catalog = catalog::Catalog::from_config(cfg);
+    // Pinning a GROUP means "no single model" — pinning would grab whatever
+    // happens to lead that chain today and freeze it, so it clears instead.
+    if clear || model.is_some_and(|m| catalog.is_group(m)) {
         st.kv_delete(router::ROUTE_PIN_KEY)?;
-        println!("auto route unpinned — chain priority restored");
+        println!("route unpinned — group chain priority restored");
         return Ok(());
     }
     let Some(model) = model else {
         match st.kv_get(router::ROUTE_PIN_KEY)?.filter(|p| !p.is_empty()) {
-            Some(pin) => println!("auto route pinned to: {pin} (chain is the fallback)"),
-            None => println!("auto route unpinned (configured chain priority)"),
+            Some(pin) => println!("route pinned to: {pin} (the group chain is the fallback)"),
+            None => println!("route unpinned (configured group chain priority)"),
         }
         return Ok(());
     };
-    let catalog = catalog::Catalog::from_config(cfg);
     let resolved = catalog.resolve(cfg, model);
     let Some(cand) = resolved.first() else {
         anyhow::bail!("'{model}' resolves to nothing — see `pxy models`");
     };
     // resolve() fabricates a candidate for any id under a known provider;
-    // refuse to store one, or a typo'd pin leads every auto walk to a model
+    // refuse to store one, or a typo'd pin leads every group walk to a model
     // that doesn't exist.
     if !catalog.is_listed(&cand.full_id()) {
         anyhow::bail!("'{model}' is not in the catalog — see `pxy models`");
@@ -281,7 +335,10 @@ fn route(cfg: &config::Config, model: Option<&str>, clear: bool) -> Result<()> {
     // pins ONE provider's copy, deterministically, not whichever bare match
     // wins on a later config.
     st.kv_set(router::ROUTE_PIN_KEY, &cand.full_id())?;
-    println!("auto route pinned to: {} (chain is the fallback)", cand.full_id());
+    println!(
+        "route pinned to: {} (the group chain is the fallback)",
+        cand.full_id()
+    );
     Ok(())
 }
 

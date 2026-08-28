@@ -11,12 +11,12 @@ pub fn default_config_path() -> PathBuf {
     base.join("pxy").join("config.toml")
 }
 
-/// `generated.toml` lives beside the config it augments.
-pub fn generated_path(config_path: &Path) -> PathBuf {
+/// `models.toml` lives beside the config it augments.
+pub fn models_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("generated.toml")
+        .join("models.toml")
 }
 
 pub fn home_dir() -> PathBuf {
@@ -36,13 +36,21 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// Named failover chains — "free", "subscription", "payperuse", whatever
+    /// the config declares. A group name is itself a routable model id.
     #[serde(default)]
-    pub auto: AutoConfig,
+    pub groups: BTreeMap<String, GroupConfig>,
+    /// Provider allowlist. Empty (the default) exposes every enabled provider.
+    /// Non-empty exposes ONLY these: their models are the entire catalog a
+    /// picker sees, group chains keep only members that survive the filter, and
+    /// a group with nothing left stops being advertised at all. An entry
+    /// matches by exact name or as a FAMILY PREFIX — "opencode-go" covers
+    /// opencode-go-github and opencode-go-google, while never matching an
+    /// unrelated name that merely starts with the same letters.
+    #[serde(default)]
+    pub providers_whitelist: Vec<String>,
     #[serde(default)]
     pub launch: LaunchConfig,
-    /// Model-quality ranking used to generate the `auto` chain.
-    #[serde(default)]
-    pub preferences: Preferences,
     /// Phase 2: web search providers (ordered; first healthy wins).
     #[serde(default)]
     pub search: ServiceConfig,
@@ -120,65 +128,77 @@ impl ModelChain {
     }
 }
 
-/// Bare model names (no provider), best first. A TIE-BREAKER only: `auto` is
-/// ordered by context bucket, then open weights, then release date, and this
-/// list decides between models that come out equal on all three. It can never
-/// lift a narrower or older model above a wider or newer one — and, since only
-/// free pools are generated at all, never start spending money.
+/// One named failover chain. Config order inside `models` is walk order: pxy
+/// skips candidates in cooldown / over limits / with too small a context, then
+/// takes the first survivor. Entirely hand-written — generation never touches
+/// a group, so what you put in a chain is what it walks.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Preferences {
+pub struct GroupConfig {
+    /// Ordered candidates: "provider/model".
     #[serde(default)]
     pub models: Vec<String>,
-    /// Cap on how many providers may serve the same model in `auto`. Without
-    /// it, one popular model with 4 pools crowds out everything below it.
-    #[serde(default = "default_max_pools")]
-    pub max_pools_per_model: usize,
-    /// How many models NOT on the preference list may enter `auto` — with an
-    /// empty list, the chain length. Kept tight because `/v1/models` advertises
-    /// the MINIMUM context over the chain: a long tail of small-window models
-    /// would tell agents that `auto` holds 32k.
-    #[serde(default = "default_max_unranked")]
-    pub max_unranked: usize,
-    /// Model ids (or bare names) that must never enter `auto`, whatever
-    /// discovery says. For catalogue entries that list but don't work.
-    #[serde(default)]
-    pub deny: Vec<String>,
+    /// What pickers show instead of the raw key. Optional because the key is
+    /// usually enough once title-cased — but "payperuse" can only become
+    /// "Pay Per Use" if somebody says so.
+    pub name: Option<String>,
 }
 
-fn default_max_unranked() -> usize {
-    12
+impl GroupConfig {
+    /// Display label: the configured `name`, else the key title-cased across
+    /// `-` and `_` ("free" -> "Free", "pay-per-use" -> "Pay Per Use").
+    pub fn label(&self, key: &str) -> String {
+        if let Some(n) = self.name.as_ref().filter(|n| !n.is_empty()) {
+            return n.clone();
+        }
+        key.split(['-', '_'])
+            .filter(|w| !w.is_empty())
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
-fn default_max_pools() -> usize {
-    3
-}
-
-/// Cost class. Decides whether a provider may be in `auto` at all: only `free`
-/// is generated into the chain. Never inferred — a vendor's billing behaviour
-/// is a curated fact, so anything but `free` must be set by hand.
+/// Cost class of a provider. Display metadata: it rides into `models.toml` and
+/// the pickers so a model's price is visible before it is chosen. Never
+/// inferred — a vendor's billing behaviour is a curated fact, so anything but
+/// `free` must be set by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tier {
-    /// Free and renewing; the only tier `auto` is generated from.
+    /// Free and renewing.
     #[default]
     Free,
-    /// A subscription already paid for, with a usage allowance. Manual only:
-    /// an allowance spent by background auto traffic is an allowance not there
-    /// when it's wanted (opencode Go).
+    /// A subscription already paid for, with a usage allowance (opencode Go).
     Subscription,
-    /// A finite grant that does not renew. Manual only — reach for it
-    /// deliberately, don't let `auto` drain it.
+    /// A finite grant that does not renew.
     Finite,
     /// Real money per token, or a promotional balance that drains
-    /// (agentrouter, gorouter). Manual only.
+    /// (agentrouter, gorouter).
     Reserve,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Free => "free",
+            Tier::Subscription => "subscription",
+            Tier::Finite => "finite",
+            Tier::Reserve => "reserve",
+        }
+    }
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let mut cfg = Self::load_base(path)?;
-        let gen_path = generated_path(path);
+        let gen_path = models_path(path);
         if gen_path.exists() {
             let graw = std::fs::read_to_string(&gen_path)
                 .with_context(|| format!("reading {}", gen_path.display()))?;
@@ -203,15 +223,15 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Overlay generated model lists and auto chain onto the hand-written
-    /// baseline. Generation only ever produces these two things, so nothing
-    /// hand-curated (credentials, limits, headers, quirks) can be clobbered.
-    /// A generated block for an unknown provider is ignored rather than
-    /// creating a half-configured provider with no credentials.
+    /// Overlay generated model lists onto the hand-written baseline. Generation
+    /// only ever produces model lists, so nothing hand-curated (credentials,
+    /// limits, headers, quirks, groups) can be clobbered. A generated block for
+    /// an unknown provider is ignored rather than creating a half-configured
+    /// provider with no credentials.
     ///
     /// The generated list decides WHICH models exist; for a model the
     /// hand-written config also lists, the hand-written spec wins wholesale.
-    /// generated.toml only carries id/context/tool_call, so taking its entry
+    /// models.toml only carries id/context/tool_call/free, so taking its entry
     /// for a curated model silently dropped max_output_tokens, per-model
     /// format overrides, and pinned context lengths (groq's 8192).
     fn apply_generated(&mut self, generated: Generated) {
@@ -231,12 +251,37 @@ impl Config {
                 }
             }
         }
-        if !generated.auto.models.is_empty() {
-            self.auto.models = generated.auto.models;
-        }
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Whether this provider is exposed at all. The one gate every catalog
+    /// view goes through, so the picker and the router can never disagree
+    /// about which providers exist.
+    pub fn provider_allowed(&self, name: &str) -> bool {
+        self.providers_whitelist.is_empty()
+            || self.providers_whitelist.iter().any(|entry| {
+                entry == name
+                    || name
+                        .strip_prefix(entry.as_str())
+                        .is_some_and(|rest| rest.starts_with('-'))
+            })
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        // A whitelist entry that matches nothing is a typo, and a typo in an
+        // allowlist fails SILENTLY into a smaller catalog — the one failure
+        // mode worth a hard error.
+        for entry in &self.providers_whitelist {
+            if !self.providers.keys().any(|name| {
+                entry == name
+                    || name
+                        .strip_prefix(entry.as_str())
+                        .is_some_and(|rest| rest.starts_with('-'))
+            }) {
+                anyhow::bail!(
+                    "providers_whitelist entry '{entry}' matches no configured provider"
+                );
+            }
+        }
         for (name, p) in &self.providers {
             if p.kind == ProviderKind::OpenaiCompat
                 && p.base_url.is_none()
@@ -248,15 +293,39 @@ impl Config {
                 );
             }
         }
-        for entry in &self.auto.models {
-            let (prov, _) = entry
-                .split_once('/')
-                .with_context(|| format!("auto model '{entry}' must be provider/model"))?;
-            if !self.providers.contains_key(prov) {
-                anyhow::bail!("auto model '{entry}' references unknown provider '{prov}'");
+        for (group, g) in &self.groups {
+            // A group name IS a model id on the wire, so it must not collide
+            // with the "provider/model" spelling or with a provider name — a
+            // group that shadowed a provider would swallow every request for
+            // that provider's models.
+            if group.contains('/') {
+                anyhow::bail!("group '{group}': a group name must not contain '/'");
+            }
+            if self.providers.contains_key(group) {
+                anyhow::bail!("group '{group}' collides with the provider of the same name");
+            }
+            for entry in &g.models {
+                let (prov, _) = entry.split_once('/').with_context(|| {
+                    format!("group '{group}': model '{entry}' must be provider/model")
+                })?;
+                if !self.providers.contains_key(prov) {
+                    anyhow::bail!(
+                        "group '{group}': model '{entry}' references unknown provider '{prov}'"
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    /// Model id for a request that names none. Every agent pxy wires sends one,
+    /// so this is a safety net: the launch default, else the first group.
+    pub fn default_route(&self) -> String {
+        self.launch
+            .model
+            .clone()
+            .or_else(|| self.groups.keys().next().cloned())
+            .unwrap_or_default()
     }
 
     pub fn base_url(&self) -> String {
@@ -264,20 +333,23 @@ impl Config {
     }
 }
 
-/// The subset `pxy refresh --write` produces. Deliberately tiny: anything not
-/// in this struct cannot be generated, and so cannot be lost to generation.
+/// The subset `pxy refresh --generate` produces. Deliberately tiny: anything
+/// not in this struct cannot be generated, and so cannot be lost to generation.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Generated {
     #[serde(default)]
     pub providers: BTreeMap<String, GeneratedProvider>,
-    #[serde(default)]
-    pub auto: AutoConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeneratedProvider {
+    /// Echo of config.toml's `tier`, written so the file reads on its own.
+    /// Declared but never read: config.toml is where a tier lives, and the
+    /// field exists so `deny_unknown_fields` accepts the key we emit.
+    #[allow(dead_code)]
+    pub tier: Option<Tier>,
     #[serde(default)]
     pub models: Vec<ModelEntry>,
 }
@@ -398,10 +470,16 @@ pub struct ProviderConfig {
     /// `expiration_date` on 8 of 419 models, and not on the promo we use), so
     /// the deadline is declared here.
     pub promo: Option<Promo>,
-    /// Remote billing endpoint for `pxy status --remote`. Two shapes are
-    /// recognized: OpenRouter's `data.{total_credits,total_usage}` (dollars)
-    /// and the OpenAI/new-api `total_usage` (cents).
+    /// Remote billing endpoint for `pxy status --remote`. Recognized shapes:
+    /// OpenRouter's `data.{total_credits,total_usage}` (dollars), new-api's
+    /// `data.{quota,used_quota}` (units of 1/500000 USD), and the OpenAI
+    /// dashboard's `total_usage` (cents).
     pub balance_url: Option<String>,
+    /// Credential for `balance_url` when it is NOT the chat credential, sent
+    /// RAW in `Authorization` (no `Bearer`). new-api gateways gate billing
+    /// behind a separate console-issued key — aihubmix calls it a Manage Key —
+    /// and answer 401 to the `sk-` inference key.
+    pub balance_key: Option<SecretRef>,
     /// Phase 2 media capabilities (images, audio, rerank, video).
     pub media: Option<MediaConfig>,
 }
@@ -508,6 +586,7 @@ impl ProviderConfig {
             tier: Tier::default(),
             promo: None,
             balance_url: None,
+            balance_key: None,
             media: None,
         }
     }
@@ -527,15 +606,16 @@ mod tests {
             max_output_tokens: 64000,
             format: Some(WireFormat::Anthropic),
             tool_call: Some(true),
+            free: None,
             force_stream: true,
             drop_params: Vec::new(),
         })];
         let mut cfg = Config {
             server: ServerConfig { port: 1, api_key: "k".into() },
             providers: BTreeMap::from([("p".to_string(), cfg_provider)]),
-            auto: AutoConfig::default(),
+            groups: BTreeMap::new(),
+            providers_whitelist: Vec::new(),
             launch: LaunchConfig::default(),
-            preferences: Preferences::default(),
             search: ServiceConfig::default(),
             fetch: ServiceConfig::default(),
             media: MediaDefaults::default(),
@@ -609,11 +689,13 @@ pub struct ModelSpec {
     pub max_output_tokens: u64,
     /// Override wire format for this model (e.g. copilot claude models)
     pub format: Option<WireFormat>,
-    /// Asserted tool-calling support, skipping discovery and probing. Set this
-    /// only from a real verified call — it exists because probing can't reach
-    /// some models (Z.AI allows one concurrent request, so a refresh sweep
-    /// gets 429s and would exclude a model that works).
+    /// Asserted tool-calling support, skipping discovery. Set this only from a
+    /// real verified call.
     pub tool_call: Option<bool>,
+    /// Whether the provider prices this model at zero, as discovery saw it.
+    /// DISPLAY METADATA — routing never reads it, so a wrong value costs a
+    /// misleading picker row and nothing else. `None` = nobody knows.
+    pub free: Option<bool>,
     /// Always request streaming upstream, even for a non-streaming client
     /// call; pxy collects the stream and returns ordinary JSON. For upstreams
     /// that error or time out without `stream: true` on some models
@@ -644,6 +726,7 @@ impl ModelEntry {
                 max_output_tokens: default_max_output(),
                 format: None,
                 tool_call: None,
+                free: None,
                 force_stream: false,
                 drop_params: Vec::new(),
             },
@@ -697,16 +780,8 @@ impl Default for Limits {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct AutoConfig {
-    /// Ordered candidates: "provider/model". First healthy with headroom wins.
-    #[serde(default)]
-    pub models: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 pub struct LaunchConfig {
-    /// Default model for launched agents (default: "auto")
+    /// Default model for launched agents — usually a group name.
     pub model: Option<String>,
     /// Cheap/background model for agents that want one (claude haiku slot)
     pub small_model: Option<String>,

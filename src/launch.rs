@@ -20,10 +20,10 @@ pub fn launch(
     extra_args: &[String],
 ) -> Result<()> {
     let catalog = Catalog::from_config(cfg);
-    let model = model
-        .map(String::from)
-        .or_else(|| cfg.launch.model.clone())
-        .unwrap_or_else(|| "auto".to_string());
+    let model = model.map(String::from).unwrap_or_else(|| cfg.default_route());
+    if model.is_empty() {
+        anyhow::bail!("no model to launch with: pass --model, or set [launch] model in config.toml");
+    }
 
     match agent {
         "claude" => launch_claude(cfg, &catalog, &model, dry_run, extra_args),
@@ -40,7 +40,7 @@ pub fn launch(
 /// The api key with the agent's name smuggled on as a `:agent` suffix. The
 /// server never validates the key (soft gate, loopback only) but does parse
 /// the suffix back out in client_ctx(), which is how per-model usage stats
-/// know WHICH agent asked for "auto". One mechanism for every agent — they
+/// know WHICH agent asked for a group. One mechanism for every agent — they
 /// all send the key, while only some can be taught a custom header.
 fn tagged_key(cfg: &Config, agent: &str) -> String {
     format!("{}:{agent}", cfg.server.api_key)
@@ -148,8 +148,12 @@ fn launch_opencode(
     extra_args: &[String],
 ) -> Result<()> {
     let mut models_map = Map::new();
-    if !catalog.resolve(cfg, "auto").is_empty() {
-        models_map.insert("auto".into(), json!({"name": "auto"}));
+    for (name, group) in catalog.groups() {
+        let (ctx, max_out) = crate::catalog::chain_limits(&group.chain);
+        models_map.insert(
+            name.clone(),
+            json!({"name": group.label, "limit": {"context": ctx, "output": max_out}}),
+        );
     }
     for cand in catalog.models() {
         models_map.insert(
@@ -291,14 +295,15 @@ fn merge_pi_models(
     };
 
     let mut models: Vec<Value> = Vec::new();
-    if !catalog.resolve(cfg, "auto").is_empty() {
+    for (name, group) in catalog.groups() {
+        let (ctx, max_out) = crate::catalog::chain_limits(&group.chain);
         models.push(json!({
-            "id": "auto",
-            "name": "auto",
+            "id": name,
+            "name": group.label,
             "reasoning": false,
             "input": ["text"],
-            "contextWindow": 128000,
-            "maxTokens": 16384,
+            "contextWindow": ctx,
+            "maxTokens": max_out,
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         }));
     }

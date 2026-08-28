@@ -3,103 +3,111 @@
 # Model ids below are real (sampled from the OmniRoute catalog, 2026-08-24) —
 # trim/extend per provider as you like. `pxy models` lists what's exposed.
 
+# Provider allowlist. Empty (or absent) = every enabled provider is exposed.
+# Non-empty = ONLY these are: their models are the whole catalog every picker
+# sees, group chains keep only the members that survive the filter, a group
+# left with nothing stops being advertised, and an explicit request for a
+# hidden provider routes nowhere. An entry matches a provider by exact name or
+# as a FAMILY PREFIX — "opencode-go" covers opencode-go-github and
+# opencode-go-google, and never matches an unrelated name that merely starts
+# with the same letters ("go" will not match "google"). An entry that matches
+# no provider is a hard error: a typo in an allowlist would otherwise fail
+# silently into a smaller catalog.
+#
+# MUST stay above [server]: TOML puts a bare key after a table header INSIDE
+# that table, and pxy would then reject it as an unknown [server] field.
+#
+# Allow only corporate gateways + Gemini:
+# providers_whitelist = ["opencode-zen", "opencode-go", "google"]
+providers_whitelist = []
+
 [server]
 port = 4100
 api_key = "pxy-local"   # soft gate; server binds 127.0.0.1 only
 
 # ---------------------------------------------------------------------------
-# The auto chain: ordered priority. First provider with limit headroom and no
-# cooldown wins; failures/limits walk down the list.
-# ---------------------------------------------------------------------------
-[auto]
-# Ordered priority. pxy skips candidates in cooldown / over limits / with too
-# small a context, then takes the first survivor. Design rules:
-#   * quality x throughput first, but never spend scarce quota when a cheap
-#     equal-quality pool is available;
+# GROUPS — named failover chains. A group name is itself a model id: an agent
+# launched with `--model free` walks [groups.free] in order, and the first
+# candidate with limit headroom, no cooldown and a big enough context serves
+# the request. Failures walk down the list.
+#
+# Groups are entirely hand-written. `pxy refresh --generate` regenerates
+# models.toml (every model of every provider, free and paid) and never touches
+# a chain — what spends money stays a decision, not a heuristic.
+#
+# Design rules, each of which is somebody's post-mortem:
 #   * providers are INTERLEAVED so one provider's 429 doesn't stall the chain;
-#   * every entry below is verified to do tool calling (agentic coding needs it);
-#   * opencode Go entries use only HIGH-ALLOWANCE models (see table below) —
-#     never kimi-k3 (110/5h), grok-4.5 (120), qwen3.8-max (160), glm-5.3 (220);
-#   * Copilot premium is LAST: 300 requests/month is the scarcest resource.
+#   * every entry is verified to do tool calling (agentic coding needs it);
+#   * the scarcest allowance goes LAST;
+#   * /v1/models advertises the MINIMUM context over a chain, so one
+#     small-window model at the tail tells agents the whole group holds 32k
+#     and breaks their auto-compaction. Keep a chain inside one context class.
+# ---------------------------------------------------------------------------
+
+# Zero cost, renewable. The default for everyday agent traffic.
+[groups.free]
+models = [
+  "zenmux/deepseek/deepseek-v4-flash-vision-exp-free", # 1M ctx, tool-calling verified 2026-08-25
+  "openrouter/stealth/ox-alpha",                       # frontier agentic coder, 1M ctx, 20rpm/1000day
+  "openrouter/minimax/minimax-m3:free",                # GMI promo, unlimited+free UNTIL SEP 6 2026 — remove after
+  "ollama/gpt-oss:120b",                               # ollama cloud free tier
+  "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", # 550B, 1M ctx
+  "mistral/devstral-latest",                           # free Experiment tier, agentic coder
+  "zai/glm-4.7-flash",                                 # permanently free, 59.2 SWE-bench; 1 concurrent (rpm 5)
+  "google/gemini-3-flash-preview",                     # AI Studio free tier direct, 1M ctx (trains on prompts)
+  "aihubmix/gemini-3.7-flash-free",                    # 2nd Gemini pool via aggregator, 1M ctx
+  "aihubmix/minimax-m3-free",                          # outlives the openrouter GMI promo
+  "aihubmix/ox-alpha",                                 # 4th ox-alpha pool, deep fallback
+  "kilocode/tencent/hy3:free",                         # hy3 pool #3 (295B reasoning)
+  "kilocode/minimax/minimax-m3:free",                  # M3 pool #4, 1M ctx
+  "agnes/agnes-2.5-flash",                             # free flash tier
+  "tokenharbor/mimo-v2.5:free",                        # tokenharbor free tier, tools verified 2026-08-26
+  "tokenharbor/deepseek-v4-flash:free",                # deepseek-v4-flash pool #4
+  "tokenharbor/qwen3.8-27b:free",                      # qwen3.8-27b pool #2
+]
+
+# Allowances already paid for. Unlimited/high-allowance pools first, the
+# scarcest last — an allowance spent by background traffic is one that isn't
+# there when it's wanted.
 #
 # opencode Go requests per 5h per account (x2 accounts), from the Go dashboard:
 #   ox-alpha-free INF | muse-spark 45,300 (needs data opt-in) | mimo-v2.5 30,100
 #   hy3 4,300 (8x usage => ~34,400) | longcat-2.0 11,400 | deepseek-v4-flash 7,600
 #   qwen3.7-plus 4,300 | minimax-m3 3,200 | kimi-k2.7-code 1,350 | glm-5.2 880
+[groups.subscription]
 models = [
-  # --- free frontier, zero cost, renewable ---
-  "zenmux/deepseek/deepseek-v4-flash-vision-exp-free",  # 1M ctx, tool-calling verified 2026-08-25
-  "openrouter/stealth/ox-alpha",                   # frontier agentic coder, 1M ctx, 20rpm/1000day
-  "openrouter/minimax/minimax-m3:free",            # GMI promo, unlimited+free UNTIL SEP 6 2026 — remove after
-  "opencode-zen/hy3-free",                         # Hunyuan 3 (295B reasoning)
-
-  # --- opencode Go subscriptions: unlimited / huge allowance models only ---
-  "opencode-go-github/ox-alpha-free",              # INFINITE requests
-  "opencode-go-google/ox-alpha-free",              # INFINITE requests
-  "opencode-go-github/hy3",                        # ~34,400 effective / 5h
+  "opencode-go-github/ox-alpha-free",  # INFINITE requests
+  "opencode-go-google/ox-alpha-free",  # INFINITE requests
+  "opencode-zen/hy3-free",             # Hunyuan 3 (295B reasoning)
+  "opencode-go-github/hy3",            # ~34,400 effective / 5h
   "opencode-go-google/hy3",
-
-  # --- other free renewables ---
-  "ollama/gpt-oss:120b",                           # ollama cloud free tier
-  "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",  # 550B, 1M ctx
-  "mistral/devstral-latest",                       # free Experiment tier, agentic coder
-  "zai/glm-4.7-flash",                             # permanently free, 59.2 SWE-bench; 1 concurrent (rpm 5)
-  "google/gemini-3-flash-preview",                 # AI Studio free tier direct, 1M ctx (trains on prompts)
-  "aihubmix/gemini-3.7-flash-free",                # 2nd Gemini pool via aggregator, 1M ctx
-  "aihubmix/minimax-m3-free",                      # outlives the openrouter GMI promo
-  "aihubmix/ox-alpha",                             # 4th ox-alpha pool, deep fallback
-  "kilocode/tencent/hy3:free",                     # hy3 pool #3 (295B reasoning)
-  "kilocode/minimax/minimax-m3:free",              # M3 pool #4, 1M ctx
-  "agnes/agnes-2.5-flash",                         # free flash tier
-  "tokenharbor/mimo-v2.5:free",                    # tokenharbor free tier, tools verified 2026-08-26
-  "tokenharbor/deepseek-v4-flash:free",            # deepseek-v4-flash pool #4
-  "tokenharbor/qwen3.8-27b:free",                  # qwen3.8-27b pool #2
-
-  # --- deeper Go fallbacks (still very high allowance) ---
-  "opencode-go-github/deepseek-v4-flash",          # 7,600 / 5h
-  "opencode-go-google/mimo-v2.5",                  # 30,100 / 5h
-
-  # --- finite free packs (spend after renewables; alibaba expires ~Nov 2026) ---
-  "tokenrouter/moonshotai/kimi-k3",                # 50M-token promo grant, tools verified
-  "inception/mercury-2",                           # 100M-token signup grant, >1000 tok/s diffusion
-  "tencent/glm-5.3",
-  "alibaba/qwen3.8-max",
-
-  # --- premium last: scarce, then the 0x model that never runs out ---
-  "github/claude-sonnet-4.6",                      # 300 premium requests/month
-  "github-free/gpt-5-mini",                        # 0x multiplier, unlimited floor
+  "opencode-go-github/deepseek-v4-flash", # 7,600 / 5h
+  "opencode-go-google/mimo-v2.5",         # 30,100 / 5h
+  "commandcode/deepseek/deepseek-v4-flash",
+  "github-free/gpt-5-mini",            # 0x multiplier, unlimited floor
+  "claude/claude-sonnet-5",            # Anthropic Pro/Max, 5h window
+  "claude/claude-opus-5",
+  "github/claude-sonnet-4.6",          # 300 premium requests/month — scarcest, so last
 ]
 
-# ---------------------------------------------------------------------------
-# `pxy refresh --write` generates the auto chain from FREE-tier providers only
-# (subscriptions, promotional balances and finite grants are manual-only), and
-# orders it by context bucket (widest first) -> open weights before proprietary
-# -> newest release date.
-#
-# `models` below is a TIE-BREAKER applied after all three: bare model names,
-# best first, no provider. It picks between models that come out equal on
-# context, openness and release date — it can never lift a narrower or older
-# model up the chain. Empty = the automatic order stands.
-# ---------------------------------------------------------------------------
-[preferences]
-models = []
-max_pools_per_model = 3
-# Chain length (with `models` empty, every candidate is "unranked"). 24 keeps
-# the whole chain inside the 1M-context bucket, which matters: /v1/models
-# advertises the MINIMUM context over the chain, so a tail of small-window
-# models would tell agents `auto` holds 32k and break their auto-compaction.
-max_unranked = 24
-# Listed by a provider but verified not to work — never let discovery re-add
-# these (checked 2026-08-25).
-deny = [
-  "kilo-auto/free",        # kilocode's router id errors on every call
-  "openrouter/free",       # same shape, same problem
-  "gpt-5.5-free",          # aihubmix lists it; it never routes
-  "ox-alpha",              # withdrawn from the free pools
+# Real money per token, prepaid balances, and finite grants that do not renew.
+# Reach for this deliberately; nothing should drain it in the background.
+[groups.payperuse]
+name = "Pay Per Use"   # pickers show this; the routable id stays "payperuse"
+models = [
+  "tokenrouter/moonshotai/kimi-k3", # 50M-token promo grant, tools verified
+  "inception/mercury-2",            # 100M-token signup grant, >1000 tok/s diffusion
+  "tencent/glm-5.3",
+  "alibaba/qwen3.8-max",
+  "kiro/claude-sonnet-4.5",         # Amazon Q free-tier grant
+  "kimi-coding/k3",
+  "agentrouter/claude-opus-5",      # prepaid balance that drains
+  "gorouter/claude-opus-5",
+  "tabitoken/claude-opus-5",
 ]
 
 [launch]
-model = "auto"
+model = "free"
 small_model = "github-free/gpt-5-mini"
 
 # ---------------------------------------------------------------------------
@@ -110,7 +118,7 @@ small_model = "github-free/gpt-5-mini"
 # OAuth credential (~/.claude/.credentials.json). pxy reads the file fresh
 # per request and writes refreshed tokens back (rotating refresh tokens, so
 # the write-back is what keeps pxy and the CLI from fighting).
-# RESERVE tier: never generated into [auto] — manual selection only
+# RESERVE tier: in [groups.subscription] only — manual selection otherwise
 # ("claude/<model>"). Non-Claude-Code clients get the CC system sentinel
 # prepended automatically (the OAuth endpoint requires it).
 [providers.claude]
@@ -250,7 +258,7 @@ models = [
   # cloaked frontier model, free while in stealth (prompts likely used for training)
   { id = "stealth/ox-alpha", context_length = 1000000 },
   # GMI Cloud promo: unlimited + free Aug 24 - Sep 6 2026, served by GMICloud.
-  # Tool calling verified 2026-08-25. REMOVE from [auto] after Sep 6 (goes paid).
+  # Tool calling verified 2026-08-25. REMOVE from [groups.free] after Sep 6 (goes paid).
   { id = "minimax/minimax-m3:free", context_length = 1048576 },
   { id = "minimax/minimax-m2.7:free", context_length = 196608 },
   { id = "z-ai/glm-5.2:free", context_length = 256000 },
@@ -284,6 +292,14 @@ reset_tz = "UTC"
 [providers.aihubmix]
 base_url = "https://aihubmix.com/v1/chat/completions"
 api_key = { pass = "AI/aihubmix/main" }
+# Account balance in the panel. aihubmix runs new-api, whose console API gates
+# billing behind a separate "Manage Key" — the sk- inference key gets a flat
+# 401 from /api/user/self, and its OpenAI-compat shim
+# (/dashboard/billing/subscription) reports a placeholder hard_limit_usd of
+# 0.01, not the real balance. Create one under the aihubmix console's API/Key
+# settings, `pass insert AI/aihubmix/manage`, then uncomment:
+# balance_url = "https://aihubmix.com/api/user/self"
+# balance_key = { pass = "AI/aihubmix/manage" }   # sent RAW, no Bearer
 models = [
   { id = "ox-alpha", context_length = 1000000 },
   { id = "gemini-3.7-flash-free", context_length = 1000000 },
@@ -300,7 +316,7 @@ models = [
 # switch), so the guard is client-side: daily_tokens 50k across only cheap
 # models (output <= $1.32/M) is worst-case ~6k neurons ≈ 60% of the free
 # allocation — never bills. kimi-k2.7-code and glm-5.2 deliberately EXCLUDED
-# ($4+/M output would blow the allocation). KEEP OUT of [auto]: agentic
+# ($4+/M output would blow the allocation). KEEP OUT of every group: agentic
 # traffic would eat the cap instantly; manual/overflow use only.
 # Account id from the old OmniRoute db (provider_connections). Tool calling
 # verified on all included models 2026-08-25.
@@ -374,7 +390,7 @@ base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 balance_url = "https://opencode.ai/zen/go/v1/usage"
 api_key = { pass = "AI/opencode-go/github" }
 models = [
-  # High-allowance picks only (per-5h caps in the [auto] comment above).
+  # High-allowance picks only (per-5h caps in the [groups.subscription] comment above).
   "ox-alpha-free",
   "hy3",
   "mimo-v2.5",
@@ -384,7 +400,7 @@ models = [
   "qwen3.7-plus",
   "kimi-k2.7-code",
   "glm-5.2",
-  # Deliberately NOT in [auto] (tiny allowances): kimi-k3 110/5h,
+  # Deliberately NOT in a group (tiny allowances): kimi-k3 110/5h,
   # grok-4.5 120, qwen3.8-max 160, glm-5.3 220.
   "kimi-k3",
   "glm-5.3",
@@ -398,7 +414,7 @@ base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 balance_url = "https://opencode.ai/zen/go/v1/usage"
 api_key = { pass = "AI/opencode-go/google" }
 models = [
-  # High-allowance picks only (per-5h caps in the [auto] comment above).
+  # High-allowance picks only (per-5h caps in the [groups.subscription] comment above).
   "ox-alpha-free",
   "hy3",
   "mimo-v2.5",
@@ -408,7 +424,7 @@ models = [
   "qwen3.7-plus",
   "kimi-k2.7-code",
   "glm-5.2",
-  # Deliberately NOT in [auto] (tiny allowances): kimi-k3 110/5h,
+  # Deliberately NOT in a group (tiny allowances): kimi-k3 110/5h,
   # grok-4.5 120, qwen3.8-max 160, glm-5.3 220.
   "kimi-k3",
   "glm-5.3",
@@ -487,7 +503,7 @@ models = [
 # ZenMux — has 8 zero-priced models (catalog probe 2026-08-24), notably
 # z-ai/glm-5.3-free with 1M context. NOTE: current key returns 403 on ALL
 # generation calls (verified independently via OmniRoute too) — the account
-# needs a new key or re-verification at zenmux.ai. Kept out of [auto] until
+# needs a new key or re-verification at zenmux.ai. Kept out of the groups until
 # the key works.
 # UPDATE 2026-08-24: new key + $5 balance -> all free models verified working.
 [providers.zenmux]
@@ -495,7 +511,7 @@ base_url = "https://zenmux.ai/api/v1/chat/completions"
 api_key = { pass = "AI/zenmux/main" }
 # NOTE 2026-08-25: z-ai/glm-5.3-free was DELISTED by zenmux — their free list
 # churns; re-check `curl zenmux.ai/api/v1/models` occasionally. (Upstream 404s
-# now fail over in [auto] instead of killing the chain, fixed 2026-08-25.)
+# now fail over inside a group instead of killing the chain, fixed 2026-08-25.)
 models = [
   { id = "deepseek/deepseek-v4-flash-vision-exp-free", context_length = 1000000 },
   { id = "sapiens-ai/agnes-2.5-flash", context_length = 524288 },
@@ -572,7 +588,7 @@ daily_requests = 20
 default = "Cherry"
 
 # Fireworks — PAID serverless (pay per token; $1 signup credit only, 10 rpm
-# without a payment method). Kept OUT of [auto] deliberately: it spends real
+# without a payment method). Kept OUT of [groups.free] deliberately: it spends real
 # money. Cheap picks: gpt-oss-120b $0.15/$0.60 per M, deepseek-v4-flash
 # $0.14/$0.28. Fully-qualified model ids required.
 [providers.fireworks]
@@ -595,7 +611,7 @@ rpm = 10
 # agentrouter speaks Anthropic messages natively (docs/06). Its WAF rejects
 # unknown clients ("unauthorized client detected") — a claude-cli User-Agent
 # is the minimal passing fingerprint (probed 2026-08-24). PAID balance
-# (prepaid credits) — kept OUT of [auto]; premium manual-use reserve.
+# (prepaid credits) — [groups.payperuse] only; premium manual-use reserve.
 [providers.agentrouter]
 tier = "reserve"
 format = "anthropic"
@@ -638,7 +654,7 @@ models = [
 # ⚠️ Injects a ~7k-token hidden system prompt billed to us on EVERY call — fine
 # for real coding sessions, wasteful for tiny calls. Their billing endpoint
 # returns dummy limits, so no remote balance readout. PAID balance — kept OUT
-# of [auto]; premium manual-use reserve.
+# of [groups.free]; premium manual-use reserve.
 [providers.tabitoken]
 tier = "reserve"
 format = "anthropic"
@@ -656,7 +672,7 @@ models = [
 
 # GoRouter — same operator as tabitoken (identical WAF, model list, ~7k prompt
 # injection, `kiro_credits` leak). $70 referral credits (2026-08-25). Same
-# caveats apply. PAID balance — kept OUT of [auto]; premium manual-use reserve.
+# caveats apply. PAID balance — [groups.payperuse] only; premium manual-use reserve.
 [providers.gorouter]
 tier = "reserve"
 format = "anthropic"
@@ -747,9 +763,9 @@ video_models = ["agnes-video-v2.0", "agnes-video-2.5-flash", "agnes-video-2.5"]
 # balance=0 quota error). Re-swept 2026-08-28: SIX models now answer at zero
 # balance, up from just mimo-v2.5 in the 08-24 sweep. All six tool call in both
 # streaming and non-streaming, and vision-exp reads images. Free tier, so they
-# are auto-chain candidates — safely: b.ai's /v1/models reports no pricing and
-# no :free suffix, so discovery can never promote the deposit-gated catalogue,
-# and only the hand-listed ids below become candidates.
+# are good [groups.free] candidates — safely: b.ai's /v1/models reports no
+# pricing and no :free suffix, so the generated catalogue can never claim the
+# deposit-gated models are free.
 # The rate limit is ACCOUNT-WIDE, not per-model — saturating deepseek-v4-flash
 # 429s hy3/qwen/mimo in the same breath — which is exactly the shape of pxy's
 # per-provider rpm gate. Measured ~10 req/min on a sliding window, empty-body
@@ -912,7 +928,7 @@ rpm = 40
 # api_key = { pass = "AI/vercel-gateway/main" }
 # models = ["anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-flash"]
 
-# 5) Groq — ACTIVE 2026-08-25 as a SHORT-CALL sidecar, NEVER in [auto].
+# 5) Groq — ACTIVE 2026-08-25 as a SHORT-CALL sidecar, NEVER in a group.
 #    Verified from live headers: gpt-oss/qwen = 1000 req/day but 8K TPM —
 #    context_length below is set to 8192 ON PURPOSE so pxy rejects bigger
 #    requests locally instead of upstream request_too_large. compound(-mini)
@@ -931,7 +947,7 @@ rpm = 40
 # from ListAvailableModels. Credit cost scales with rateMultiplier, so the
 # cheap models go a very long way (qwen3-coder-next 0.05x, minimax-m2.1 0.15x,
 # deepseek-3.2/minimax-m2.5 0.25x, haiku 0.4x, glm-5 0.5x, sonnet-4.5 1.3x).
-# NOT in [auto]: 50 credits/month is scarcer than every free pool above.
+# NOT in a group: 50 credits/month is scarcer than every free pool above.
 [providers.kiro]
 tier = "finite"
 kind = "kiro"
@@ -962,7 +978,7 @@ reset_tz = "UTC"
 # STATUS 2026-08-25: account credits EXHAUSTED ("Credits used up" from
 # /coding/v1/usages) — chat + /models return bare 500s while in this state
 # (Kimi's error hygiene is poor). Auth/refresh verified working end-to-end.
-# Keep OUT of [auto] until a quota reset makes calls succeed.
+# Keep OUT of the groups until a quota reset makes calls succeed.
 [providers.kimi-coding]
 tier = "finite"
 kind = "kimi-coding"
@@ -1052,7 +1068,7 @@ transcription_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
 #    tier, and a card IS on file, so every call bills real money. Key verified
 #    working (secret key = Bearer, access key id line 2 of pass entry; 4 chat
 #    models + whisper + embeddings all fine) — kept in pass, re-enable only
-#    deliberately as a PAID provider, never in [auto].
+#    deliberately as a PAID provider, never in a group.
 # [providers.scaleway]
 # base_url = "https://api.scaleway.ai/v1/chat/completions"
 # api_key = { pass = "AI/scaleway/main" }
@@ -1067,7 +1083,7 @@ transcription_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
 # total_tokens = 1000000
 
 # 8) Cerebras — ~3000 tok/s but free tier is capped at 8K CONTEXT and 5 RPM.
-#    Use for commit messages / classification only. NEVER put in [auto].
+#    Use for commit messages / classification only. NEVER put in a group.
 # [providers.cerebras]
 # base_url = "https://api.cerebras.ai/v1/chat/completions"
 # api_key = { pass = "AI/cerebras/main" }

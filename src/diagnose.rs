@@ -39,10 +39,10 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
         .as_deref()
         .map(|p| catalog.resolve(cfg, p).iter().map(|c| c.full_id()).collect())
         .unwrap_or_default();
-    let is_auto = requested == "auto" || requested == "claude/auto";
+    let is_group = catalog.is_group(requested);
     // A stale pin (resolve_candidates ignored it) must not be reported as
     // steering the walk: when active, the pin leads — so check the head.
-    let pin_active = is_auto
+    let pin_active = is_group
         && candidates.first().is_some_and(|c| pinned_ids.contains(&c.full_id()));
     if candidates.is_empty() {
         if json {
@@ -65,7 +65,7 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                 "'{requested}' -> {} candidate(s) (pin '{p}' first), walked in order:\n",
                 candidates.len()
             ),
-            (Some(p), false) if is_auto => println!(
+            (Some(p), false) if is_group => println!(
                 "'{requested}' -> {} candidate(s); pin '{p}' is STALE (not in the catalog), walked in chain order:\n",
                 candidates.len()
             ),
@@ -112,12 +112,17 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                     notes.push(format!("rpm cap {rpm} (live window unknown outside the daemon)"));
                 }
                 if cand.model.tool_call == Some(false) {
-                    notes.push("tool_call=false: skipped for tools requests in auto".into());
+                    notes.push("tool_call=false: skipped for tools requests in a group".into());
                 }
                 notes.push(format!(
-                    "ctx {}k, max_out {}k",
+                    "ctx {}k, max_out {}k{}",
                     cand.model.context_length / 1000,
-                    cand.model.max_output_tokens / 1000
+                    cand.model.max_output_tokens / 1000,
+                    match cand.model.free {
+                        Some(true) => ", free",
+                        Some(false) => ", paid",
+                        None => "",
+                    }
                 ));
             }
             Some(_) => skips.push("provider disabled".into()),
@@ -132,6 +137,7 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                 "id": cand.full_id(),
                 "provider": cand.provider,
                 "model": cand.model.id,
+                "free": cand.model.free,
                 "pinned": pinned,
                 "eligible": eligible,
                 "skips": skips,
@@ -286,18 +292,18 @@ pub async fn doctor(cfg_path: &std::path::Path) -> Result<()> {
         }
         r.ok("credentials", format!("{resolved} provider credential(s) resolve"));
 
-        // 5. generated.toml freshness.
-        let gen_path = crate::config::generated_path(cfg_path);
+        // 5. models.toml freshness.
+        let gen_path = crate::config::models_path(cfg_path);
         match std::fs::metadata(&gen_path).and_then(|m| m.modified()) {
             Ok(t) => {
                 let age = t.elapsed().map(|d| d.as_secs() / 86_400).unwrap_or(0);
                 if age > 14 {
-                    r.warn("generated", format!("{age} days old — consider `pxy refresh --write`"));
+                    r.warn("models", format!("{age} days old — consider `pxy refresh --generate`"));
                 } else {
-                    r.ok("generated", format!("{age} day(s) old"));
+                    r.ok("models", format!("{age} day(s) old"));
                 }
             }
-            Err(_) => r.warn("generated", "missing — `pxy refresh --write` never run"),
+            Err(_) => r.warn("models", "missing — `pxy refresh --generate` never run"),
         }
     }
 

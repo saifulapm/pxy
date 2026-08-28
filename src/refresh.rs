@@ -3,10 +3,11 @@
 //! Two catalogs answer two different questions and neither answers both:
 //!   * a provider's `/models` says what THIS ACCOUNT may call (ids, availability,
 //!     and — for the richer gateways — pricing that proves free-ness);
-//!   * models.dev says what a model DOES (tool calling, context, cost) and covers
-//!     ~94% of what we configure, including every entry currently in `auto`.
-//! Joining them leaves only a small remainder that needs a live probe, so probing
-//! is a fallback rather than the mechanism.
+//!   * models.dev says what a model DOES (tool calling, context) and covers ~94%
+//!     of what we configure.
+//! Joining them is the whole mechanism: `--generate` writes `models.toml` with
+//! EVERY model of every provider, free and paid alike, and the groups that
+//! decide what actually gets routed stay hand-written in config.toml.
 //!
 //! Hard rules, each of which is somebody's post-mortem:
 //!   * **Absence is not death.** A model missing from a listing is REPORTED, never
@@ -29,14 +30,11 @@ use serde_json::Value;
 
 use crate::config::{Config, ProviderConfig, Tier};
 use crate::secrets::Secrets;
-use crate::state::State;
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 /// Reject an upstream catalog that looks truncated rather than overwriting a
 /// good one with it (litellm's poison-pill guard).
 const MIN_MODELS_DEV_ENTRIES: usize = 500;
-/// How long a "does not support tools" verdict is trusted before re-probing.
-const NEGATIVE_PROBE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Tri-state. `Unknown` is a real answer and must survive as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +59,16 @@ impl Tri {
             Tri::Unknown => "?",
         }
     }
+    /// Back to an Option for the generated file. `Unknown` writes NOTHING —
+    /// the key is absent, not `false`: OmniRoute shipped `tools: bool` with
+    /// `false` doubling as unknown and had to bump their schema to undo it.
+    fn as_opt(self) -> Option<bool> {
+        match self {
+            Tri::Yes => Some(true),
+            Tri::No => Some(false),
+            Tri::Unknown => None,
+        }
+    }
 }
 
 /// Capability facts for one canonical model name.
@@ -68,10 +76,6 @@ impl Tri {
 pub struct Caps {
     pub tool_call: Option<bool>,
     pub context: Option<u64>,
-    /// `YYYY-MM-DD` (occasionally `YYYY-MM`). Orders `auto` by recency.
-    pub release_date: Option<String>,
-    /// Open-weight models are preferred inside a context bucket.
-    pub open_weights: Option<bool>,
 }
 
 /// One model as offered by one provider.
@@ -136,8 +140,6 @@ pub async fn fetch_capabilities(http: &reqwest::Client) -> Result<HashMap<String
             let caps = Caps {
                 tool_call: rec["tool_call"].as_bool(),
                 context: rec["limit"]["context"].as_u64(),
-                release_date: rec["release_date"].as_str().map(str::to_string),
-                open_weights: rec["open_weights"].as_bool(),
             };
             // First writer wins: providers are iterated in a stable order and
             // the facts are about the MODEL, not the reseller.
@@ -271,7 +273,7 @@ pub async fn discover(
 /// Context window for one discovered record, across the id spellings gateways
 /// use. A ZERO window is not a window, it is a missing one: aihubmix lists
 /// image models (gpt-image-2-free) with a null `context_length` and the
-/// models.dev fallback answers 0. Left as `Some(0)` that reaches generated.toml
+/// models.dev fallback answers 0. Left as `Some(0)` that reaches models.toml
 /// verbatim, and pi rejects the whole pxy provider over it ("invalid
 /// contextWindow"). Reporting `None` instead lets the caller apply
 /// `default_context()`, exactly as for a provider that omits the field.
@@ -292,7 +294,7 @@ fn snippet(s: &str) -> String {
     }
 }
 
-/// Discover, report, and (when `write`) generate `generated.toml`.
+/// Discover, report, and (when `write`) generate `models.toml`.
 pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::path::Path) -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -313,10 +315,19 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
 
     let mut stale: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
-    let mut new_free: BTreeMap<String, Vec<Discovered>> = BTreeMap::new();
+    let mut ungrouped: BTreeMap<String, Vec<Discovered>> = BTreeMap::new();
     let mut pools: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut found: BTreeMap<String, Vec<Discovered>> = BTreeMap::new();
     let (mut n_ok, mut n_models) = (0usize, 0usize);
+
+    // Every "provider/model" that some group already routes to. Discovery's
+    // job is to surface what ISN'T in a chain yet — a free, tool-capable model
+    // nobody put in a group is the one actionable finding this command has.
+    let grouped: BTreeSet<&str> = cfg
+        .groups
+        .values()
+        .flat_map(|g| g.models.iter().map(String::as_str))
+        .collect();
 
     for (name, pcfg) in &cfg.providers {
         if !pcfg.enabled {
@@ -372,22 +383,21 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
                             .insert(name.clone());
                     }
                 }
-                // Free + tool-capable + not already configured = candidates.
+                // Free + tool-capable + in no group yet = worth adding to one.
                 let all = models.clone();
                 let cands: Vec<Discovered> = models
                     .into_iter()
                     .filter(|m| {
                         m.free == Tri::Yes
                             && m.tool_call == Tri::Yes
-                            && !configured.contains(&m.id)
+                            && !grouped.contains(format!("{name}/{}", m.id).as_str())
                     })
                     .collect();
                 if !cands.is_empty() {
-                    new_free.insert(name.clone(), cands);
+                    ungrouped.insert(name.clone(), cands);
                 }
-                // Keep the FULL list: a model already in config.toml still needs
-                // its discovered capability data, or generation would re-probe
-                // something models.dev already answered.
+                // Keep the FULL list — free and paid alike: it is what gets
+                // written to models.toml.
                 found.insert(name.clone(), all);
             }
         }
@@ -416,9 +426,9 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
         );
     }
 
-    // Which canonical models are served by more than one provider. This is the
-    // ground truth a bare-name preference list resolves against, so it belongs
-    // in the report: it shows what "kimi-k3" would actually match.
+    // Which canonical models are served by more than one provider — the pools
+    // to interleave when hand-writing a group, so one provider's 429 doesn't
+    // stall the chain.
     if !pools.is_empty() {
         let mut multi: Vec<(&String, &BTreeSet<String>)> =
             pools.iter().filter(|(_, v)| v.len() > 1).collect();
@@ -437,9 +447,9 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
         }
     }
 
-    let total_new: usize = new_free.values().map(|v| v.len()).sum();
-    println!("\nfree + tool-capable, not yet configured ({total_new}):");
-    for (prov, models) in &new_free {
+    let total_new: usize = ungrouped.values().map(|v| v.len()).sum();
+    println!("\nfree + tool-capable, in no group ({total_new}):");
+    for (prov, models) in &ungrouped {
         let mut sorted = models.clone();
         sorted.sort_by_key(|m| std::cmp::Reverse(m.context.unwrap_or(0)));
         for m in sorted.iter().take(6) {
@@ -457,14 +467,14 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
     }
 
     if !write {
-        println!("\n(dry run — nothing written. Use `pxy refresh --write` to generate.)");
+        println!("\n(dry run — nothing written. Use `pxy refresh --generate` to write models.toml.)");
         return Ok(());
     }
-    // Generating from degraded discovery would shrink the chain to whatever
+    // Generating from degraded discovery would shrink the catalog to whatever
     // happened to work this minute, and the shrunken file would then be loaded
     // as truth. Credential failures (a locked gpg agent takes out EVERY
     // provider at once) or a high failure rate abort the write; the previous
-    // generated.toml stays in force.
+    // models.toml stays in force.
     let cred_failures = failures
         .iter()
         .filter(|(_, why)| why.starts_with("credential:"))
@@ -473,33 +483,37 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
         anyhow::bail!(
             "refusing to write: {} discovery failure(s), {} credential-related \
              (locked gpg agent?). Fix access and rerun; the existing \
-             generated.toml is untouched.",
+             models.toml is untouched.",
             failures.len(),
             cred_failures
         );
     }
-    generate(cfg, secrets, &http, found, &caps, out_path).await
+    generate(cfg, found, out_path)
 }
 
-/// Build and write `generated.toml`.
-async fn generate(
+/// One generated model row — everything `models.toml` records about a model.
+struct Row {
+    id: String,
+    context: u64,
+    tool_call: Option<bool>,
+    free: Option<bool>,
+}
+
+/// Build and write `models.toml`: for every enabled provider, the UNION of its
+/// hand-written models and everything discovery listed — free and paid alike.
+/// Groups are never touched. What actually gets routed is a hand-written
+/// decision, and a generator able to rewrite a chain is a generator able to
+/// spend money.
+fn generate(
     cfg: &Config,
-    secrets: &Secrets,
-    http: &reqwest::Client,
     discovered: BTreeMap<String, Vec<Discovered>>,
-    caps: &HashMap<String, Caps>,
     out_path: &std::path::Path,
 ) -> Result<()> {
-    let state = State::open(&crate::config::data_dir().join("state.sqlite"))?;
     let today = today();
-    let prefs = &cfg.preferences;
-    let rank_of = |canon: &str| prefs.models.iter().position(|p| canonical(p) == canon);
 
     println!("\n── generating ──");
 
-    let mut per_provider: BTreeMap<String, Vec<(String, u64, Option<bool>)>> = BTreeMap::new();
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut probed = 0usize;
+    let mut per_provider: BTreeMap<String, (Tier, Vec<Row>)> = BTreeMap::new();
     let mut dropped_promo: Vec<String> = Vec::new();
 
     for (name, pcfg) in &cfg.providers {
@@ -508,377 +522,131 @@ async fn generate(
         }
         // Start from what config.toml already has. Never lose a hand-added
         // model: discovery can omit one that works.
-        let mut models: BTreeMap<String, u64> = pcfg
+        let mut rows: BTreeMap<String, Row> = pcfg
             .models
             .iter()
             .map(|m| {
                 let s = m.spec();
-                (s.id, s.context_length)
-            })
-            .collect();
-        // Hand-asserted capability wins over both discovery and probing.
-        let asserted: HashMap<String, bool> = pcfg
-            .models
-            .iter()
-            .filter_map(|m| {
-                let s = m.spec();
-                s.tool_call.map(|t| (s.id, t))
+                let row = Row {
+                    id: s.id.clone(),
+                    context: s.context_length,
+                    tool_call: s.tool_call,
+                    free: s.free,
+                };
+                (s.id, row)
             })
             .collect();
 
         // Drop expired promo models wherever they came from.
-        if let Some(promo) = &pcfg.promo {
-            if promo.is_expired(&today) {
-                for id in &promo.models {
-                    if models.remove(id).is_some() {
-                        dropped_promo.push(format!("{name}/{id}"));
-                    }
-                }
+        let promo = pcfg.promo.as_ref().filter(|p| p.is_expired(&today));
+        for id in promo.iter().flat_map(|p| &p.models) {
+            if rows.remove(id).is_some() {
+                dropped_promo.push(format!("{name}/{id}"));
             }
         }
 
         for d in discovered.get(name).into_iter().flatten() {
-            // Only free models are auto-added. The full discovery list is kept
-            // for capability lookups, but unioning it wholesale would pull a
-            // provider's entire paid catalogue into the exposed model list.
-            if d.free != Tri::Yes {
+            if promo.is_some_and(|p| p.models.contains(&d.id)) {
                 continue;
             }
-            if pcfg
-                .promo
-                .as_ref()
-                .is_some_and(|p| p.is_expired(&today) && p.models.contains(&d.id))
-            {
-                continue;
-            }
-            // `or_insert`, not `insert`: for a model config.toml already lists,
-            // the hand-written ModelSpec wins WHOLESALE at load time
-            // (Config::apply_generated), so writing the discovered window here
-            // would record a number the router never uses — and `auto` is now
-            // ordered by context, so it would order the chain by fiction.
-            // aihubmix lists coding-kimi-k3-free at 1M; the curated entry pins
-            // it to 262k, and 262k is what a request gets.
-            models
-                .entry(d.id.clone())
-                .or_insert_with(|| d.context.unwrap_or(crate::config::default_context()));
-        }
-
-        // Candidates for `auto`: FREE pools only. Subscriptions have an
-        // allowance somebody paid for (opencode Go), reserves are real money or
-        // promotional balances that drain (agentrouter, gorouter), and finite
-        // grants don't renew — none of them belong in the default route, so no
-        // ranking can put them there.
-        if pcfg.tier == Tier::Free {
-            for (id, ctx) in &models {
-                let canon = canonical(id);
-                let rank = rank_of(&canon);
-                // Only rank-worthy models are worth a probe.
-                let known = discovered
-                    .get(name)
-                    .and_then(|v| v.iter().find(|d| &d.id == id))
-                    .map(|d| d.tool_call)
-                    .unwrap_or(Tri::Unknown);
-                let known = match asserted.get(id) {
-                    Some(true) => Tri::Yes,
-                    Some(false) => Tri::No,
-                    None => known,
-                };
-                let tools = match known {
-                    Tri::Unknown if rank.is_some() => {
-                        probed += 1;
-                        probe_tool_calling(name, pcfg, id, secrets, &state, http).await
-                    }
-                    other => other,
-                };
-                // Unknown is NOT eligible. An optimistic default here is
-                // exactly the bug OmniRoute shipped.
-                if tools != Tri::Yes {
-                    continue;
+            match rows.get_mut(&d.id) {
+                // A hand-written entry is authoritative at load time
+                // (Config::apply_generated takes the curated spec WHOLESALE),
+                // so discovery may only fill in the facts it left blank.
+                // Overwriting the window with the discovered one would record a
+                // number the router never uses: aihubmix lists
+                // coding-kimi-k3-free at 1M, the curated entry pins it to 262k,
+                // and 262k is what a request gets.
+                Some(row) => {
+                    row.tool_call = row.tool_call.or(d.tool_call.as_opt());
+                    row.free = row.free.or(d.free.as_opt());
                 }
-                let known = caps.get(&canon);
-                candidates.push(Candidate {
-                    provider: name.clone(),
-                    id: id.clone(),
-                    context: *ctx,
-                    // Unknown openness is NOT openness: an unlabelled model
-                    // sorts with the proprietary ones rather than jumping the
-                    // queue on a missing field.
-                    open_weights: known.and_then(|c| c.open_weights).unwrap_or(false),
-                    release: known.and_then(|c| c.release_date.clone()),
-                    canonical: canon,
-                    rank,
-                });
+                None => {
+                    rows.insert(
+                        d.id.clone(),
+                        Row {
+                            id: d.id.clone(),
+                            context: d.context.unwrap_or(crate::config::default_context()),
+                            tool_call: d.tool_call.as_opt(),
+                            free: d.free.as_opt(),
+                        },
+                    );
+                }
             }
         }
-        per_provider.insert(
-            name.clone(),
-            models
-                .into_iter()
-                .map(|(id, ctx)| {
-                    let a = asserted.get(&id).copied();
-                    (id, ctx, a)
-                })
-                .collect(),
-        );
+        per_provider.insert(name.clone(), (pcfg.tier, rows.into_values().collect()));
     }
 
-    // Widest context bucket first, open weights before proprietary inside a
-    // bucket, then newest release. The preference list is the LAST word, not
-    // the first: it breaks ties between models that are otherwise equivalent
-    // instead of overriding the automatic order.
-    candidates.sort_by(|a, b| {
-        context_bucket(b.context)
-            .cmp(&context_bucket(a.context))
-            .then(b.open_weights.cmp(&a.open_weights))
-            // `None` (models.dev doesn't know the model) sorts last, because
-            // reversing the comparison puts the smaller `None` at the end.
-            .then(b.release.cmp(&a.release))
-            .then(a.rank.is_none().cmp(&b.rank.is_none()))
-            .then(a.rank.cmp(&b.rank))
-            .then(a.provider.cmp(&b.provider))
-            .then(a.id.cmp(&b.id))
-    });
-
-    // Cap pools per model so one popular model can't crowd out the chain, and
-    // bound the unranked tail so `auto` stays preference-driven.
-    let denied: BTreeSet<String> = prefs.deny.iter().map(|d| canonical(d)).collect();
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut unranked = 0usize;
-    let auto: Vec<Candidate> = candidates
-        .into_iter()
-        .filter(|c| {
-            if denied.contains(&c.canonical) || prefs.deny.contains(&c.id) {
-                return false;
-            }
-            if c.rank.is_none() {
-                unranked += 1;
-                if unranked > prefs.max_unranked {
-                    return false;
-                }
-            }
-            let n = seen.entry(c.canonical.clone()).or_insert(0);
-            *n += 1;
-            *n <= prefs.max_pools_per_model
-        })
-        .collect();
-
-    let unmatched: Vec<&String> = prefs
-        .models
-        .iter()
-        .filter(|p| {
-            let c = canonical(p);
-            !auto.iter().any(|a| a.canonical == c)
-        })
-        .collect();
-
-    let body = render_generated(&per_provider, &auto, &today);
+    let body = render_generated(&per_provider, &today);
     std::fs::write(out_path, &body)
         .with_context(|| format!("writing {}", out_path.display()))?;
 
-    let total: usize = per_provider.values().map(|v| v.len()).sum();
-    println!("probed {probed} model(s) for tool calling (results cached)");
+    let rows = || per_provider.values().flat_map(|(_, v)| v.iter());
+    let total = rows().count();
+    let free = rows().filter(|r| r.free == Some(true)).count();
     if !dropped_promo.is_empty() {
         println!("dropped {} expired promo model(s):", dropped_promo.len());
         for d in &dropped_promo {
             println!("  {d}");
         }
     }
-    if !unmatched.is_empty() {
-        println!("preferences with no eligible pool ({}):", unmatched.len());
-        for u in &unmatched {
-            println!("  {u}");
-        }
-    }
     println!(
-        "wrote {} — {} models across {} providers, auto chain of {}",
+        "wrote {} — {total} models across {} providers ({free} priced at zero). \
+         Groups in config.toml are unchanged.",
         out_path.display(),
-        total,
         per_provider.len(),
-        auto.len()
     );
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2: probing the gap models.dev can't answer
+// Rendering
 // ---------------------------------------------------------------------------
-
-/// Ask a model to call a trivial tool. Only used when capability data is
-/// missing AND the model is a candidate for `auto`, so the cost stays tiny.
-/// A result is cached forever: a model's tool support doesn't change.
-async fn probe_tool_calling(
-    prov: &str,
-    cfg: &ProviderConfig,
-    model_id: &str,
-    secrets: &Secrets,
-    state: &State,
-    http: &reqwest::Client,
-) -> Tri {
-    let key = format!("probe:tools:{prov}/{model_id}");
-    if let Ok(Some(v)) = state.kv_get(&key) {
-        let (verdict, at) = v.split_once('@').unwrap_or((v.as_str(), "0"));
-        let age = now_secs().saturating_sub(at.parse().unwrap_or(0));
-        match verdict {
-            // Capability is intrinsic, so a YES never needs rechecking.
-            "yes" => return Tri::Yes,
-            // A NO expires. Free pools degrade and recover (aihubmix's
-            // gemini-3.7-flash tool-called in the morning and stopped by the
-            // afternoon), so a permanent negative would bury a model that
-            // came back.
-            "no" if age < NEGATIVE_PROBE_TTL_SECS => return Tri::No,
-            _ => {}
-        }
-    }
-    let Some(url) = cfg.base_url.clone() else {
-        return Tri::Unknown;
-    };
-    let mut req = http.post(&url).header("content-type", "application/json");
-    if let Some(sref) = cfg.api_key.as_ref().or(cfg.credentials.as_ref()) {
-        match secrets.resolve_key(sref) {
-            Ok(k) => req = req.header("authorization", format!("Bearer {k}")),
-            Err(_) => return Tri::Unknown,
-        }
-    }
-    for (k, v) in &cfg.headers {
-        req = req.header(k, v);
-    }
-    let body = serde_json::json!({
-        "model": model_id,
-        // Generous budget on purpose: a reasoning model can spend a small
-        // allowance entirely on thinking and emit no tool call, which would
-        // read as "no tool support".
-        "max_tokens": 512,
-        "messages": [{"role": "user", "content": "What is the weather in Dhaka? Use the tool."}],
-        "tools": [{"type": "function", "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a city",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-        }}],
-    });
-    let Ok(resp) = req.json(&body).send().await else {
-        return Tri::Unknown; // transport failure proves nothing; don't cache
-    };
-    if !resp.status().is_success() {
-        return Tri::Unknown;
-    }
-    let Ok(v) = resp.json::<Value>().await else {
-        return Tri::Unknown;
-    };
-    let choice = &v["choices"][0];
-    let called = choice["message"]["tool_calls"]
-        .as_array()
-        .is_some_and(|a| !a.is_empty());
-    if called {
-        let _ = state.kv_set(&key, &format!("yes@{}", now_secs()));
-        return Tri::Yes;
-    }
-    // Ran out of room before it could answer: that is not evidence of
-    // anything, so record nothing.
-    if choice["finish_reason"].as_str() == Some("length") {
-        return Tri::Unknown;
-    }
-    let _ = state.kv_set(&key, &format!("no@{}", now_secs()));
-    Tri::No
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-// ---------------------------------------------------------------------------
-// Stage 3: generating the model lists and the auto chain
-// ---------------------------------------------------------------------------
-
-/// A model eligible for the generated auto chain.
-struct Candidate {
-    provider: String,
-    id: String,
-    canonical: String,
-    context: u64,
-    open_weights: bool,
-    /// models.dev `release_date`; `None` when the model is unknown to it.
-    release: Option<String>,
-    /// Index into the preference list; None = unranked (sorts after ranked).
-    rank: Option<usize>,
-}
-
-/// Lower edge of each context bucket, widest first.
-const CONTEXT_BUCKETS: [u64; 7] = [1_000_000, 500_000, 256_000, 131_072, 65_536, 32_768, 8_192];
-
-/// Group a context window so that ordering is decided by openness and recency
-/// rather than by noise: 1,048,756 vs 1,048,576 vs 1,000,000 are all "1M", and
-/// letting the exact number rank them puts whichever provider rounds highest on
-/// top of the chain for no reason.
-fn context_bucket(ctx: u64) -> u64 {
-    CONTEXT_BUCKETS
-        .iter()
-        .copied()
-        .find(|edge| ctx >= *edge)
-        .unwrap_or(0)
-}
 
 /// Today as YYYY-MM-DD, for promo expiry.
 fn today() -> String {
     jiff::Zoned::now().date().to_string()
 }
 
-/// Build `generated.toml`: per-provider model lists (union of hand-configured
-/// and newly discovered) plus the auto chain.
-fn render_generated(
-    per_provider: &BTreeMap<String, Vec<(String, u64, Option<bool>)>>,
-    auto: &[Candidate],
-    stamp: &str,
-) -> String {
+/// Build `models.toml`: per-provider model lists (union of hand-configured and
+/// discovered), each with the facts a picker needs.
+fn render_generated(per_provider: &BTreeMap<String, (Tier, Vec<Row>)>, stamp: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# AUTO-GENERATED by `pxy refresh --write` on {stamp}.\n"
+        "# AUTO-GENERATED by `pxy refresh --generate` on {stamp}.\n"
     ));
     out.push_str(concat!(
         "# Do not edit: rerun the command instead. Hand-written provider settings\n",
-        "# (credentials, limits, headers, quirks) live in config.toml and are never\n",
-        "# touched by generation; only model lists and the auto chain come from here.\n",
-        "# Model lists are a UNION with config.toml: a provider's /models can omit a\n",
-        "# model that works (zai/glm-4.7-flash is absent from Z.AI's own listing).\n\n",
+        "# (credentials, limits, headers, quirks) and the [groups] chains live in\n",
+        "# config.toml and are never touched by generation; only model lists come\n",
+        "# from here.\n",
+        "# Every model each provider lists is here, free and paid alike. Model lists\n",
+        "# are a UNION with config.toml: a provider's /models can omit a model that\n",
+        "# works (zai/glm-4.7-flash is absent from Z.AI's own listing), and for a\n",
+        "# model config.toml also declares, the hand-written spec wins wholesale.\n",
+        "# `free` is a DISPLAY fact (provider pricing as discovery saw it); routing\n",
+        "# never reads it. `tier` echoes config.toml so this file reads on its own.\n\n",
     ));
-    for (prov, models) in per_provider {
-        out.push_str(&format!("[providers.{prov}]\nmodels = [\n"));
-        for (id, ctx, asserted) in models {
-            let extra = match asserted {
-                Some(t) => format!(", tool_call = {t}"),
-                None => String::new(),
-            };
+    for (prov, (tier, rows)) in per_provider {
+        out.push_str(&format!(
+            "[providers.{prov}]\ntier = \"{}\"\nmodels = [\n",
+            tier.as_str()
+        ));
+        for r in rows {
+            let mut extra = String::new();
+            if let Some(t) = r.tool_call {
+                extra.push_str(&format!(", tool_call = {t}"));
+            }
+            if let Some(f) = r.free {
+                extra.push_str(&format!(", free = {f}"));
+            }
             out.push_str(&format!(
-                "  {{ id = \"{id}\", context_length = {ctx}{extra} }},\n"
+                "  {{ id = \"{}\", context_length = {}{extra} }},\n",
+                r.id, r.context
             ));
         }
         out.push_str("]\n\n");
     }
-    out.push_str(concat!(
-        "# FREE-tier pools only: subscriptions, promotional balances and finite\n",
-        "# grants are never generated into `auto`. Ordered by context bucket\n",
-        "# (widest first), then open weights before proprietary, then newest\n",
-        "# release; the [preferences] list only breaks ties below all of that.\n",
-        "[auto]\nmodels = [\n",
-    ));
-    for c in auto {
-        let rank = match c.rank {
-            Some(r) => format!(", preference #{}", r + 1),
-            None => String::new(),
-        };
-        out.push_str(&format!(
-            "  \"{}/{}\",{}# ctx={}, {}, {}{rank}\n",
-            c.provider,
-            c.id,
-            " ".repeat(46usize.saturating_sub(c.provider.len() + c.id.len())),
-            c.context,
-            c.release.as_deref().unwrap_or("release ?"),
-            if c.open_weights { "open" } else { "proprietary" },
-        ));
-    }
-    out.push_str("]\n");
     out
 }
 
@@ -905,7 +673,7 @@ mod tests {
     #[test]
     fn zero_context_reads_as_unknown_not_as_a_window() {
         // aihubmix's gpt-image-2-free: null upstream, 0 from the caps fallback.
-        // Some(0) used to reach generated.toml and break pi's models.json.
+        // Some(0) used to reach models.toml and break pi's models.json.
         let caps = Caps {
             context: Some(0),
             ..Default::default()
@@ -966,110 +734,69 @@ mod tests {
         assert_ne!(Tri::Unknown, Tri::No);
     }
 
-    fn cand(id: &str, ctx: u64, open: bool, release: Option<&str>, rank: Option<usize>) -> Candidate {
-        Candidate {
-            provider: "p".into(),
-            id: id.into(),
-            canonical: canonical(id),
-            context: ctx,
-            open_weights: open,
-            release: release.map(str::to_string),
-            rank,
-        }
-    }
-
-    /// The generated ordering: context bucket, then open weights, then recency,
-    /// and only then the hand-written preference list.
-    fn sort_for_test(mut v: Vec<Candidate>) -> Vec<String> {
-        v.sort_by(|a, b| {
-            context_bucket(b.context)
-                .cmp(&context_bucket(a.context))
-                .then(b.open_weights.cmp(&a.open_weights))
-                .then(b.release.cmp(&a.release))
-                .then(a.rank.is_none().cmp(&b.rank.is_none()))
-                .then(a.rank.cmp(&b.rank))
-                .then(a.provider.cmp(&b.provider))
-                .then(a.id.cmp(&b.id))
-        });
-        v.into_iter().map(|c| c.id).collect()
-    }
-
+    /// Generation writes what discovery found for a NEW model, and only fills
+    /// blanks on one config.toml already declares — the curated spec is
+    /// authoritative at load time, so a discovered window written over a pinned
+    /// one would be a number the router never uses.
     #[test]
-    fn context_bucket_groups_near_equal_windows() {
-        // The three spellings of "1M" that our providers actually report.
-        for ctx in [1_048_756, 1_048_576, 1_000_000] {
-            assert_eq!(context_bucket(ctx), 1_000_000, "ctx={ctx}");
-        }
-        assert_eq!(context_bucket(991_000), 500_000);
-        assert_eq!(context_bucket(262_144), 256_000);
-        assert_eq!(context_bucket(200_000), 131_072);
-        assert_eq!(context_bucket(8_191), 0);
-    }
-
-    #[test]
-    fn widest_context_bucket_leads_and_beats_everything_else() {
-        // A newer, open-weight model in a smaller bucket still sorts below.
-        let order = sort_for_test(vec![
-            cand("small-new-open", 262_144, true, Some("2026-08-20"), Some(0)),
-            cand("huge-old-closed", 1_000_000, false, Some("2025-01-01"), None),
-        ]);
-        assert_eq!(order, ["huge-old-closed", "small-new-open"]);
-    }
-
-    #[test]
-    fn open_weights_lead_their_bucket_then_newest_release() {
-        let order = sort_for_test(vec![
-            cand("closed-newest", 1_048_576, false, Some("2026-08-13"), None),
-            cand("open-older", 1_000_000, true, Some("2026-06-01"), None),
-            cand("open-newest", 1_048_576, true, Some("2026-07-30"), None),
-        ]);
-        assert_eq!(order, ["open-newest", "open-older", "closed-newest"]);
-    }
-
-    #[test]
-    fn preference_only_breaks_ties() {
-        // Same bucket, same openness, same date: the list decides. It must not
-        // be able to lift a model over a wider-context or newer one.
-        let order = sort_for_test(vec![
-            cand("unranked", 1_000_000, true, Some("2026-06-01"), None),
-            cand("ranked-second", 1_000_000, true, Some("2026-06-01"), Some(1)),
-            cand("ranked-first", 1_000_000, true, Some("2026-06-01"), Some(0)),
-            cand("newer-unranked", 1_000_000, true, Some("2026-07-01"), None),
-        ]);
-        assert_eq!(
-            order,
-            ["newer-unranked", "ranked-first", "ranked-second", "unranked"]
-        );
-    }
-
-    #[test]
-    fn unknown_release_date_sorts_last_not_first() {
-        let order = sort_for_test(vec![
-            cand("undated", 1_000_000, true, None, Some(0)),
-            cand("dated", 1_000_000, true, Some("2025-01-01"), None),
-        ]);
-        assert_eq!(order, ["dated", "undated"]);
-    }
-
-    #[test]
-    fn pool_cap_limits_duplicates_of_one_model() {
-        let cands = vec![
-            cand("kimi-k3", 100, true, None, Some(0)),
-            cand("kimi-k3:free", 100, true, None, Some(0)),
-            cand("moonshotai/kimi-k3", 100, true, None, Some(0)),
-            cand("kimi-k3-free", 100, true, None, Some(0)),
+    fn generated_rows_keep_curated_specs_and_absorb_discovery() {
+        let mut rows: BTreeMap<String, Row> = BTreeMap::from([(
+            "pinned".to_string(),
+            Row { id: "pinned".into(), context: 262_144, tool_call: Some(true), free: None },
+        )]);
+        let discovered = [
+            Discovered { id: "pinned".into(), canonical: "pinned".into(), free: Tri::Yes,
+                         tool_call: Tri::No, context: Some(1_000_000) },
+            Discovered { id: "new".into(), canonical: "new".into(), free: Tri::No,
+                         tool_call: Tri::Unknown, context: Some(400_000) },
         ];
-        let mut seen: HashMap<String, usize> = HashMap::new();
-        let kept: Vec<_> = cands
-            .into_iter()
-            .filter(|c| {
-                let n = seen.entry(c.canonical.clone()).or_insert(0);
-                *n += 1;
-                *n <= 2
-            })
-            .collect();
-        assert_eq!(kept.len(), 2, "all four are the same canonical model");
+        for d in &discovered {
+            match rows.get_mut(&d.id) {
+                Some(row) => {
+                    row.tool_call = row.tool_call.or(d.tool_call.as_opt());
+                    row.free = row.free.or(d.free.as_opt());
+                }
+                None => {
+                    rows.insert(d.id.clone(), Row {
+                        id: d.id.clone(),
+                        context: d.context.unwrap_or(crate::config::default_context()),
+                        tool_call: d.tool_call.as_opt(),
+                        free: d.free.as_opt(),
+                    });
+                }
+            }
+        }
+        let pinned = &rows["pinned"];
+        assert_eq!(pinned.context, 262_144, "curated window survives discovery");
+        assert_eq!(pinned.tool_call, Some(true), "curated assertion survives");
+        assert_eq!(pinned.free, Some(true), "blank display fact is filled in");
+        // Paid models are generated too now, and an unknown capability writes
+        // no key at all rather than a `false`.
+        let new = &rows["new"];
+        assert_eq!(new.free, Some(false));
+        assert_eq!(new.tool_call, None);
     }
+
+    #[test]
+    fn render_omits_unknown_capabilities_and_stamps_the_tier() {
+        let out = render_generated(
+            &BTreeMap::from([(
+                "p".to_string(),
+                (Tier::Subscription, vec![
+                    Row { id: "known".into(), context: 8192, tool_call: Some(true), free: Some(false) },
+                    Row { id: "unknown".into(), context: 128_000, tool_call: None, free: None },
+                ]),
+            )]),
+            "2026-08-29",
+        );
+        assert!(out.contains("tier = \"subscription\""), "{out}");
+        assert!(out.contains(r#"{ id = "known", context_length = 8192, tool_call = true, free = false }"#), "{out}");
+        assert!(out.contains(r#"{ id = "unknown", context_length = 128000 }"#), "{out}");
+        // The generated file must parse back into the overlay struct.
+        let parsed: crate::config::Generated = toml::from_str(&out).unwrap();
+        assert_eq!(parsed.providers["p"].models.len(), 2);
+    }
+
 
     #[test]
     fn promo_expiry_is_date_ordered_and_fails_closed() {
