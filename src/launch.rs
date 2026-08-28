@@ -117,17 +117,20 @@ fn launch_claude(
     // reads /v1/models, which mirrors all ids under a "claude/" prefix.
     cmd.env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");
 
-    // Claude Code assumes a 200K context for model ids it doesn't recognize;
-    // if our resolved chain has a smaller window, lower the auto-compact bound.
+    // Claude Code assumes a 200K context for model ids it doesn't recognize —
+    // wrong in both directions, and it says so at startup. Declare the real
+    // window instead (docs/en/model-config, "Correct the window for a gateway
+    // or custom model ID"), which also silences that warning. min() over the
+    // chain: any member may serve the request, so the declared window has to be
+    // one they all satisfy. The compact bound keeps 5% of it as headroom.
     let min_ctx = catalog
         .resolve(cfg, model)
         .iter()
         .map(|c| c.model.context_length)
         .min();
     if let Some(ctx) = min_ctx {
-        if ctx < 200_000 {
-            cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", ((ctx * 95) / 100).to_string());
-        }
+        cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx.to_string());
+        cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", ((ctx * 95) / 100).to_string());
     }
 
     exec_or_print(cmd, dry_run, "claude wired via ANTHROPIC_* env vars")
