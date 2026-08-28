@@ -865,6 +865,28 @@ async fn fetch_balance(
         );
         return (line, Some(body));
     }
+    // Command Code: dollars spent inside each plan window, plus what is left
+    // of the credit pool (GET /alpha/billing/credits — the source its own CLI
+    // reads for `/usage`). `cap` is the window's dollar allowance, so the
+    // percentage has to be derived; `exceeded` marks a window already spent.
+    if body["windowLimits"].is_object() {
+        let mut parts: Vec<String> = Vec::new();
+        for (key, label) in [("fiveHour", "5h"), ("weekly", "wk")] {
+            let w = &body["windowLimits"][key];
+            let (Some(used), Some(cap)) = (w["used"].as_f64(), w["cap"].as_f64()) else {
+                continue;
+            };
+            let pct = if cap > 0.0 { used / cap * 100.0 } else { 0.0 };
+            let flag = if w["exceeded"].as_bool().unwrap_or(false) { "!" } else { "" };
+            parts.push(format!("{label} ${used:.2}/${cap:.0} ({pct:.0}%){flag}"));
+        }
+        let c = &body["credits"];
+        let left = c["monthlyCredits"].as_f64().unwrap_or(0.0)
+            + c["purchasedCredits"].as_f64().unwrap_or(0.0)
+            + c["freeCredits"].as_f64().unwrap_or(0.0);
+        parts.push(format!("${left:.2} credits left"));
+        return (parts.join(" · "), Some(body));
+    }
     // OpenAI/new-api dashboard billing: total_usage in cents.
     if let Some(cents) = body["total_usage"].as_f64() {
         return (format!("used ${:.2}", cents / 100.0), Some(body));
