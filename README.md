@@ -56,4 +56,10 @@ tells you who served it.
 - Providers: any OpenAI- or Anthropic-compatible endpoint via config, plus GitHub
   Copilot (built-in two-stage token mint). More OAuth providers land one by one.
 
+Anthropic's `web_search` **server** tool works on models that have never heard of it.
+An OpenAI upstream is offered a plain function instead; pxy intercepts the call, runs it
+through `[[search.providers]]`, feeds the results back to the model, and streams the
+turn to the client as the `server_tool_use` + `web_search_tool_result` blocks it expects
+— so Claude Code's WebSearch works on any model in the catalog.
+
 Design/research notes live in `docs/` (start with `docs/07-pxy-design.md`).

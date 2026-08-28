@@ -9,6 +9,7 @@ pub mod responses;
 pub mod sse;
 pub mod think;
 pub mod tool_text;
+pub mod web_search;
 
 /// Token usage extracted from a response, in provider-neutral terms.
 #[derive(Debug, Clone, Copy, Default)]

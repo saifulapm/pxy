@@ -4,6 +4,7 @@
 use serde_json::{json, Map, Value};
 
 use super::sse::format_event;
+use super::web_search;
 use super::TokenUsage;
 
 // ---------------------------------------------------------------------------
@@ -68,14 +69,16 @@ pub fn request(anthropic: &Value) -> Value {
     }
 
     if let Some(tools) = anthropic["tools"].as_array() {
-        let mapped: Vec<Value> = tools
+        let mut mapped: Vec<Value> = tools
             .iter()
-            .filter(|t| t["name"].is_string())
+            // Server tools (web_search, code_execution, …) carry a `name` but
+            // no schema because the API, not the model, runs them. Mapping one
+            // to a function yields a zero-argument call the client can't
+            // execute, so they never reach the upstream as functions:
+            // web_search is substituted below, the rest are dropped.
+            .filter(|t| t["name"].is_string() && t["input_schema"].is_object())
             .map(|t| {
                 let mut params = t["input_schema"].clone();
-                if params.is_null() {
-                    params = json!({"type": "object", "properties": {}});
-                }
                 // OpenAI strict mode chokes on schemas without properties
                 if params.get("properties").is_none() {
                     params["properties"] = json!({});
@@ -90,6 +93,17 @@ pub fn request(anthropic: &Value) -> Value {
                 })
             })
             .collect();
+        // web_search is the one server tool pxy can run itself: it comes back
+        // as a real function, and the router intercepts the calls. Only on the
+        // streaming path — that's where the interception lives, and offering a
+        // function nobody will intercept would hand the client a tool_use it
+        // can't execute, which is the bug this whole thing exists to fix.
+        if anthropic["stream"].as_bool().unwrap_or(false)
+            && web_search::plan(anthropic).is_some()
+            && !mapped.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)
+        {
+            mapped.insert(0, web_search::tool_def());
+        }
         if !mapped.is_empty() {
             out.insert("tools".into(), Value::Array(mapped));
         }
@@ -214,6 +228,17 @@ fn push_assistant_turn(messages: &mut Vec<Value>, blocks: &[Value]) {
                         "arguments": serde_json::to_string(&block["input"]).unwrap_or_else(|_| "{}".into()),
                     }
                 }));
+            }
+            // The search blocks pxy emitted last turn come back here. The
+            // upstream has no notion of a server tool, so they replay as prose
+            // — dropping them would lose what the search found.
+            Some("server_tool_use") | Some("web_search_tool_result") => {
+                if let Some(line) = web_search::flatten_history_block(block) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&line);
+                }
             }
             // thinking / redacted_thinking: dropped for openai upstreams
             _ => {}
@@ -565,6 +590,54 @@ impl StreamState {
     }
 
     /// Close all open blocks and emit message_delta + message_stop.
+    /// Splice a whole content block into the stream — the `server_tool_use` /
+    /// `web_search_tool_result` pair pxy fills in itself. Any open text or
+    /// thinking block is closed first so block indices stay ordered.
+    pub fn emit_block(&mut self, mut block: Value) -> String {
+        let mut out = String::new();
+        if let Some((idx, _)) = self.open_text.take() {
+            out.push_str(&stop_block(idx));
+        }
+        // server_tool_use streams its arguments the way tool_use does: the
+        // client reads the query off input_json_delta, not off the start event.
+        let input_json = (block["type"] == "server_tool_use").then(|| {
+            let input = block["input"].take();
+            block["input"] = json!({});
+            serde_json::to_string(&input).unwrap_or_else(|_| "{}".into())
+        });
+
+        let idx = self.next_block;
+        self.next_block += 1;
+        out.push_str(&format_event(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": idx, "content_block": block}),
+        ));
+        if let Some(js) = input_json {
+            out.push_str(&format_event(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": idx,
+                        "delta": {"type": "input_json_delta", "partial_json": js}}),
+            ));
+        }
+        out.push_str(&stop_block(idx));
+        out
+    }
+
+    /// Hand over the usage counted so far and zero it. A server-tool
+    /// continuation is a second upstream call: its final chunk overwrites
+    /// these numbers, so they have to be banked before it starts or the first
+    /// call's tokens never reach the quota windows.
+    pub fn take_usage(&mut self) -> TokenUsage {
+        std::mem::take(&mut self.usage)
+    }
+
+    /// Forget a finish_reason recorded before a server-tool continuation: the
+    /// turn isn't over, and a stale `tool_calls` would reach the client as
+    /// `stop_reason: tool_use` with no tool_use block left to answer.
+    pub fn clear_finish_reason(&mut self) {
+        self.finish_reason = None;
+    }
+
     pub fn finish(&mut self) -> String {
         let mut out = String::new();
         if !self.started {
@@ -602,6 +675,67 @@ fn stop_block(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The web_search server tool becomes a real function pxy can intercept,
+    /// and client tools are untouched. Every other server tool is dropped:
+    /// mapped as a function it would reach the client as a call for a tool it
+    /// never registered.
+    #[test]
+    fn server_tools_are_substituted_or_dropped() {
+        let req = json!({
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+                {"type": "code_execution_20250522", "name": "code_execution"},
+                {"name": "Bash", "input_schema": {"type": "object", "properties": {}}},
+            ],
+        });
+        let out = request(&req);
+        let names: Vec<&str> = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec![web_search::TOOL_NAME, "Bash"]);
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"]["required"],
+            json!(["query"])
+        );
+    }
+
+    /// Non-streaming requests don't get the function: the interception that
+    /// makes it work lives on the streaming path only.
+    #[test]
+    fn web_search_is_not_offered_without_streaming() {
+        let req = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        });
+        assert!(request(&req)["tools"].is_null());
+    }
+
+    /// A replayed turn carries pxy's own search blocks back. The upstream has
+    /// no server tools, so they land in the assistant message as prose.
+    #[test]
+    fn replayed_search_blocks_become_history_text() {
+        let req = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "s1", "name": "web_search",
+                 "input": {"query": "rust"}},
+                {"type": "web_search_tool_result", "tool_use_id": "s1",
+                 "content": [{"type": "web_search_result", "title": "T", "url": "u"}]},
+                {"type": "text", "text": "Rust is a language."},
+            ]}],
+        });
+        let out = request(&req);
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            content,
+            "[web search: rust]\n[web search results]\n- T (u)\nRust is a language."
+        );
+    }
 
     #[test]
     fn request_maps_system_tools_and_tool_results() {

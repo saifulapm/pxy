@@ -18,6 +18,7 @@ use crate::state::State;
 use crate::translate::sse::SseParser;
 use crate::translate::think::ThinkFilter;
 use crate::translate::tool_text::ToolTextFilter;
+use crate::translate::web_search;
 use crate::translate::{anthropic_to_openai, estimate_tokens, kiro, openai_to_anthropic, TokenUsage};
 use crate::usage::current_windows;
 
@@ -654,6 +655,23 @@ async fn try_candidate(
         }
     }
 
+    // The web_search server tool: pxy runs it for OpenAI upstreams, which have
+    // no server tools of their own. Built before the send so the follow-up
+    // call replays this exact request with the results appended.
+    let search = (client_format == ClientFormat::Anthropic
+        && upstream_format == WireFormat::Openai)
+        .then(|| web_search::plan(payload))
+        .flatten()
+        .filter(|_| !app.cfg.search.providers.is_empty())
+        .map(|plan| SearchLoop {
+            filter: SearchCallFilter::default(),
+            uses_left: plan.max_uses,
+            url: prepared.url.clone(),
+            headers: prepared.headers.clone(),
+            body: body.clone(),
+            timeout: Duration::from_secs(provider_cfg.timeout_secs),
+        });
+
     app.state.rpm_increment(&cand.provider);
     let resp = match req.json(&body).send().await {
         Ok(r) => r,
@@ -696,6 +714,7 @@ async fn try_candidate(
             resp,
             input_estimate,
             tool_names,
+            search,
         )
         .await
         {
@@ -1210,6 +1229,90 @@ struct StreamCtx {
     app: SharedApp,
     upstream: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
     done: bool,
+    /// Present when the request carried the web_search server tool and the
+    /// upstream speaks OpenAI: pxy runs the search and continues the turn.
+    search: Option<SearchLoop>,
+}
+
+/// Accumulates the model's calls to `web_search::TOOL_NAME` while stripping
+/// them from the chunks, so the client never sees a tool_use it can't run.
+#[derive(Default)]
+struct SearchCallFilter {
+    /// openai tool_call index -> (id, arguments so far). The function name
+    /// only rides the first chunk of a call, so later chunks are matched on
+    /// the index instead.
+    ours: std::collections::HashMap<u64, (String, String)>,
+    /// A client tool was called in the same turn. Anthropic's API doesn't run
+    /// the search then either — it hands the client tools back first and
+    /// searches on the next turn — so pxy leaves the turn alone.
+    saw_other: bool,
+}
+
+/// The web_search server tool's loop: what the model asked for, what's left of
+/// its budget, and the request to replay once results are in.
+struct SearchLoop {
+    filter: SearchCallFilter,
+    uses_left: u64,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Value,
+    timeout: Duration,
+}
+
+impl SearchLoop {
+    /// The one captured call, when it's this turn's only tool call.
+    fn pending(&self) -> Option<(String, String)> {
+        if self.filter.saw_other || self.uses_left == 0 {
+            return None;
+        }
+        self.filter.ours.values().next().cloned()
+    }
+}
+
+/// Strip calls to the injected search function out of an openai chunk,
+/// remembering id + arguments. Returns the rewritten chunk.
+fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(data) else {
+        return data.to_string();
+    };
+    let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() else {
+        return data.to_string();
+    };
+    let mut keep: Vec<Value> = Vec::new();
+    let mut stripped = false;
+    for call in calls {
+        let idx = call["index"].as_u64().unwrap_or(0);
+        let name = call["function"]["name"].as_str().unwrap_or("");
+        if name != web_search::TOOL_NAME && !f.ours.contains_key(&idx) {
+            if !name.is_empty() {
+                f.saw_other = true;
+            }
+            keep.push(call.clone());
+            continue;
+        }
+        stripped = true;
+        let entry = f.ours.entry(idx).or_default();
+        if let Some(id) = call["id"].as_str().filter(|s| !s.is_empty()) {
+            entry.0 = id.to_string();
+        }
+        if let Some(args) = call["function"]["arguments"].as_str() {
+            entry.1.push_str(args);
+        }
+    }
+    if !stripped {
+        return data.to_string();
+    }
+    if keep.is_empty() {
+        v["choices"][0]["delta"].as_object_mut().map(|d| d.remove("tool_calls"));
+        // Nothing left for the client to run: a `tool_calls` finish would
+        // close the turn as `stop_reason: tool_use` with no tool_use block.
+        if v["choices"][0]["finish_reason"].as_str() == Some("tool_calls") {
+            v["choices"][0]["finish_reason"] = Value::Null;
+        }
+    } else {
+        v["choices"][0]["delta"]["tool_calls"] = Value::Array(keep);
+    }
+    v.to_string()
 }
 
 /// Tool names the request declared, in either dialect's shape. None when the
@@ -1354,7 +1457,7 @@ impl StreamCtx {
             }
             None => bytes,
         };
-        let Self { parser, kind, think, tooltext, usage, .. } = self;
+        let Self { parser, kind, think, tooltext, usage, search, .. } = self;
         let events = parser.feed(bytes);
         match kind {
             StreamKind::OpenaiPass => {
@@ -1437,7 +1540,12 @@ impl StreamCtx {
                         {
                             out.push_str(&state.on_data(&tail));
                         }
-                        out.push_str(&state.on_data(&ev.data));
+                        // A search is queued: this [DONE] ends the upstream
+                        // call, not the client's turn. Closing the message
+                        // here would strand the answer the model still owes.
+                        if search.as_ref().is_none_or(|s| s.pending().is_none()) {
+                            out.push_str(&state.on_data(&ev.data));
+                        }
                     } else {
                         let mut data = ev.data.clone();
                         if let Some(filter) = think.as_mut() {
@@ -1447,6 +1555,9 @@ impl StreamCtx {
                         }
                         if let Some(tf) = tooltext.as_mut() {
                             data = rewrite_chunk_tools(&data, tf);
+                        }
+                        if let Some(s) = search.as_mut() {
+                            data = rewrite_chunk_search(&data, &mut s.filter);
                         }
                         out.push_str(&state.on_data(&data));
                     }
@@ -1466,6 +1577,96 @@ impl StreamCtx {
     }
 
     /// End-of-stream flush (upstream may end without a terminal marker).
+    /// The upstream call ended on a `web_search` call. Run the search, splice
+    /// the protocol blocks into the client's stream, and re-issue the request
+    /// with the results appended so the model answers from them — all inside
+    /// the one message the client is already reading.
+    ///
+    /// Returns the bytes to emit, or None when there was nothing to search
+    /// (then the turn closes normally). A failure to reach a search provider
+    /// is reported to the model AND to the client rather than aborting: an
+    /// error block is what the real API sends too.
+    async fn continue_after_search(&mut self) -> Option<Bytes> {
+        let (call_id, args) = self.search.as_ref()?.pending()?;
+        let query = serde_json::from_str::<Value>(&args)
+            .ok()
+            .and_then(|a| a["query"].as_str().map(String::from))
+            .filter(|q| !q.is_empty())?;
+
+        let search = self.search.as_mut()?;
+        search.uses_left -= 1;
+        search.filter = SearchCallFilter::default();
+
+        let found = crate::media::search::run_search(&self.app, &query, 5, None).await;
+        let (block, tool_output) = match &found {
+            Ok((provider, results)) => {
+                info!(%query, %provider, hits = results.len(), "web_search served");
+                (
+                    web_search::result_block(&call_id, results),
+                    web_search::results_for_model(results),
+                )
+            }
+            Err(e) => {
+                warn!(%query, error = %e, "web_search failed");
+                (web_search::error_block(&call_id), format!("Search failed: {e}"))
+            }
+        };
+
+        // The model's own view of the turn: it called the function, this is
+        // what it returned.
+        let search = self.search.as_mut()?;
+        if let Some(messages) = search.body["messages"].as_array_mut() {
+            messages.push(json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": web_search::TOOL_NAME, "arguments": args},
+                }],
+            }));
+            messages.push(json!({
+                "role": "tool", "tool_call_id": call_id, "content": tool_output,
+            }));
+        }
+
+        let mut req = self
+            .app
+            .http
+            .post(&search.url)
+            .timeout(search.timeout)
+            .header("content-type", "application/json");
+        for (k, v) in &search.headers {
+            req = req.header(k, v);
+        }
+        let resp = match req.json(&search.body).send().await {
+            Ok(r) if r.status().is_success() => r,
+            // No second call means no answer, so the turn ends here rather
+            // than hanging: the client still gets the results it can read.
+            other => {
+                warn!(status = ?other.map(|r| r.status().as_u16()), "web_search continuation failed");
+                self.search = None;
+                return None;
+            }
+        };
+        self.upstream = resp.bytes_stream().boxed();
+        self.parser = SseParser::new();
+        record_request(&self.app, &self.agent, &self.provider, &self.model);
+
+        let mut out = String::new();
+        if let StreamKind::ToAnthropic(state) = &mut self.kind {
+            // Bank what the first call spent before the second overwrites it.
+            let spent = state.take_usage();
+            record_tokens(&self.app, &self.agent, &self.provider, &self.model, spent);
+            // The call that asked for the search finished with `tool_calls`;
+            // the turn hasn't, and the continuation sets its own reason.
+            state.clear_finish_reason();
+            out.push_str(&state.emit_block(web_search::server_tool_use_block(&call_id, &query)));
+            out.push_str(&state.emit_block(block));
+        }
+        Some(Bytes::from(out))
+    }
+
     fn finish(&mut self) -> Bytes {
         // Kiro never sends a terminating SSE event: synthesize the closing
         // chunks (incl. buffered tool arguments) and run them through the
@@ -1593,6 +1794,7 @@ async fn stream_outcome(
     resp: reqwest::Response,
     input_estimate: u64,
     tool_names: Option<std::collections::HashSet<String>>,
+    search: Option<SearchLoop>,
 ) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
@@ -1637,6 +1839,7 @@ async fn stream_outcome(
         app,
         upstream: resp.bytes_stream().boxed(),
         done: false,
+        search,
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
@@ -1697,6 +1900,11 @@ async fn stream_outcome(
                 Some((Ok(tail), ctx))
             }
             None => {
+                // A queued web_search swaps in a fresh upstream response and
+                // keeps the same client stream going.
+                if let Some(blocks) = ctx.continue_after_search().await {
+                    return Some((Ok(blocks), ctx));
+                }
                 ctx.done = true;
                 let tail = ctx.finish();
                 Some((Ok(tail), ctx))
@@ -1824,6 +2032,95 @@ fn error_outcome(format: ClientFormat, status: u16, etype: &str, message: &str) 
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    /// A call to the injected search function is captured and removed, and the
+    /// `tool_calls` finish that came with it is dropped too — leaving it would
+    /// close the turn as `stop_reason: tool_use` with nothing to answer.
+    #[test]
+    fn search_call_is_stripped_from_the_stream() {
+        let mut f = SearchCallFilter::default();
+        let out = rewrite_chunk_search(
+            &json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": web_search::TOOL_NAME, "arguments": "{\"query\":"}
+            }]}}]})
+            .to_string(),
+            &mut f,
+        );
+        assert!(!out.contains("tool_calls"), "{out}");
+
+        // Arguments streamed across chunks: later ones carry no name.
+        let out = rewrite_chunk_search(
+            &json!({"choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {"tool_calls": [{
+                "index": 0, "function": {"arguments": "\"rust\"}"}
+            }]}}]})
+            .to_string(),
+            &mut f,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["choices"][0]["finish_reason"].is_null(), "{out}");
+        assert_eq!(f.ours[&0], ("call_1".into(), "{\"query\":\"rust\"}".into()));
+        assert!(!f.saw_other);
+    }
+
+    /// A client tool called in the same turn is forwarded untouched, and its
+    /// presence cancels the search: Anthropic's API hands the client tools back
+    /// first and searches on the following turn.
+    #[test]
+    fn client_tool_calls_survive_and_cancel_the_search() {
+        let mut f = SearchCallFilter::default();
+        let out = rewrite_chunk_search(
+            &json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": web_search::TOOL_NAME, "arguments": "{}"}},
+                {"index": 1, "id": "c2", "function": {"name": "Bash", "arguments": "{}"}}
+            ]}}]})
+            .to_string(),
+            &mut f,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let calls = v["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        assert!(f.saw_other);
+
+        let loop_ = SearchLoop {
+            filter: f,
+            uses_left: 5,
+            url: String::new(),
+            headers: Vec::new(),
+            body: Value::Null,
+            timeout: Duration::from_secs(1),
+        };
+        assert!(loop_.pending().is_none());
+    }
+
+    /// `max_uses` is a hard stop: a model that keeps searching runs out of
+    /// budget and the turn closes instead of looping on pxy's search quota.
+    #[test]
+    fn exhausted_budget_stops_the_loop() {
+        let mut filter = SearchCallFilter::default();
+        filter.ours.insert(0, ("call_1".into(), "{\"query\":\"x\"}".into()));
+        let mut loop_ = SearchLoop {
+            filter,
+            uses_left: 1,
+            url: String::new(),
+            headers: Vec::new(),
+            body: Value::Null,
+            timeout: Duration::from_secs(1),
+        };
+        assert!(loop_.pending().is_some());
+        loop_.uses_left = 0;
+        assert!(loop_.pending().is_none());
+    }
+
+    /// A chunk with no tool calls at all comes back byte-identical.
+    #[test]
+    fn plain_chunks_pass_through_untouched() {
+        let mut f = SearchCallFilter::default();
+        let data = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}).to_string();
+        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
+        assert_eq!(rewrite_chunk_search("[DONE]", &mut f), "[DONE]");
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

@@ -47,8 +47,25 @@ pub async fn search(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         return error_response(StatusCode::BAD_REQUEST, "'query' is required");
     };
     let n = payload["max_results"].as_u64().unwrap_or(5).clamp(1, 20);
-    let only = payload["provider"].as_str();
+    match run_search(&app, query, n, payload["provider"].as_str()).await {
+        Ok((provider, results)) => (
+            StatusCode::OK,
+            Json(json!({"provider": provider, "query": query, "results": results})),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
+    }
+}
 
+/// The provider walk behind `/v1/search`, without the HTTP layer: the
+/// `web_search` server tool (translate/web_search.rs) runs through it too.
+/// Returns the provider that answered and its results.
+pub(crate) async fn run_search(
+    app: &App,
+    query: &str,
+    n: u64,
+    only: Option<&str>,
+) -> Result<(String, Vec<Value>), String> {
     let mut errors: Vec<String> = Vec::new();
     // A provider that answered 200 with zero hits is remembered but not
     // punished: another provider may still find something, and if none does
@@ -58,22 +75,18 @@ pub async fn search(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         if only.is_some_and(|o| o != p.name) {
             continue;
         }
-        let Some(key) = service_ready(&app, "search", p) else { continue };
+        let Some(key) = service_ready(app, "search", p) else { continue };
         // Count the query up front: an upstream 200 consumed quota even if
         // we fail to read the body.
-        super::record(&app, &key);
-        match search_one(&app, p, query, n).await {
+        super::record(app, &key);
+        match search_one(app, p, query, n).await {
             Ok(results) => {
                 app.state.clear_cooldown(&key, "");
                 if results.is_empty() {
                     empty_from.get_or_insert_with(|| p.name.clone());
                     continue;
                 }
-                return (
-                    StatusCode::OK,
-                    Json(json!({"provider": p.name, "query": query, "results": results})),
-                )
-                    .into_response();
+                return Ok((p.name.clone(), results));
             }
             Err(e) => {
                 app.state.set_cooldown(&key, None, None, true, &format!("{e:#}"));
@@ -82,16 +95,9 @@ pub async fn search(State(app): State<SharedApp>, Json(payload): Json<Value>) ->
         }
     }
     if let Some(provider) = empty_from {
-        return (
-            StatusCode::OK,
-            Json(json!({"provider": provider, "query": query, "results": []})),
-        )
-            .into_response();
+        return Ok((provider, Vec::new()));
     }
-    error_response(
-        StatusCode::BAD_GATEWAY,
-        if errors.is_empty() { "no search provider available".into() } else { errors.join("; ") },
-    )
+    Err(if errors.is_empty() { "no search provider available".into() } else { errors.join("; ") })
 }
 
 async fn search_one(
