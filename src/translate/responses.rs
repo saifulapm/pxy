@@ -316,7 +316,12 @@ fn convert_tool(tool: &Value) -> Option<Value> {
                 "required": ["command"],
             },
         }})),
-        // web_search / image_generation / other hosted tools: no equivalent.
+        // `codex --search` turns on the Responses API's hosted web_search,
+        // which an OpenAI-compatible chat upstream can't run. Same treatment
+        // as Anthropic's server tool: a real function pxy intercepts and
+        // answers itself (translate/web_search.rs).
+        Some("web_search") | Some("web_search_preview") => Some(super::web_search::tool_def()),
+        // image_generation / other hosted tools: no equivalent.
         _ => None,
     }
 }
@@ -812,9 +817,22 @@ mod tests {
         assert_eq!(msgs[3]["content"], "result"); // envelope unwrapped
         assert_eq!(msgs[4]["role"], "assistant");
         let tools = chat["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2); // web_search dropped
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0]["function"]["name"], "get");
         assert_eq!(tools[1]["function"]["name"], "shell");
+        // hosted web_search -> the function pxy answers itself
+        assert_eq!(tools[2]["function"]["name"], super::super::web_search::TOOL_NAME);
+    }
+
+    /// image_generation and friends still have no equivalent, and a hosted
+    /// tool mapped to a function would reach the client as a call it can't run.
+    #[test]
+    fn other_hosted_tools_are_still_dropped() {
+        let chat = request(&json!({
+            "input": [],
+            "tools": [{"type": "image_generation"}, {"type": "code_interpreter"}],
+        }));
+        assert!(chat["tools"].is_null());
     }
 
     #[test]

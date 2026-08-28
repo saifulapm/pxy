@@ -655,22 +655,25 @@ async fn try_candidate(
         }
     }
 
-    // The web_search server tool: pxy runs it for OpenAI upstreams, which have
-    // no server tools of their own. Built before the send so the follow-up
-    // call replays this exact request with the results appended.
-    let search = (client_format == ClientFormat::Anthropic
-        && upstream_format == WireFormat::Openai)
-        .then(|| web_search::plan(payload))
-        .flatten()
-        .filter(|_| !app.cfg.search.providers.is_empty())
-        .map(|plan| SearchLoop {
-            filter: SearchCallFilter::default(),
-            uses_left: plan.max_uses,
-            url: prepared.url.clone(),
-            headers: prepared.headers.clone(),
-            body: body.clone(),
-            timeout: Duration::from_secs(provider_cfg.timeout_secs),
-        });
+    // The hosted web_search tool: pxy runs it for OpenAI upstreams, which have
+    // no hosted tools of their own. Whoever built the body decided that —
+    // anthropic_to_openai for Claude Code's server tool, responses for
+    // `codex --search` — so the marker is the injected function itself.
+    // Built before the send so the follow-up call replays this exact request
+    // with the results appended.
+    let search = (upstream_format == WireFormat::Openai
+        && !app.cfg.search.providers.is_empty()
+        && body["tools"]
+            .as_array()
+            .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)))
+    .then(|| SearchLoop {
+        filter: SearchCallFilter::default(),
+        uses_left: web_search::plan(payload).map_or(web_search::DEFAULT_MAX_USES, |p| p.max_uses),
+        url: prepared.url.clone(),
+        headers: prepared.headers.clone(),
+        body: body.clone(),
+        timeout: Duration::from_secs(provider_cfg.timeout_secs),
+    });
 
     app.state.rpm_increment(&cand.provider);
     let resp = match req.json(&body).send().await {
@@ -1275,42 +1278,56 @@ fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(data) else {
         return data.to_string();
     };
-    let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() else {
+    if v["choices"][0].is_null() {
         return data.to_string();
-    };
-    let mut keep: Vec<Value> = Vec::new();
-    let mut stripped = false;
-    for call in calls {
-        let idx = call["index"].as_u64().unwrap_or(0);
-        let name = call["function"]["name"].as_str().unwrap_or("");
-        if name != web_search::TOOL_NAME && !f.ours.contains_key(&idx) {
-            if !name.is_empty() {
-                f.saw_other = true;
+    }
+    let mut changed = false;
+
+    if let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+        let mut keep: Vec<Value> = Vec::new();
+        for call in calls {
+            let idx = call["index"].as_u64().unwrap_or(0);
+            let name = call["function"]["name"].as_str().unwrap_or("");
+            if name != web_search::TOOL_NAME && !f.ours.contains_key(&idx) {
+                if !name.is_empty() {
+                    f.saw_other = true;
+                }
+                keep.push(call.clone());
+                continue;
             }
-            keep.push(call.clone());
-            continue;
+            changed = true;
+            let entry = f.ours.entry(idx).or_default();
+            if let Some(id) = call["id"].as_str().filter(|s| !s.is_empty()) {
+                entry.0 = id.to_string();
+            }
+            if let Some(args) = call["function"]["arguments"].as_str() {
+                entry.1.push_str(args);
+            }
         }
-        stripped = true;
-        let entry = f.ours.entry(idx).or_default();
-        if let Some(id) = call["id"].as_str().filter(|s| !s.is_empty()) {
-            entry.0 = id.to_string();
-        }
-        if let Some(args) = call["function"]["arguments"].as_str() {
-            entry.1.push_str(args);
+        if changed {
+            if keep.is_empty() {
+                v["choices"][0]["delta"].as_object_mut().map(|d| d.remove("tool_calls"));
+            } else {
+                v["choices"][0]["delta"]["tool_calls"] = Value::Array(keep);
+            }
         }
     }
-    if !stripped {
+
+    // The close usually arrives as its own chunk — `finish_reason: tool_calls`
+    // with an empty delta — so this can't live in the branch above. Left alone
+    // it ends the client's turn before the search has run: the Responses
+    // translator completes the response on the spot, and Anthropic clients get
+    // a `stop_reason: tool_use` with no tool_use block to answer.
+    if !f.ours.is_empty()
+        && !f.saw_other
+        && v["choices"][0]["finish_reason"].as_str() == Some("tool_calls")
+    {
+        v["choices"][0]["finish_reason"] = Value::Null;
+        changed = true;
+    }
+
+    if !changed {
         return data.to_string();
-    }
-    if keep.is_empty() {
-        v["choices"][0]["delta"].as_object_mut().map(|d| d.remove("tool_calls"));
-        // Nothing left for the client to run: a `tool_calls` finish would
-        // close the turn as `stop_reason: tool_use` with no tool_use block.
-        if v["choices"][0]["finish_reason"].as_str() == Some("tool_calls") {
-            v["choices"][0]["finish_reason"] = Value::Null;
-        }
-    } else {
-        v["choices"][0]["delta"]["tool_calls"] = Value::Array(keep);
     }
     v.to_string()
 }
@@ -1476,7 +1493,7 @@ impl StreamCtx {
                         }
                     }
                 }
-                if think.is_none() && tooltext.is_none() {
+                if think.is_none() && tooltext.is_none() && search.is_none() {
                     return bytes.clone();
                 }
                 // Any active filter forces chunk rewriting even in passthrough.
@@ -1493,7 +1510,11 @@ impl StreamCtx {
                         {
                             out.push_str(&format!("data: {tail}\n\n"));
                         }
-                        out.push_str("data: [DONE]\n\n");
+                        // Held back while a search is queued: this ends the
+                        // upstream call, not the client's turn.
+                        if search.as_ref().is_none_or(|s| s.pending().is_none()) {
+                            out.push_str("data: [DONE]\n\n");
+                        }
                     } else {
                         let mut data = ev.data.clone();
                         if let Some(filter) = think.as_mut() {
@@ -1501,6 +1522,9 @@ impl StreamCtx {
                         }
                         if let Some(tf) = tooltext.as_mut() {
                             data = rewrite_chunk_tools(&data, tf);
+                        }
+                        if let Some(s) = search.as_mut() {
+                            data = rewrite_chunk_search(&data, &mut s.filter);
                         }
                         out.push_str(&format!("data: {data}\n\n"));
                     }
@@ -1654,15 +1678,27 @@ impl StreamCtx {
         record_request(&self.app, &self.agent, &self.provider, &self.model);
 
         let mut out = String::new();
-        if let StreamKind::ToAnthropic(state) = &mut self.kind {
-            // Bank what the first call spent before the second overwrites it.
-            let spent = state.take_usage();
-            record_tokens(&self.app, &self.agent, &self.provider, &self.model, spent);
-            // The call that asked for the search finished with `tool_calls`;
-            // the turn hasn't, and the continuation sets its own reason.
-            state.clear_finish_reason();
-            out.push_str(&state.emit_block(web_search::server_tool_use_block(&call_id, &query)));
-            out.push_str(&state.emit_block(block));
+        match &mut self.kind {
+            StreamKind::ToAnthropic(state) => {
+                // Bank what the first call spent before the second overwrites it.
+                let spent = state.take_usage();
+                record_tokens(&self.app, &self.agent, &self.provider, &self.model, spent);
+                // The call that asked for the search finished with `tool_calls`;
+                // the turn hasn't, and the continuation sets its own reason.
+                state.clear_finish_reason();
+                out.push_str(
+                    &state.emit_block(web_search::server_tool_use_block(&call_id, &query)),
+                );
+                out.push_str(&state.emit_block(block));
+            }
+            // Passthrough — codex, through /v1/responses. Chat completions has
+            // no event meaning "a search happened", so nothing is spliced in;
+            // the client sees the answer the results produced, with the URLs
+            // the model cites from them.
+            _ => {
+                let spent = std::mem::take(&mut self.usage);
+                record_tokens(&self.app, &self.agent, &self.provider, &self.model, spent);
+            }
         }
         Some(Bytes::from(out))
     }
@@ -2092,6 +2128,44 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert!(loop_.pending().is_none());
+    }
+
+    /// The upstream closes a tool turn with a bare `finish_reason` chunk that
+    /// carries no delta. It has to be neutralised too, or the client is told
+    /// the turn is over while the search is still running.
+    #[test]
+    fn bare_finish_reason_chunk_is_neutralised() {
+        let mut f = SearchCallFilter::default();
+        f.ours.insert(0, ("call_1".into(), "{}".into()));
+        let out = rewrite_chunk_search(
+            &json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+                .to_string(),
+            &mut f,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["choices"][0]["finish_reason"].is_null(), "{out}");
+
+        // A client tool in the same turn means no search, so the finish that
+        // hands those calls to the client must survive.
+        f.saw_other = true;
+        let data =
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}).to_string();
+        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
+
+        // So must an ordinary end-of-turn finish.
+        f.saw_other = false;
+        let data = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}).to_string();
+        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
+    }
+
+    /// The trailing usage-only chunk (`choices: []`) must pass through: it
+    /// carries the token counts.
+    #[test]
+    fn usage_only_chunk_passes_through() {
+        let mut f = SearchCallFilter::default();
+        f.ours.insert(0, ("call_1".into(), "{}".into()));
+        let data = json!({"choices": [], "usage": {"prompt_tokens": 5}}).to_string();
+        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
     }
 
     /// `max_uses` is a hard stop: a model that keeps searching runs out of
