@@ -692,20 +692,57 @@ video_status_url = "https://apihub.agnes-ai.com/agnesapi?video_id={id}"
 # from the client once Agnes documents it.
 video_models = ["agnes-video-v2.0", "agnes-video-2.5-flash", "agnes-video-2.5"]
 
-# b.ai — 42 models (Claude/GPT/Gemini/GLM/Qwen), nearly all deposit-gated
-# ("Access restricted. Deposit required to unlock premium models"). Full
-# catalog sweep 2026-08-24 found exactly ONE model usable at zero balance:
-# mimo-v2.5 — free but heavily throttled (429s with empty bodies under any
-# concurrency), so keep rpm low and let failover absorb it.
+# b.ai — 44 models (Claude/GPT/Gemini/GLM/Qwen), nearly all deposit-gated
+# ("Access restricted. Deposit required to unlock premium models", or a
+# balance=0 quota error). Re-swept 2026-08-28: SIX models now answer at zero
+# balance, up from just mimo-v2.5 in the 08-24 sweep. All six tool call in both
+# streaming and non-streaming, and vision-exp reads images. Free tier, so they
+# are auto-chain candidates — safely: b.ai's /v1/models reports no pricing and
+# no :free suffix, so discovery can never promote the deposit-gated catalogue,
+# and only the hand-listed ids below become candidates.
+# The rate limit is ACCOUNT-WIDE, not per-model — saturating deepseek-v4-flash
+# 429s hy3/qwen/mimo in the same breath — which is exactly the shape of pxy's
+# per-provider rpm gate. Measured ~10 req/min on a sliding window, empty-body
+# 429s, no rate-limit headers at all (it's a One API gateway); rpm 8 leaves
+# headroom. No balance_url: every non-inference path 403s with "HTTP node only
+# allows access to inference API paths".
+# There is a SECOND, account-wide ceiling underneath the rpm one: a COST
+# budget. Past it every model 503s with activity_cost_limit_reached — "today's
+# activity cost limit has been reached". Despite that wording it is NOT a
+# day-long lockout: it tripped after ~5.5M prompt tokens of padded probes and
+# cleared roughly ten minutes later, so treat it as a rolling cost window.
+# No `daily_tokens` limit is set here: the budget is denominated in cost rather
+# than tokens, b.ai publishes no figure, and the 503 already does the work —
+# pxy cools the model down and walks on. Only bulk traffic gets near it;
+# ordinary agent turns are orders of magnitude smaller.
+# ⚠️ context_length is measured against the LIVE API (binary search on a padded
+# prompt; the largest window that actually answered is what's recorded).
+# b.ai's over-limit 400 names no ceiling — except on hy3, which states its own.
 [providers.bai]
-tier = "reserve"
 base_url = "https://api.b.ai/v1/chat/completions"
 api_key = { pass = "AI/bai/main" }
 models = [
-  { id = "mimo-v2.5", context_length = 128000 },
+  # 960,002 prompt tokens accepted, ~1.02M rejected. Fastest here (~2s), and
+  # the only one that answers from several backends (-0731, -202605, plain).
+  { id = "deepseek-v4-flash", context_length = 1000000, tool_call = true },
+  # Same window. Image input verified 2026-08-28. max_tokens capped at 393216.
+  { id = "deepseek-v4-flash-vision-exp", context_length = 1000000, tool_call = true },
+  # 507,419 accepted, ~970k rejected. max_tokens capped at 131072. A cold call
+  # can take 80s+ before the first byte; short probes make it look dead.
+  { id = "glm-5.3-flash", context_length = 524288, tool_call = true },
+  # 503,552 accepted, ~970k rejected. max_tokens capped at 131072.
+  { id = "qwen3.8-flash", context_length = 524288, tool_call = true },
+  # 489,408 accepted, ~940k rejected. Flakiest of the six: intermittent 503
+  # "No available channel for model mimo-v2.5" that clears on its own, so let
+  # failover absorb it. Reports reasoning as `reasoning` (OpenRouter shape),
+  # not `reasoning_content`.
+  { id = "mimo-v2.5", context_length = 524288, tool_call = true },
+  # The one model that names its own ceiling in the 400: "Input tokens exceed
+  # the configured limit of 192000 tokens".
+  { id = "hy3", context_length = 192000, tool_call = true },
 ]
 [providers.bai.limits]
-rpm = 2
+rpm = 8
 
 # UNUSABLE (commented out) — freemodel.dev: 3 GPT-5.6 models, account returns "Insufficient
 # balance" (probed 2026-08-24). Disabled until topped up.
