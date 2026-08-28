@@ -17,8 +17,12 @@ user's global config.
   - `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_FABLE_MODEL` — alias remaps.
   - `CLAUDE_CODE_SUBAGENT_MODEL` — subagent model.
 - `API_TIMEOUT_MS` (default 600000; values > 2147483647 overflow and break).
-- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` recommended with gateways — but it also disables
-  gateway model discovery.
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` is the usual gateway recommendation, but it also
+  disables gateway model discovery, and a settings.json `env` block applies it *over* whatever the
+  launcher put in the child environment. pxy sends its telemetry half instead
+  (`DISABLE_TELEMETRY` + `DISABLE_ERROR_REPORTING`) and neutralises a user-level copy with
+  `--settings '{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":""}}'` — the CLI settings scope
+  outranks user settings and an empty value reads as unset.
 
 ### Endpoints Claude Code calls on the base URL
 | Endpoint | Required? | Notes |

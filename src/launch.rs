@@ -82,6 +82,13 @@ fn launch_claude(
     extra_args: &[String],
 ) -> Result<()> {
     let mut cmd = Command::new("claude");
+    // Claude Code applies a settings file's `env` block OVER the process
+    // environment, so a user-level CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    // re-disables the model discovery enabled below no matter what pxy puts in
+    // the child env. The --settings scope outranks user settings and an empty
+    // value reads as unset. Before extra_args so a caller's own --settings wins.
+    cmd.arg("--settings")
+        .arg(r#"{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":""}}"#);
     cmd.args(extra_args);
 
     // Delete every inherited ANTHROPIC_* var: a stale shell token must not
@@ -99,7 +106,13 @@ fn launch_claude(
     cmd.env("ANTHROPIC_MODEL", model);
     let small = cfg.launch.small_model.clone().unwrap_or_else(|| model.to_string());
     cmd.env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &small);
-    cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    // NOT CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: it also switches off
+    // gateway model discovery (docs/en/llm-gateway-protocol, "When discovery
+    // runs"), which would cancel the flag below — inherited copies too, hence
+    // the removal. These two are the telemetry half of it, all pxy wants off.
+    cmd.env_remove("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC");
+    cmd.env("DISABLE_TELEMETRY", "1");
+    cmd.env("DISABLE_ERROR_REPORTING", "1");
     // In-session /model switching across every pxy provider: the picker
     // reads /v1/models, which mirrors all ids under a "claude/" prefix.
     cmd.env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");

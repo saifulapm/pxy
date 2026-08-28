@@ -458,15 +458,18 @@ async fn models(State(app): State<SharedApp>) -> Json<Value> {
             "max_output_tokens": cand.model.max_output_tokens,
         }));
     }
-    // Claude Code's gateway model picker only lists ids beginning
-    // "claude"/"anthropic": mirror everything else under a "claude/" prefix
-    // (catalog.resolve strips it) so /model works across every provider.
+    // Claude Code's gateway model picker only lists ids CONTAINING
+    // "claude"/"anthropic" (case-insensitive): mirror everything else under a
+    // "claude/" prefix (catalog.resolve strips it) so /model works across every
+    // provider. Ids that already carry the substring are left alone — mirroring
+    // them too would list each one twice.
     // display_name carries the real id so the picker stays readable.
     let mirrors: Vec<Value> = data
         .iter()
         .filter_map(|m| {
             let id = m["id"].as_str()?;
-            if id.starts_with("claude") || id.starts_with("anthropic") {
+            let lower = id.to_ascii_lowercase();
+            if lower.contains("claude") || lower.contains("anthropic") {
                 return None;
             }
             let mut v = m.clone();
