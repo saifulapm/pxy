@@ -261,14 +261,26 @@ pub async fn discover(
             id: id.to_string(),
             free: free_of(rec, id),
             tool_call: Tri::from_opt(known.and_then(|c| c.tool_call)),
-            context: rec["context_length"]
-                .as_u64()
-                .or_else(|| rec["tokenLimits"]["maxInputTokens"].as_u64())
-                .or_else(|| known.and_then(|c| c.context)),
+            context: discovered_context(rec, known),
             canonical: canon,
         });
     }
     ProviderCatalog::Ok(out)
+}
+
+/// Context window for one discovered record, across the id spellings gateways
+/// use. A ZERO window is not a window, it is a missing one: aihubmix lists
+/// image models (gpt-image-2-free) with a null `context_length` and the
+/// models.dev fallback answers 0. Left as `Some(0)` that reaches generated.toml
+/// verbatim, and pi rejects the whole pxy provider over it ("invalid
+/// contextWindow"). Reporting `None` instead lets the caller apply
+/// `default_context()`, exactly as for a provider that omits the field.
+fn discovered_context(rec: &Value, known: Option<&Caps>) -> Option<u64> {
+    rec["context_length"]
+        .as_u64()
+        .or_else(|| rec["tokenLimits"]["maxInputTokens"].as_u64())
+        .or_else(|| known.and_then(|c| c.context))
+        .filter(|c| *c > 0)
 }
 
 fn snippet(s: &str) -> String {
@@ -888,6 +900,34 @@ mod tests {
         ] {
             assert_eq!(canonical(input), want, "canonical({input})");
         }
+    }
+
+    #[test]
+    fn zero_context_reads_as_unknown_not_as_a_window() {
+        // aihubmix's gpt-image-2-free: null upstream, 0 from the caps fallback.
+        // Some(0) used to reach generated.toml and break pi's models.json.
+        let caps = Caps {
+            context: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            discovered_context(&json!({"id": "gpt-image-2-free", "context_length": null}), Some(&caps)),
+            None
+        );
+        // A provider reporting 0 directly is equally meaningless.
+        assert_eq!(
+            discovered_context(&json!({"context_length": 0}), None),
+            None
+        );
+        // Real windows still come through, from either spelling.
+        assert_eq!(
+            discovered_context(&json!({"context_length": 262144}), None),
+            Some(262144)
+        );
+        assert_eq!(
+            discovered_context(&json!({"tokenLimits": {"maxInputTokens": 131072}}), None),
+            Some(131072)
+        );
     }
 
     #[test]

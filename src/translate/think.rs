@@ -28,20 +28,41 @@ impl ThinkFilter {
         let mut content = String::new();
 
         loop {
-            let tag = if self.inside { CLOSE } else { OPEN };
-            if let Some(idx) = self.buffer.find(tag) {
+            // Outside a block BOTH tags matter, and the earlier one wins. A
+            // `</think>` with no `<think>` before it is not stray text: the
+            // DeepSeek-family chat templates PRE-FILL the opening tag, so the
+            // model only ever emits the closing half and everything up to it
+            // is reasoning. Scanning for `<think>` alone published that
+            // reasoning as content and the tag itself as literal text.
+            let hit = if self.inside {
+                self.buffer.find(CLOSE).map(|i| (i, CLOSE, true))
+            } else {
+                let open = self.buffer.find(OPEN).map(|i| (i, OPEN, false));
+                let close = self.buffer.find(CLOSE).map(|i| (i, CLOSE, true));
+                match (open, close) {
+                    (Some(o), Some(c)) => Some(if c.0 < o.0 { c } else { o }),
+                    (o, c) => o.or(c),
+                }
+            };
+            if let Some((idx, tag, is_close)) = hit {
                 let before: String = self.buffer[..idx].to_string();
                 self.buffer.drain(..idx + tag.len());
-                if self.inside {
+                if self.inside || is_close {
                     reasoning.push_str(&before);
                 } else {
                     content.push_str(&before);
                 }
-                self.inside = !self.inside;
+                // A close always lands us outside; an open always inside.
+                self.inside = !is_close;
                 continue;
             }
             // No full tag: keep only a tail that could still become one.
-            let keep = partial_suffix_len(&self.buffer, tag);
+            let keep = if self.inside {
+                partial_suffix_len(&self.buffer, CLOSE)
+            } else {
+                partial_suffix_len(&self.buffer, OPEN)
+                    .max(partial_suffix_len(&self.buffer, CLOSE))
+            };
             let emit_len = self.buffer.len() - keep;
             let emitted: String = self.buffer[..emit_len].to_string();
             self.buffer.drain(..emit_len);
@@ -84,7 +105,9 @@ fn partial_suffix_len(s: &str, tag: &str) -> usize {
 /// One-shot extraction for non-streaming responses.
 /// Returns (reasoning, content); reasoning is None when no tags were found.
 pub fn extract(text: &str) -> (Option<String>, String) {
-    if !text.contains(OPEN) {
+    // CLOSE counts on its own: a pre-filled `<think>` never reaches us, so a
+    // reply whose only tag is `</think>` still carries a reasoning span.
+    if !text.contains(OPEN) && !text.contains(CLOSE) {
         return (None, text.to_string());
     }
     let mut f = ThinkFilter::new();
@@ -115,6 +138,27 @@ mod tests {
         let (r, c) = extract("<think>never closed");
         assert_eq!(r.as_deref(), Some("never closed"));
         assert_eq!(c, "");
+    }
+
+    #[test]
+    fn bare_closing_tag_is_a_prefilled_block_not_text() {
+        // DeepSeek-family templates PRE-FILL the opening `<think>`, so the
+        // reply legitimately carries only the closing half. Treating it as
+        // text leaked a stray `</think>` into agent transcripts.
+        let (r, c) = extract("weighing the options</think>the answer");
+        assert_eq!(r.as_deref(), Some("weighing the options"));
+        assert_eq!(c, "the answer");
+    }
+
+    #[test]
+    fn bare_closing_tag_streams_without_leaking() {
+        let mut f = ThinkFilter::new();
+        let (r1, c1) = f.push("weighing ");
+        assert_eq!((r1.as_str(), c1.as_str()), ("", "weighing "));
+        let (r2, c2) = f.push("options</think>the answer");
+        assert_eq!(r2, "options");
+        assert_eq!(c2, "the answer");
+        assert!(!c1.contains("think") && !c2.contains("think"));
     }
 
     #[test]

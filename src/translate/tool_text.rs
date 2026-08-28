@@ -338,6 +338,18 @@ mod tests {
     }
 
     #[test]
+    fn near_miss_opener_round_trips_byte_for_byte() {
+        // `<tools/run ...>` shares a five-byte prefix with `<tool_call>`, so
+        // it gets held as a candidate opener and then disproved. Releasing it
+        // re-spelled would corrupt a model's own markup into something the
+        // client renders as garbage.
+        let mut f = ToolTextFilter::new(names(&["Bash"]));
+        let (text, calls) = run(&mut f, &["<tool", "s/run command>ls</tool", "s/run>"]);
+        assert!(calls.is_empty());
+        assert_eq!(text, "<tools/run command>ls</tools/run>");
+    }
+
+    #[test]
     fn multibyte_text_never_panics() {
         // The think.rs lesson, relearned: unguarded suffix slicing panics on
         // any CJK/emoji within opener-length distance of the chunk end.

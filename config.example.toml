@@ -341,10 +341,16 @@ daily_requests = 30
 # opencode Zen: pay-per-token gateway sharing the Go workspace key.
 # The *-free models cost nothing (limited time; NVIDIA ones are trial-only —
 # don't send personal data; muse-spark trains on prompts).
+# Every model here is a reasoning model (deepseek/hy3/mimo/nemotron/laguna).
+# opencode usually returns the chain-of-thought in `reasoning_content`, but a
+# `</think>` has been seen leaking into a Claude Code transcript from
+# deepseek-v4-flash, so parse the tags out of content too — a no-op on the
+# responses that use the field properly.
 [providers.opencode-zen]
 tier = "subscription"
 base_url = "https://opencode.ai/zen/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/github" }
+parse_think_tags = true
 models = [
   "big-pickle",
   "hy3-free",
@@ -362,6 +368,7 @@ models = [
 # 429+Retry-After cooldown rotates between them automatically.
 [providers.opencode-go-github]
 tier = "subscription"
+parse_think_tags = true   # same reasoning models as opencode-zen above
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 # Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
 balance_url = "https://opencode.ai/zen/go/v1/usage"
@@ -385,6 +392,7 @@ models = [
 
 [providers.opencode-go-google]
 tier = "subscription"
+parse_think_tags = true   # same reasoning models as opencode-zen above
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 # Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
 balance_url = "https://opencode.ai/zen/go/v1/usage"
