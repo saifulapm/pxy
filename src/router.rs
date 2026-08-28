@@ -676,7 +676,40 @@ async fn try_candidate(
     });
 
     app.state.rpm_increment(&cand.provider);
-    let resp = match req.json(&body).send().await {
+    // A streaming upstream returns headers as soon as it accepts the request,
+    // so silence here means it is not answering at all. With a chain to fall
+    // back on, waiting out timeout_secs (600s by default) for that is the
+    // wrong trade — one dead provider at the head of `auto` would strand
+    // every request. An explicitly named model still gets the full timeout:
+    // there is nothing to fail over to. Non-streaming is exempt because its
+    // headers legitimately arrive only once the whole answer is generated.
+    let send = req.json(&body).send();
+    let resp = if multi && (stream || force_stream) {
+        match tokio::time::timeout(HEADERS_DEADLINE, send).await {
+            Ok(r) => r,
+            Err(_) => {
+                // Provider-scoped, like a network error: an endpoint that
+                // accepts the connection and then says nothing is not
+                // answering for ANY of its models, and the escalating default
+                // starts at 3s — long gone by the next candidate from the same
+                // provider, so the walk would pay the deadline again and again.
+                app.state.set_cooldown(
+                    &cand.provider,
+                    None,
+                    Some(HEADERS_COOLDOWN),
+                    true,
+                    "no response headers",
+                );
+                return AttemptResult::Skip(format!(
+                    "no response after {}s",
+                    HEADERS_DEADLINE.as_secs()
+                ));
+            }
+        }
+    } else {
+        send.await
+    };
+    let resp = match resp {
         Ok(r) => r,
         Err(e) => {
             // Network failures are our-side/transport, not model-specific.
@@ -1692,12 +1725,24 @@ impl StreamCtx {
                 out.push_str(&state.emit_block(block));
             }
             // Passthrough — codex, through /v1/responses. Chat completions has
-            // no event meaning "a search happened", so nothing is spliced in;
-            // the client sees the answer the results produced, with the URLs
-            // the model cites from them.
+            // no event for "a search happened", so pxy sends its own marker
+            // chunk and translate/responses turns it into the Responses API's
+            // `web_search_call` item. Without it the user watches a silent gap
+            // for as long as the searches take and assumes it has hung.
+            // Shaped as an ordinary empty-choices chunk so a plain chat client
+            // (which never asked for this and can't reach here anyway) would
+            // skip it the way it skips the usage chunk.
             _ => {
                 let spent = std::mem::take(&mut self.usage);
                 record_tokens(&self.app, &self.agent, &self.provider, &self.model, spent);
+                out.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [],
+                        "pxy_web_search": {"id": call_id, "query": query},
+                    })
+                ));
             }
         }
         Some(Bytes::from(out))
@@ -1817,6 +1862,17 @@ fn error_event_status(data: &str) -> Option<u16> {
 /// while a free model queues) is alive, and failover before the deadline
 /// happens only on affirmative evidence of death.
 const FIRST_EVENT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a streaming candidate may take to return response headers while
+/// other candidates are waiting. Generous enough for a cold model to accept
+/// the request, short enough that a hung provider costs seconds, not the
+/// 600-second default timeout.
+const HEADERS_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a provider that failed to answer is left out of the walk. Flat
+/// rather than the escalating default: one silent endpoint should cost the
+/// chain a single deadline, not one per model it offers.
+const HEADERS_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Returns Err when the stream died before producing a first event — the
 /// caller treats that as a failed attempt and walks on. Nothing has been

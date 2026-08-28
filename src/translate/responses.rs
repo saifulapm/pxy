@@ -476,6 +476,17 @@ impl StreamState {
             self.usage = TokenUsage::from_openai(&chunk["usage"]);
         }
 
+        // pxy's marker for a search it ran itself (router::continue_after_search).
+        // Replayed here as the Responses API's own `web_search_call` item so the
+        // client shows the query instead of a silent gap.
+        if let Some(ws) = chunk.get("pxy_web_search").filter(|v| v.is_object()) {
+            out.push_str(&self.web_search_call(
+                ws["id"].as_str().unwrap_or("ws_pxy"),
+                ws["query"].as_str().unwrap_or(""),
+            ));
+            return out;
+        }
+
         let choices = chunk["choices"].as_array().cloned().unwrap_or_default();
         if choices.is_empty() {
             // Trailing usage-only chunk after finish_reason deferred completion.
@@ -602,6 +613,38 @@ impl StreamState {
         ));
         let item = json!({"id": id, "type": "reasoning",
                           "summary": [{"type": "summary_text", "text": buf}]});
+        out.push_str(&self.emit(
+            "response.output_item.done",
+            json!({"output_index": idx, "item": item}),
+        ));
+        self.completed_items.push(item);
+        out
+    }
+
+    /// A completed `web_search_call` item — the search pxy ran on the model's
+    /// behalf. Emitted whole (added + done) because by the time pxy says so the
+    /// results are already in hand. Any open reasoning or message block is
+    /// closed first so output items stay in order.
+    fn web_search_call(&mut self, id: &str, query: &str) -> String {
+        let mut out = self.close_reasoning();
+        out.push_str(&self.close_message());
+        let idx = self.next_index;
+        self.next_index += 1;
+        // added(in_progress) then done(completed), the pair the real API
+        // streams — a client that tracks items by `added` would otherwise
+        // never see this one. pxy already has the results by now, so the
+        // in-progress phase is momentary.
+        let mut item = json!({
+            "id": format!("ws_{id}"),
+            "type": "web_search_call",
+            "status": "in_progress",
+            "action": {"type": "search", "query": query},
+        });
+        out.push_str(&self.emit(
+            "response.output_item.added",
+            json!({"output_index": idx, "item": item}),
+        ));
+        item["status"] = json!("completed");
         out.push_str(&self.emit(
             "response.output_item.done",
             json!({"output_index": idx, "item": item}),

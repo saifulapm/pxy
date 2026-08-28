@@ -425,8 +425,97 @@ async fn count_tokens(Json(payload): Json<Value>) -> Json<Value> {
     Json(json!({"input_tokens": tokens.max(1)}))
 }
 
+/// codex identifies itself with an `originator` header — `codex_cli_rs` in the
+/// TUI, `codex_exec` for `codex exec` — and it is the one client that reads a
+/// different dialect off this path.
+fn is_codex(headers: &HeaderMap) -> bool {
+    headers
+        .get("originator")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("codex"))
+}
+
+/// The instructions codex prepends for a pxy model. Its own models each ship
+/// one; an entry without it is rejected outright, and codex's built-in
+/// fallback is written for GPT-5 and its tool set.
+const CODEX_BASE_INSTRUCTIONS: &str = "You are a coding agent running in the Codex CLI. \
+You share a workspace with the user and help them carry out software engineering tasks. \
+Use the tools you are given to read and edit files and to run commands, and prefer doing \
+the work over describing it. Be concise and factual: state what you did and what you found, \
+without padding.";
+
+/// One entry of codex's model manifest. Codex validates the whole document, so
+/// a missing or unknown field rejects EVERY model, not just this one — the
+/// shape here was verified field by field against codex 0.150.1.
+fn codex_model_entry(slug: &str, display: &str, context: u64) -> Value {
+    json!({
+        "slug": slug,
+        "display_name": display,
+        "description": format!("via pxy ({slug})"),
+        "base_instructions": CODEX_BASE_INSTRUCTIONS,
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+            {"effort": "medium", "description": "Balances speed and reasoning depth"},
+            {"effort": "high", "description": "Greater reasoning depth"},
+        ],
+        "shell_type": "unified_exec",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 1,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": null,
+        "upgrade": null,
+        "include_skills_usage_instructions": false,
+        "include_plugin_usage_instructions": false,
+        "include_apps_usage_instructions": false,
+        "default_reasoning_summary": "none",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_image_detail_original": false,
+        "context_window": context,
+        "max_context_window": context,
+        "comp_hash": "3000",
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+        // pxy runs web search itself for openai upstreams (translate/web_search)
+        "supports_search_tool": true,
+        "use_responses_lite": false,
+        "node_repl_auto_review_required": false,
+        "node_repl_disabled": true,
+        "tool_mode": "default",
+        "multi_agent_version": "v2",
+    })
+}
+
+/// codex's model manifest. Without it codex can't see pxy's models in its
+/// picker and warns that it is falling back to built-in metadata. The
+/// "claude/" mirrors are left out: they exist only to get past Claude Code's
+/// picker filter and would double every row here.
+fn codex_models(app: &SharedApp) -> Json<Value> {
+    let mut models: Vec<Value> = Vec::new();
+    let auto_chain = app.catalog.resolve(&app.cfg, "auto");
+    if !auto_chain.is_empty() {
+        let ctx = auto_chain.iter().map(|c| c.model.context_length).min().unwrap_or(0);
+        models.push(codex_model_entry("auto", "auto", ctx));
+    }
+    for cand in app.catalog.models() {
+        let id = cand.full_id();
+        models.push(codex_model_entry(&id, &id, cand.model.context_length));
+    }
+    Json(json!({"models": models}))
+}
+
 /// Must answer fast: Claude Code's gateway discovery times out at 3s.
-async fn models(State(app): State<SharedApp>) -> Json<Value> {
+async fn models(State(app): State<SharedApp>, headers: HeaderMap) -> Json<Value> {
+    if is_codex(&headers) {
+        return codex_models(&app);
+    }
     let created = Timestamp::now().as_second();
     let mut data: Vec<Value> = Vec::new();
     let auto_chain = app.catalog.resolve(&app.cfg, "auto");
@@ -902,6 +991,32 @@ async fn fetch_balance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only codex gets the manifest dialect, and it announces itself with
+    /// `originator` — `codex_cli_rs` in the TUI, `codex_exec` under
+    /// `codex exec`. Every other client keeps the OpenAI list.
+    #[test]
+    fn codex_is_recognised_by_originator() {
+        assert!(is_codex(&headers(&[("originator", "codex_cli_rs")])));
+        assert!(is_codex(&headers(&[("originator", "codex_exec")])));
+        assert!(!is_codex(&headers(&[("originator", "opencode")])));
+        assert!(!is_codex(&headers(&[])));
+    }
+
+    /// The manifest is validated as a whole by codex: one entry missing a
+    /// required field rejects every model. `base_instructions` is the field it
+    /// named explicitly, and the entry is useless in the picker without
+    /// `visibility: "list"` and `supported_in_api`.
+    #[test]
+    fn codex_entry_carries_the_fields_codex_validates() {
+        let e = codex_model_entry("prov/model", "prov/model", 128_000);
+        assert_eq!(e["slug"], "prov/model");
+        assert_eq!(e["visibility"], "list");
+        assert_eq!(e["supported_in_api"], true);
+        assert_eq!(e["context_window"], 128_000);
+        assert!(e["base_instructions"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(e["supported_reasoning_levels"].as_array().is_some_and(|a| !a.is_empty()));
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

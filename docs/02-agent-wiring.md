@@ -24,6 +24,16 @@ user's global config.
   `--settings '{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":""}}'` — the CLI settings scope
   outranks user settings and an empty value reads as unset.
 
+## codex
+
+`GET /v1/models?client_version=<v>` is fetched with an `originator` header (`codex_cli_rs` in
+the TUI, `codex_exec` under `codex exec`) and must answer in codex's OWN dialect —
+`{"models":[{slug, display_name, base_instructions, context_window, visibility, …}]}`, not the
+OpenAI `{"data":[…]}` list. The document is validated whole, so one entry missing a required
+field rejects every model: codex then warns "Model metadata not found… can degrade performance"
+and its `/model` picker can't see pxy at all. `base_instructions` (or
+`model_messages.instructions_template`) is the field it names first when it's absent.
+
 ### Endpoints Claude Code calls on the base URL
 | Endpoint | Required? | Notes |
 |---|---|---|
