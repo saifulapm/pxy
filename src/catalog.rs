@@ -2,6 +2,33 @@ use std::collections::BTreeMap;
 
 use crate::config::{Config, ModelSpec, ProviderConfig, WireFormat};
 
+/// Suffix pxy appends to a Claude Code mirror id whose window is >= 1M. It
+/// exists purely to be read back by Claude Code, which resolves any id matching
+/// /\[1m\]/i to a 1,000,000-token window; it is never part of a provider's real
+/// id, so resolve() takes it off again before routing.
+const CTX_1M_MARKER: &str = "[1m]";
+
+/// The id a Claude Code mirror is advertised under (server::models).
+///
+/// Claude Code DISCARDS the `context_length` in that listing — its gateway
+/// discovery schema is `{id, display_name?}` followed by `.strip()` — so the
+/// only window it knows for a mirror is the launch-time
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, stale the moment `/model` picks something
+/// else. A `[1m]` anywhere in the id is the one per-model signal it honours:
+/// getModelContextWindow tests `/\[1m\]/i` ahead of every env var, and
+/// re-resolves on each model switch. Rounds 1048576 down to 1000000 — the safe
+/// direction. An id that already carries the marker is left as is, which is
+/// what lets resolve() treat a trailing one as unambiguously pxy's.
+pub fn claude_mirror_id(id: &str, context_length: u64) -> String {
+    let marker = if context_length >= 1_000_000 && !id.to_ascii_lowercase().contains(CTX_1M_MARKER)
+    {
+        CTX_1M_MARKER
+    } else {
+        ""
+    };
+    format!("claude/{id}{marker}")
+}
+
 /// A concrete (provider, model) pair a request can be routed to.
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -102,6 +129,7 @@ impl Catalog {
     /// Is this id a routable group (bare, or behind the "claude/" mirror)?
     pub fn is_group(&self, requested: &str) -> bool {
         let bare = requested.strip_prefix("claude/").unwrap_or(requested);
+        let bare = bare.strip_suffix(CTX_1M_MARKER).unwrap_or(bare);
         self.groups.get(bare).is_some_and(|g| !g.chain.is_empty())
     }
 
@@ -138,6 +166,11 @@ impl Catalog {
         // would hand the subscription's model to whichever provider sorts
         // first (agentrouter hijack, caught in review).
         if let Some(rest) = requested.strip_prefix("claude/") {
+            // A trailing "[1m]" here is always pxy's own window marker: the
+            // mirror only appends it to ids that lack it, so a provider id that
+            // genuinely ends in "[1m]" is mirrored unchanged and never reaches
+            // this strip with a doubled suffix.
+            let rest = rest.strip_suffix(CTX_1M_MARKER).unwrap_or(rest);
             if let Some(g) = self.groups.get(rest) {
                 // An empty chain -> empty candidates -> clean local 404, same
                 // as the bare group name; never a literal group id upstream.
@@ -213,7 +246,7 @@ mod tests {
             models = ["claude-opus-5"]
             [providers.zai]
             base_url = "https://z.example/chat"
-            models = ["glm-4.7-flash"]
+            models = ["glm-4.7-flash", { id = "glm-5.3-flash", context_length = 1048576 }]
             [groups.free]
             models = ["zai/glm-4.7-flash"]
             [groups.subscription]
@@ -242,6 +275,37 @@ mod tests {
         let r = cat.resolve(&c, "claude/claude-nonexistent-model");
         assert_eq!(r[0].provider, "claude");
         assert_eq!(r[0].model.id, "claude-nonexistent-model");
+    }
+
+    /// The marker exists only so Claude Code reads a 1M window off the id; a
+    /// provider must never see it. Round-trips against the id the listing
+    /// actually advertises, so the append and the strip cannot drift apart.
+    #[test]
+    fn the_1m_window_marker_comes_off_before_routing() {
+        let c = cfg();
+        let cat = Catalog::from_config(&c);
+
+        let mirrored = claude_mirror_id("zai/glm-5.3-flash", 1_048_576);
+        assert_eq!(mirrored, "claude/zai/glm-5.3-flash[1m]");
+        let r = cat.resolve(&c, &mirrored);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].provider, "zai");
+        assert_eq!(r[0].model.id, "glm-5.3-flash");
+
+        // Sub-1M ids are untouched, and an id that already ends in the marker
+        // is not doubled — that is what makes a trailing one safe to strip.
+        assert_eq!(
+            claude_mirror_id("zai/glm-4.7-flash", 200_000),
+            "claude/zai/glm-4.7-flash"
+        );
+        assert_eq!(
+            claude_mirror_id("vercel/some-model[1m]", 1_000_000),
+            "claude/vercel/some-model[1m]"
+        );
+
+        // Groups carry it the same way, and stay recognisable as groups.
+        assert!(cat.is_group("claude/free[1m]"));
+        assert_eq!(cat.resolve(&c, "claude/free[1m]")[0].provider, "zai");
     }
 
     #[test]

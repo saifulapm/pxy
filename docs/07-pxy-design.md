@@ -108,9 +108,13 @@ contain slashes themselves (OmniRoute's resolver rule). `auto` is a virtual mode
 - `pxy launch claude [--model X]`: health-check self, then spawn with clean env:
   delete inherited `ANTHROPIC_*`; set `ANTHROPIC_BASE_URL` (no /v1), `ANTHROPIC_AUTH_TOKEN`,
   `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` (cheap model from config),
-  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (from model's context length). Model picker: expose
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (from the model's context length; NOT
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which pins one window for the whole session and blocks
+  in-session `/model` switches from widening it). Model picker: expose
   `claude-*`-prefixed aliases in /v1/models (strip server-side) OR skip discovery — v1 skips
-  discovery, uses env vars.
+  discovery, uses env vars. Claude Code's gateway discovery drops the `context_length` in
+  that listing (schema is `{id, display_name?}.strip()`), so mirrors of 1M-class models carry
+  a `[1m]` id marker — the only per-model window signal it reads.
 - `pxy launch opencode`: inject `OPENCODE_CONFIG_CONTENT` JSON (provider `pxy`,
   `@ai-sdk/openai-compatible`, baseURL with /v1, `{env:PXY_API_KEY}`), models map generated
   from config.

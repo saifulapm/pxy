@@ -122,7 +122,15 @@ fn launch_claude(
     // window instead (docs/en/model-config, "Correct the window for a gateway
     // or custom model ID"), which also silences that warning. min() over the
     // chain: any member may serve the request, so the declared window has to be
-    // one they all satisfy. The compact bound keeps 5% of it as headroom.
+    // one they all satisfy.
+    //
+    // Deliberately NOT CLAUDE_CODE_AUTO_COMPACT_WINDOW: it is the first branch
+    // of resolveAutoCompactWindow, so it pins ONE window for the entire session
+    // and no in-session /model switch can widen it — that is what froze a 1M
+    // model at the launch group's window. Claude Code already subtracts its own
+    // summary buffer, so reserving headroom here only double-discounted.
+    // Per-model windows after a switch come from the "[1m]" marker instead
+    // (server::models).
     let min_ctx = catalog
         .resolve(cfg, model)
         .iter()
@@ -130,7 +138,6 @@ fn launch_claude(
         .min();
     if let Some(ctx) = min_ctx {
         cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx.to_string());
-        cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", ((ctx * 95) / 100).to_string());
     }
 
     exec_or_print(cmd, dry_run, "claude wired via ANTHROPIC_* env vars")

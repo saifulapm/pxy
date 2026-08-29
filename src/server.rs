@@ -563,7 +563,7 @@ async fn models(State(app): State<SharedApp>, headers: HeaderMap) -> Json<Value>
                 return None;
             }
             let mut v = m.clone();
-            v["id"] = json!(format!("claude/{id}"));
+            v["id"] = json!(crate::catalog::claude_mirror_id(id, m["context_length"].as_u64().unwrap_or(0)));
             v["display_name"] = json!(id);
             Some(v)
         })
