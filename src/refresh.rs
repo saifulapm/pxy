@@ -53,13 +53,6 @@ impl Tri {
             None => Tri::Unknown,
         }
     }
-    fn mark(self) -> &'static str {
-        match self {
-            Tri::Yes => "yes",
-            Tri::No => "no",
-            Tri::Unknown => "?",
-        }
-    }
     /// Back to an Option for the generated file. `Unknown` writes NOTHING —
     /// the key is absent, not `false`: OmniRoute shipped `tools: bool` with
     /// `false` doubling as unknown and had to bump their schema to undo it.
@@ -331,19 +324,8 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
 
     let mut stale: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
-    let mut ungrouped: BTreeMap<String, Vec<Discovered>> = BTreeMap::new();
-    let mut pools: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut found: BTreeMap<String, Vec<Discovered>> = BTreeMap::new();
     let (mut n_ok, mut n_models) = (0usize, 0usize);
-
-    // Every "provider/model" that some group already routes to. Discovery's
-    // job is to surface what ISN'T in a chain yet — a free, tool-capable model
-    // nobody put in a group is the one actionable finding this command has.
-    let grouped: BTreeSet<&str> = cfg
-        .groups
-        .values()
-        .flat_map(|g| g.models.iter().map(String::as_str))
-        .collect();
 
     for (name, pcfg) in &cfg.providers {
         if !pcfg.enabled {
@@ -391,30 +373,9 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
                 for m in &missing {
                     stale.push(format!("{name}/{m}"));
                 }
-                for m in &models {
-                    if m.free == Tri::Yes && m.tool_call == Tri::Yes {
-                        pools
-                            .entry(m.canonical.clone())
-                            .or_default()
-                            .insert(name.clone());
-                    }
-                }
-                // Free + tool-capable + in no group yet = worth adding to one.
-                let all = models.clone();
-                let cands: Vec<Discovered> = models
-                    .into_iter()
-                    .filter(|m| {
-                        m.free == Tri::Yes
-                            && m.tool_call == Tri::Yes
-                            && !grouped.contains(format!("{name}/{}", m.id).as_str())
-                    })
-                    .collect();
-                if !cands.is_empty() {
-                    ungrouped.insert(name.clone(), cands);
-                }
                 // Keep the FULL list — free and paid alike: it is what gets
                 // written to the models.toml report.
-                found.insert(name.clone(), all);
+                found.insert(name.clone(), models);
             }
         }
     }
@@ -440,46 +401,6 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
             "  NOTE: not proof of removal — a listing can omit a working model.\n\
              \x20       Verify with a real call before deleting anything."
         );
-    }
-
-    // Which canonical models are served by more than one provider — the pools
-    // to interleave when hand-writing a group, so one provider's 429 doesn't
-    // stall the chain.
-    if !pools.is_empty() {
-        let mut multi: Vec<(&String, &BTreeSet<String>)> =
-            pools.iter().filter(|(_, v)| v.len() > 1).collect();
-        multi.sort_by_key(|(name, provs)| (std::cmp::Reverse(provs.len()), (*name).clone()));
-        println!("\nfree models served by multiple providers ({}):", multi.len());
-        for (name, provs) in multi.iter().take(12) {
-            println!(
-                "  {:<26} {} pools: {}",
-                name,
-                provs.len(),
-                provs.iter().cloned().collect::<Vec<_>>().join(", ")
-            );
-        }
-        if multi.len() > 12 {
-            println!("  … and {} more", multi.len() - 12);
-        }
-    }
-
-    let total_new: usize = ungrouped.values().map(|v| v.len()).sum();
-    println!("\nfree + tool-capable, in no group ({total_new}):");
-    for (prov, models) in &ungrouped {
-        let mut sorted = models.clone();
-        sorted.sort_by_key(|m| std::cmp::Reverse(m.context.unwrap_or(0)));
-        for m in sorted.iter().take(6) {
-            println!(
-                "  {:<20} {:<44} ctx={:<9} tools={}",
-                prov,
-                m.id,
-                m.context.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-                m.tool_call.mark()
-            );
-        }
-        if sorted.len() > 6 {
-            println!("  {:<20} … and {} more", prov, sorted.len() - 6);
-        }
     }
 
     if !write {
