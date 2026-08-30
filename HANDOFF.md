@@ -27,7 +27,7 @@ pxy route [MODEL|--clear]     # pin the auto route to one model (chain stays as 
 pxy explain <model> [--json]  # why each candidate would (not) be routed; --json for the panel
 pxy doctor                    # config/daemon/credentials/agents health, exit 1 on FAIL
 pxy explain <model>           # why each candidate would (not) be routed right now
-pxy refresh [--generate]      # discover catalogs; report drift / regenerate models.toml
+pxy refresh [--generate]      # discover catalogs; report drift / write models.toml (a report; pxy never reads it)
 pxy search "query" [-n N]     # web search (brave -> jina -> firecrawl)
 pxy fetch <url>               # URL -> markdown (jina-reader -> firecrawl)
 pxy transcribe <file>         # STT (groq whisper default)
@@ -195,8 +195,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     subscription inference via the Claude Code CLI's own OAuth credential at
     `~/.claude/.credentials.json` — no login flow in pxy. Rotating refresh tokens:
     5-min lead, process mutex + staleness re-read, atomic write-back (0600, .bak,
-    foreign keys preserved). `tier = "reserve"` — NEVER in `auto` (Saiful's rule),
-    manual selection only. Non-CC clients get the CC system sentinel auto-prepended.
+    foreign keys preserved). Real money per token — NEVER in an auto-routed chain
+    (Saiful's rule), manual selection only. Non-CC clients get the CC system sentinel auto-prepended.
     Known residual: process-local mutex can't stop a same-second CLI+pxy double
     refresh (worst case: `claude` re-login; flock would need a libc dep).
   - **429 body classification**: window-naming quota text gets a window-sized
@@ -239,8 +239,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   request-body keys the upstream 400s on (`reasoning_effort`, `top_k`, …), removed after
   translation just before the wire — a picky new free provider needs config, not code.
   `model`/`stream` are pxy's own keys and are ignored if listed; kiro's body_patch
-  merges later and can't be stripped. Curated `drop_params` survives the generated
-  overlay like tool_call/force_stream.
+  merges later and can't be stripped. Like every model fact (tool_call,
+  force_stream, pinned contexts) it lives in config.toml and nothing overwrites it.
 
 **Routing feature round (added 2026-08-30):**
 - **Failure-rate cooldown** (litellm's rule): `state.model_health` tracks
@@ -546,35 +546,45 @@ groq + mistral (STT), agnes (images/video).
    calls BEFORE writing any code if Antigravity ships a new client/API. Free Gemini is
    already covered by the `google` (AI Studio) provider in `auto`.
 4. **Catalog automation (`pxy refresh`) — REWRITTEN 2026-08-29 (commit e75a49c).**
-   `pxy refresh` = dry-run report; `pxy refresh --generate` = regenerate
-   `~/.config/pxy/models.toml`, which Config::load overlays onto config.toml at
-   startup. Restart pxy after a --generate.
+   `pxy refresh` = dry-run report; `pxy refresh --generate` = write
+   `~/.config/pxy/models.toml`.
+   - **models.toml IS NOT CONFIG — nothing loads it (changed 2026-08-30).**
+     `Config::load` reads config.toml and nothing else, so a model is served
+     exactly when config.toml declares it. models.toml is a REPORT of what each
+     provider's /models listed (discovery only — no merge with config.toml, and
+     discovery's own numbers, so verify a window before pinning it); you copy
+     rows out of it into a provider's `models = [...]` and restart pxy. Before
+     this, it was overlaid onto config.toml at startup, which made "why is this
+     model served / at this context length?" a two-file question.
    - **Groups replaced the auto route.** The generated `[auto]` chain — context
      buckets, `max_unranked`, open-weights ordering, the `[preferences]`
      tie-breaker, `deny`, `max_pools_per_model` — is ALL GONE. `[groups.*]`
-     chains are hand-written in config.toml, and generation produces only
-     per-provider MODEL LISTS (free and paid alike; `free` is a display fact,
-     routing never reads it). Model lists are a UNION with config.toml: a
-     provider's /models can omit a model that works, and for a model
-     config.toml also declares, the hand-written spec wins wholesale (so
-     curated context_length beats discovery — the fake-1M chain-head bug is
-     structurally impossible again).
+     chains are hand-written in config.toml, and generation writes nothing but a
+     per-provider MODEL LIST report (free and paid alike; `free` is a display
+     fact, routing never reads it).
    - **Probes are removed.** Capabilities come from the models.dev join
      (7285 models; `tool_call`, `context_length`) plus hand-written overrides.
      Pre-rewrite artifacts — `~/.config/pxy/generated.toml` and the
      `probe:tools:*` kv rows — are dead weight; deleted 2026-08-30.
-   - Per-provider: `tier` echo, `discover`, `models_url`, `id_field`,
+   - Per-provider: `discover`, `models_url`, `id_field`,
      `[providers.X.promo]` `expires` — STRICT `YYYY-MM-DD` since 2026-08-30,
-     unparseable fails CLOSED (expired). Before that, a bare string compare
-     let a typo like "2026-9-6" keep a paid model in the free chains forever.
+     unparseable fails CLOSED (expired: dropped from the report). Before that,
+     a bare string compare let a typo like "2026-9-6" keep a paid model in the
+     free chains forever.
+   - **`tier` is GONE as a config key (2026-08-30).** It was the cost class the
+     dead `auto` generator ranked by; afterwards it only echoed into models.toml
+     and `pxy models --json` (the desktop panel copied it, rendered it nowhere).
+     config.toml is `deny_unknown_fields`, so a leftover `tier = "…"` line now
+     fails the load — delete it.
    - **Write guard**: --generate ABORTS if any discovery failure is
      credential-shaped (secret resolution failure, or HTTP 401/402/403 from a
      revoked-but-present key) or >half of providers fail; the previous
-     models.toml stays in force. Writes are atomic (tmp+rename) — models.toml
-     is parsed at every startup.
-   - **Feedback-loop guard**: refresh reads `Config::load_base` (baseline
-     WITHOUT the models.toml overlay) — generation consuming its own output
-     erased curated marks once.
+     models.toml is kept. A report that silently lost half its providers is
+     worse than a stale one — it is what you decide config.toml from. Writes
+     are atomic (tmp+rename).
+   - **`pxy doctor` warns** when an enabled, allowlisted provider declares no
+     models (and isn't embeddings/media-only): with config.toml as the whole
+     catalog, that provider is simply invisible — no error anywhere.
    - **Rules that must not be relaxed** (each is somebody's post-mortem):
      absence from a listing is REPORTED, never auto-deleted; capabilities are
      tri-state (Unknown never collapses to No or to an optimistic Yes); a
@@ -596,7 +606,8 @@ groq + mistral (STT), agnes (images/video).
    - ~~Per-model `force_stream`~~ DONE: streams upstream, re-assembles JSON via
      `translate/aggregate.rs`. Also fixed the generated-overlay bug it exposed:
      the overlay was replacing curated ModelSpecs (max_output_tokens, format,
-     pinned contexts) with bare generated entries — curated spec now wins by id.
+     pinned contexts) with bare generated entries. (Moot since 2026-08-30 —
+     the overlay itself is gone, see §4.)
    - Live model discovery — covered by `pxy refresh` (stage 1-3, done earlier).
    - ~~`/v1/responses`~~ DONE: full Responses API endpoint + `pxy launch codex`
      (wired via `-c` overrides, config.toml untouched). Verified: codex exec ran a

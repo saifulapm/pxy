@@ -6,8 +6,9 @@
 //!   * models.dev says what a model DOES (tool calling, context) and covers ~94%
 //!     of what we configure.
 //! Joining them is the whole mechanism: `--generate` writes `models.toml` with
-//! EVERY model of every provider, free and paid alike, and the groups that
-//! decide what actually gets routed stay hand-written in config.toml.
+//! EVERY model discovery listed, free and paid alike. That file is a REPORT —
+//! pxy never loads it. config.toml alone decides which models exist and which
+//! get routed; models.toml is what you read and copy rows out of.
 //!
 //! Hard rules, each of which is somebody's post-mortem:
 //!   * **Absence is not death.** A model missing from a listing is REPORTED, never
@@ -28,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::{Config, ProviderConfig, Tier};
+use crate::config::{Config, ProviderConfig};
 use crate::secrets::Secrets;
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
@@ -309,7 +310,7 @@ fn snippet(s: &str) -> String {
     }
 }
 
-/// Discover, report, and (when `write`) generate `models.toml`.
+/// Discover, report, and (when `write`) write the `models.toml` report.
 pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::path::Path) -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -412,7 +413,7 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
                     ungrouped.insert(name.clone(), cands);
                 }
                 // Keep the FULL list — free and paid alike: it is what gets
-                // written to models.toml.
+                // written to the models.toml report.
                 found.insert(name.clone(), all);
             }
         }
@@ -485,11 +486,12 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
         println!("\n(dry run — nothing written. Use `pxy refresh --generate` to write models.toml.)");
         return Ok(());
     }
-    // Generating from degraded discovery would shrink the catalog to whatever
-    // happened to work this minute, and the shrunken file would then be loaded
-    // as truth. Credential failures (a locked gpg agent takes out EVERY
-    // provider at once) or a high failure rate abort the write; the previous
-    // models.toml stays in force.
+    // Generating from degraded discovery would shrink the report to whatever
+    // happened to work this minute — and a report that silently lost half its
+    // providers is worse than a stale one, because it is the thing you read
+    // when deciding what to put in config.toml. Credential failures (a locked
+    // gpg agent takes out EVERY provider at once) or a high failure rate abort
+    // the write; the previous models.toml is kept.
     let cred_failures = failures
         .iter()
         .filter(|(_, why)| why.starts_with("credential:"))
@@ -506,7 +508,7 @@ pub async fn run(cfg: &Config, secrets: &Secrets, write: bool, out_path: &std::p
     generate(cfg, found, out_path)
 }
 
-/// One generated model row — everything `models.toml` records about a model.
+/// One reported model row — everything `models.toml` records about a model.
 struct Row {
     id: String,
     context: u64,
@@ -514,11 +516,11 @@ struct Row {
     free: Option<bool>,
 }
 
-/// Build and write `models.toml`: for every enabled provider, the UNION of its
-/// hand-written models and everything discovery listed — free and paid alike.
-/// Groups are never touched. What actually gets routed is a hand-written
-/// decision, and a generator able to rewrite a chain is a generator able to
-/// spend money.
+/// Build and write the `models.toml` report: for every enabled provider,
+/// exactly what discovery listed — free and paid alike, with discovery's own
+/// numbers. config.toml is neither merged in nor written back to: which models
+/// pxy serves is a hand-written decision, and a generator able to edit that
+/// file is a generator able to spend money.
 fn generate(
     cfg: &Config,
     discovered: BTreeMap<String, Vec<Discovered>>,
@@ -528,77 +530,44 @@ fn generate(
 
     println!("\n── generating ──");
 
-    let mut per_provider: BTreeMap<String, (Tier, Vec<Row>)> = BTreeMap::new();
+    let mut per_provider: BTreeMap<String, Vec<Row>> = BTreeMap::new();
     let mut dropped_promo: Vec<String> = Vec::new();
 
-    for (name, pcfg) in &cfg.providers {
-        if !pcfg.enabled {
+    for (name, models) in &discovered {
+        let Some(pcfg) = cfg.providers.get(name) else {
             continue;
-        }
-        // Start from what config.toml already has. Never lose a hand-added
-        // model: discovery can omit one that works.
-        let mut rows: BTreeMap<String, Row> = pcfg
-            .models
-            .iter()
-            .map(|m| {
-                let s = m.spec();
-                let row = Row {
-                    id: s.id.clone(),
-                    context: s.context_length,
-                    tool_call: s.tool_call,
-                    free: s.free,
-                };
-                (s.id, row)
-            })
-            .collect();
-
-        // Drop expired promo models wherever they came from.
+        };
         let promo = pcfg.promo.as_ref().filter(|p| p.is_expired(&today));
-        for id in promo.iter().flat_map(|p| &p.models) {
-            if rows.remove(id).is_some() {
-                dropped_promo.push(format!("{name}/{id}"));
-            }
-        }
-
-        for d in discovered.get(name).into_iter().flatten() {
+        // Keyed by id: a listing that repeats an id must not produce a row
+        // twice, and the key orders the output.
+        let mut rows: BTreeMap<String, Row> = BTreeMap::new();
+        for d in models {
+            // An expired promo model is still listed upstream — at a price now.
+            // Reporting it invites pasting a paying model into a free chain.
             if promo.is_some_and(|p| p.models.contains(&d.id)) {
+                dropped_promo.push(format!("{name}/{}", d.id));
                 continue;
             }
-            match rows.get_mut(&d.id) {
-                // A hand-written entry is authoritative at load time
-                // (Config::apply_generated takes the curated spec WHOLESALE),
-                // so discovery may only fill in the facts it left blank.
-                // Overwriting the window with the discovered one would record a
-                // number the router never uses: aihubmix lists
-                // coding-kimi-k3-free at 1M, the curated entry pins it to 262k,
-                // and 262k is what a request gets.
-                Some(row) => {
-                    row.tool_call = row.tool_call.or(d.tool_call.as_opt());
-                    row.free = row.free.or(d.free.as_opt());
-                }
-                None => {
-                    rows.insert(
-                        d.id.clone(),
-                        Row {
-                            id: d.id.clone(),
-                            context: d.context.unwrap_or(crate::config::default_context()),
-                            tool_call: d.tool_call.as_opt(),
-                            free: d.free.as_opt(),
-                        },
-                    );
-                }
-            }
+            rows.insert(
+                d.id.clone(),
+                Row {
+                    id: d.id.clone(),
+                    context: d.context.unwrap_or(crate::config::default_context()),
+                    tool_call: d.tool_call.as_opt(),
+                    free: d.free.as_opt(),
+                },
+            );
         }
-        per_provider.insert(name.clone(), (pcfg.tier, rows.into_values().collect()));
+        per_provider.insert(name.clone(), rows.into_values().collect());
     }
 
     let body = render_generated(&per_provider, &today);
-    // Atomic: models.toml is parsed at every startup — a truncated write from
-    // an interrupt would fail (or worse, alter) the catalog on next boot.
+    // Atomic: a truncated write would leave a half-report that reads like a
+    // provider losing models.
     crate::config::write_atomic(out_path, body.as_bytes())
         .with_context(|| format!("writing {}", out_path.display()))?;
 
-    let rows = || per_provider.values().flat_map(|(_, v)| v.iter());
+    let rows = || per_provider.values().flatten();
     let total = rows().count();
     let free = rows().filter(|r| r.free == Some(true)).count();
     if !dropped_promo.is_empty() {
@@ -609,7 +578,8 @@ fn generate(
     }
     println!(
         "wrote {} — {total} models across {} providers ({free} priced at zero). \
-         Groups in config.toml are unchanged.",
+         pxy does NOT read this file: copy the rows you want into config.toml \
+         (and restart pxy) for them to be served.",
         out_path.display(),
         per_provider.len(),
     );
@@ -625,30 +595,28 @@ fn today() -> String {
     jiff::Zoned::now().date().to_string()
 }
 
-/// Build `models.toml`: per-provider model lists (union of hand-configured and
-/// discovered), each with the facts a picker needs.
-fn render_generated(per_provider: &BTreeMap<String, (Tier, Vec<Row>)>, stamp: &str) -> String {
+/// Build `models.toml`: per-provider lists of what discovery found, each with
+/// the facts a picker needs.
+fn render_generated(per_provider: &BTreeMap<String, Vec<Row>>, stamp: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# AUTO-GENERATED by `pxy refresh --generate` on {stamp}.\n"
     ));
     out.push_str(concat!(
-        "# Do not edit: rerun the command instead. Hand-written provider settings\n",
-        "# (credentials, limits, headers, quirks) and the [groups] chains live in\n",
-        "# config.toml and are never touched by generation; only model lists come\n",
-        "# from here.\n",
-        "# Every model each provider lists is here, free and paid alike. Model lists\n",
-        "# are a UNION with config.toml: a provider's /models can omit a model that\n",
-        "# works (zai/glm-4.7-flash is absent from Z.AI's own listing), and for a\n",
-        "# model config.toml also declares, the hand-written spec wins wholesale.\n",
-        "# `free` is a DISPLAY fact (provider pricing as discovery saw it); routing\n",
-        "# never reads it. `tier` echoes config.toml so this file reads on its own.\n\n",
+        "# A REPORT, NOT CONFIG — pxy never reads this file. It serves exactly the\n",
+        "# models config.toml declares; copy the rows you want into a provider's\n",
+        "# `models = [...]` there (then restart pxy). Editing this file changes\n",
+        "# nothing, and the next --generate overwrites it.\n",
+        "# Every model each provider LISTED is here, free and paid alike, with the\n",
+        "# numbers discovery reported — verify a window before pinning it, since a\n",
+        "# listing can overstate one (aihubmix advertises coding-kimi-k3-free at 1M;\n",
+        "# it really serves 262k). A model missing here is not proof of removal: a\n",
+        "# listing can omit a model that works (zai/glm-4.7-flash is absent from\n",
+        "# Z.AI's own listing). `free` is a DISPLAY fact (provider pricing as\n",
+        "# discovery saw it); routing never reads it.\n\n",
     ));
-    for (prov, (tier, rows)) in per_provider {
-        out.push_str(&format!(
-            "[providers.{prov}]\ntier = \"{}\"\nmodels = [\n",
-            tier.as_str()
-        ));
+    for (prov, rows) in per_provider {
+        out.push_str(&format!("[providers.{prov}]\nmodels = [\n"));
         for r in rows {
             let mut extra = String::new();
             if let Some(t) = r.tool_call {
@@ -670,6 +638,7 @@ fn render_generated(per_provider: &BTreeMap<String, (Tier, Vec<Row>)>, stamp: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelEntry;
     use serde_json::json;
 
     #[test]
@@ -751,66 +720,85 @@ mod tests {
         assert_ne!(Tri::Unknown, Tri::No);
     }
 
-    /// Generation writes what discovery found for a NEW model, and only fills
-    /// blanks on one config.toml already declares — the curated spec is
-    /// authoritative at load time, so a discovered window written over a pinned
-    /// one would be a number the router never uses.
+    /// The report is what DISCOVERY listed, nothing else: config.toml is not
+    /// merged in (a hand-added model discovery omits belongs in the drift
+    /// report, not here) and its pinned numbers do not overwrite the listed
+    /// ones — the file exists to show what upstream says.
     #[test]
-    fn generated_rows_keep_curated_specs_and_absorb_discovery() {
-        let mut rows: BTreeMap<String, Row> = BTreeMap::from([(
-            "pinned".to_string(),
-            Row { id: "pinned".into(), context: 262_144, tool_call: Some(true), free: None },
-        )]);
-        let discovered = [
-            Discovered { id: "pinned".into(), canonical: "pinned".into(), free: Tri::Yes,
-                         tool_call: Tri::No, context: Some(1_000_000) },
-            Discovered { id: "new".into(), canonical: "new".into(), free: Tri::No,
-                         tool_call: Tri::Unknown, context: Some(400_000) },
+    fn report_holds_discovery_only() {
+        let mut pcfg = crate::config::ProviderConfig::test_default();
+        pcfg.base_url = Some("https://example.test/v1/chat/completions".into());
+        pcfg.models = vec![
+            // declared by hand, and also listed upstream
+            ModelEntry::Id("pinned".into()),
+            // hand-added, absent from the listing
+            ModelEntry::Id("hand-only".into()),
         ];
-        for d in &discovered {
-            match rows.get_mut(&d.id) {
-                Some(row) => {
-                    row.tool_call = row.tool_call.or(d.tool_call.as_opt());
-                    row.free = row.free.or(d.free.as_opt());
-                }
-                None => {
-                    rows.insert(d.id.clone(), Row {
-                        id: d.id.clone(),
-                        context: d.context.unwrap_or(crate::config::default_context()),
-                        tool_call: d.tool_call.as_opt(),
-                        free: d.free.as_opt(),
-                    });
-                }
-            }
-        }
-        let pinned = &rows["pinned"];
-        assert_eq!(pinned.context, 262_144, "curated window survives discovery");
-        assert_eq!(pinned.tool_call, Some(true), "curated assertion survives");
-        assert_eq!(pinned.free, Some(true), "blank display fact is filled in");
-        // Paid models are generated too now, and an unknown capability writes
-        // no key at all rather than a `false`.
-        let new = &rows["new"];
-        assert_eq!(new.free, Some(false));
-        assert_eq!(new.tool_call, None);
+        pcfg.promo = Some(crate::config::Promo {
+            models: vec!["promo".into()],
+            expires: "2020-01-01".into(),
+        });
+        let cfg = Config {
+            server: crate::config::ServerConfig { port: 1, api_key: "k".into() },
+            providers: BTreeMap::from([("p".to_string(), pcfg)]),
+            groups: BTreeMap::new(),
+            providers_whitelist: Vec::new(),
+            launch: Default::default(),
+            search: Default::default(),
+            fetch: Default::default(),
+            media: Default::default(),
+        };
+        let discovered = BTreeMap::from([(
+            "p".to_string(),
+            vec![
+                Discovered { id: "pinned".into(), canonical: "pinned".into(), free: Tri::Yes,
+                             tool_call: Tri::No, context: Some(1_000_000) },
+                Discovered { id: "new".into(), canonical: "new".into(), free: Tri::No,
+                             tool_call: Tri::Unknown, context: Some(400_000) },
+                Discovered { id: "promo".into(), canonical: "promo".into(), free: Tri::Yes,
+                             tool_call: Tri::Yes, context: Some(128_000) },
+            ],
+        )]);
+
+        let out_path = std::env::temp_dir().join(format!("pxy-report-{}.toml", std::process::id()));
+        generate(&cfg, discovered, &out_path).unwrap();
+        let out = std::fs::read_to_string(&out_path).unwrap();
+        std::fs::remove_file(&out_path).ok();
+
+        // Discovery's numbers, verbatim — including for a model config.toml pins.
+        assert!(out.contains(r#"{ id = "pinned", context_length = 1000000, tool_call = false, free = true }"#), "{out}");
+        assert!(out.contains(r#"{ id = "new", context_length = 400000, free = false }"#), "{out}");
+        // Hand-written models are NOT copied in; an expired promo is dropped.
+        assert!(!out.contains("hand-only"), "{out}");
+        assert!(!out.contains(r#"id = "promo""#), "{out}");
     }
 
     #[test]
-    fn render_omits_unknown_capabilities_and_stamps_the_tier() {
+    fn render_omits_unknown_capabilities_and_stays_pasteable() {
         let out = render_generated(
             &BTreeMap::from([(
                 "p".to_string(),
-                (Tier::Subscription, vec![
+                vec![
                     Row { id: "known".into(), context: 8192, tool_call: Some(true), free: Some(false) },
                     Row { id: "unknown".into(), context: 128_000, tool_call: None, free: None },
-                ]),
+                ],
             )]),
             "2026-08-29",
         );
-        assert!(out.contains("tier = \"subscription\""), "{out}");
         assert!(out.contains(r#"{ id = "known", context_length = 8192, tool_call = true, free = false }"#), "{out}");
         assert!(out.contains(r#"{ id = "unknown", context_length = 128000 }"#), "{out}");
-        // The generated file must parse back into the overlay struct.
-        let parsed: crate::config::Generated = toml::from_str(&out).unwrap();
+        // The rows exist to be pasted into config.toml, so they must parse as
+        // config.toml model entries — a report nobody can copy from is useless.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReportProvider {
+            models: Vec<crate::config::ModelEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Report {
+            providers: BTreeMap<String, ReportProvider>,
+        }
+        let parsed: Report = toml::from_str(&out).unwrap();
         assert_eq!(parsed.providers["p"].models.len(), 2);
     }
 

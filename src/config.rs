@@ -31,7 +31,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 
-/// `models.toml` lives beside the config it augments.
+/// `models.toml` — the discovery REPORT `pxy refresh --generate` writes beside
+/// config.toml. Nothing loads it: it exists to be read by a human and copied
+/// from, and the only file that decides what pxy serves is config.toml.
 pub fn models_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
@@ -185,92 +187,18 @@ impl GroupConfig {
     }
 }
 
-/// Cost class of a provider. Display metadata: it rides into `models.toml` and
-/// the pickers so a model's price is visible before it is chosen. Never
-/// inferred — a vendor's billing behaviour is a curated fact, so anything but
-/// `free` must be set by hand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum Tier {
-    /// Free and renewing.
-    #[default]
-    Free,
-    /// A subscription already paid for, with a usage allowance (opencode Go).
-    Subscription,
-    /// A finite grant that does not renew.
-    Finite,
-    /// Real money per token, or a promotional balance that drains
-    /// (agentrouter, gorouter).
-    Reserve,
-}
-
-impl Tier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Tier::Free => "free",
-            Tier::Subscription => "subscription",
-            Tier::Finite => "finite",
-            Tier::Reserve => "reserve",
-        }
-    }
-}
-
 impl Config {
+    /// The only loader, and config.toml is the only file it reads. `models.toml`
+    /// used to be overlaid here; it is now a discovery report pxy never opens,
+    /// so a model is routable exactly when config.toml declares it — one file to
+    /// read when asking "why is this model served?".
     pub fn load(path: &Path) -> Result<Self> {
-        let mut cfg = Self::load_base(path)?;
-        let gen_path = models_path(path);
-        if gen_path.exists() {
-            let graw = std::fs::read_to_string(&gen_path)
-                .with_context(|| format!("reading {}", gen_path.display()))?;
-            let generated: Generated = toml::from_str(&graw)
-                .with_context(|| format!("parsing {}", gen_path.display()))?;
-            cfg.apply_generated(generated);
-        }
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    /// The hand-written config alone, without the generated overlay.
-    /// `pxy refresh` MUST use this: generation reading its own previous
-    /// output is a feedback loop — the first symptom was curated `tool_call`
-    /// marks vanishing because the overlay had replaced the model lists
-    /// before the generator could read them.
-    pub fn load_base(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("parsing config {}", path.display()))?;
+        cfg.validate()?;
         Ok(cfg)
-    }
-
-    /// Overlay generated model lists onto the hand-written baseline. Generation
-    /// only ever produces model lists, so nothing hand-curated (credentials,
-    /// limits, headers, quirks, groups) can be clobbered. A generated block for
-    /// an unknown provider is ignored rather than creating a half-configured
-    /// provider with no credentials.
-    ///
-    /// The generated list decides WHICH models exist; for a model the
-    /// hand-written config also lists, the hand-written spec wins wholesale.
-    /// models.toml only carries id/context/tool_call/free, so taking its entry
-    /// for a curated model silently dropped max_output_tokens, per-model
-    /// format overrides, and pinned context lengths (groq's 8192).
-    fn apply_generated(&mut self, generated: Generated) {
-        for (name, g) in generated.providers {
-            if let Some(p) = self.providers.get_mut(&name) {
-                if !g.models.is_empty() {
-                    let curated: BTreeMap<String, ModelEntry> = p
-                        .models
-                        .iter()
-                        .map(|m| (m.spec().id, m.clone()))
-                        .collect();
-                    p.models = g
-                        .models
-                        .into_iter()
-                        .map(|m| curated.get(&m.spec().id).cloned().unwrap_or(m))
-                        .collect();
-                }
-            }
-        }
     }
 
     /// Whether this provider is exposed at all. The one gate every catalog
@@ -416,27 +344,6 @@ impl Config {
     }
 }
 
-/// The subset `pxy refresh --generate` produces. Deliberately tiny: anything
-/// not in this struct cannot be generated, and so cannot be lost to generation.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Generated {
-    #[serde(default)]
-    pub providers: BTreeMap<String, GeneratedProvider>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneratedProvider {
-    /// Echo of config.toml's `tier`, written so the file reads on its own.
-    /// Declared but never read: config.toml is where a tier lives, and the
-    /// field exists so `deny_unknown_fields` accepts the key we emit.
-    #[allow(dead_code)]
-    pub tier: Option<Tier>,
-    #[serde(default)]
-    pub models: Vec<ModelEntry>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -554,10 +461,8 @@ pub struct ProviderConfig {
     /// Field holding the usable model id in the discovery response. Default
     /// "id"; Cloudflare needs "name" because its `id` is a UUID.
     pub id_field: Option<String>,
-    /// Cost class for `auto` generation.
-    #[serde(default)]
-    pub tier: Tier,
-    /// Time-limited promotional models, dropped from generation once expired.
+    /// Time-limited promotional models, dropped from the discovery report once
+    /// expired.
     /// Upstream expiry metadata is not trustworthy (OpenRouter carries
     /// `expiration_date` on 8 of 419 models, and not on the promo we use), so
     /// the deadline is declared here.
@@ -740,7 +645,6 @@ impl ProviderConfig {
             discover: true,
             models_url: None,
             id_field: None,
-            tier: Tier::default(),
             promo: None,
             balance_url: None,
             balance_key: None,
@@ -923,51 +827,43 @@ mod tests {
         assert!(accounts[1].credential().is_some());
     }
 
+    /// config.toml is the whole catalog: a models.toml sitting next to it must
+    /// not add, remove or alter a single model.
     #[test]
-    fn overlay_preserves_curated_model_specs() {
-        let mut cfg_provider = ProviderConfig::test_default();
-        cfg_provider.models = vec![ModelEntry::Full(ModelSpec {
-            id: "m1".into(),
-            name: None,
-            context_length: 8192, // pinned by hand (groq-style)
-            max_output_tokens: 64000,
-            format: Some(WireFormat::Anthropic),
-            tool_call: Some(true),
-            free: None,
-            force_stream: true,
-            drop_params: Vec::new(),
-        })];
-        let mut cfg = Config {
-            server: ServerConfig { port: 1, api_key: "k".into() },
-            providers: BTreeMap::from([("p".to_string(), cfg_provider)]),
-            groups: BTreeMap::new(),
-            providers_whitelist: Vec::new(),
-            launch: LaunchConfig::default(),
-            search: ServiceConfig::default(),
-            fetch: ServiceConfig::default(),
-            media: MediaDefaults::default(),
-        };
-        let generated: Generated = toml::from_str(
+    fn load_ignores_models_toml_entirely() {
+        let dir = std::env::temp_dir().join(format!("pxy-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+            [server]
+            port = 4100
+
+            [providers.p]
+            base_url = "https://example.test/v1/chat/completions"
+            models = [{ id = "curated", context_length = 8192 }]
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            models_path(&cfg_path),
             r#"
             [providers.p]
             models = [
-              { id = "m1", context_length = 131072 },
-              { id = "m2", context_length = 32768 },
+              { id = "curated", context_length = 1000000 },
+              { id = "discovered-only", context_length = 32768 },
             ]
             "#,
         )
         .unwrap();
-        cfg.apply_generated(generated);
-        let models: Vec<ModelSpec> =
-            cfg.providers["p"].models.iter().map(|m| m.spec()).collect();
-        // Curated spec wins wholesale for m1…
-        assert_eq!(models[0].context_length, 8192);
-        assert_eq!(models[0].max_output_tokens, 64000);
-        assert_eq!(models[0].format, Some(WireFormat::Anthropic));
-        assert!(models[0].force_stream);
-        // …and discovered m2 still comes through.
-        assert_eq!(models[1].id, "m2");
-        assert_eq!(models[1].context_length, 32768);
+
+        let cfg = Config::load(&cfg_path).unwrap();
+        let models: Vec<ModelSpec> = cfg.providers["p"].models.iter().map(|m| m.spec()).collect();
+        assert_eq!(models.len(), 1, "models.toml must not add a model");
+        assert_eq!(models[0].id, "curated");
+        assert_eq!(models[0].context_length, 8192, "config.toml's window stands");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

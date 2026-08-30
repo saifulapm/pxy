@@ -229,7 +229,7 @@ pub async fn doctor(cfg_path: &std::path::Path) -> Result<()> {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                // Model count through the daemon proves catalog + overlay load.
+                // Model count through the daemon proves the catalog loaded.
                 let models = http
                     .get(format!("http://127.0.0.1:{}/v1/models", cfg.server.port))
                     .timeout(std::time::Duration::from_secs(3))
@@ -298,22 +298,47 @@ pub async fn doctor(cfg_path: &std::path::Path) -> Result<()> {
         }
         r.ok("credentials", format!("{resolved} provider credential(s) resolve"));
 
-        // 5. models.toml freshness.
+        // 5. Providers that will serve nothing. config.toml is the whole
+        // catalog, so a provider with an empty `models` list is simply
+        // invisible — no error anywhere, it just never shows up.
+        let mute: Vec<&str> = cfg
+            .providers
+            .iter()
+            .filter(|(name, p)| {
+                p.enabled
+                    && cfg.provider_allowed(name)
+                    && p.models.is_empty()
+                    && p.embedding_models.is_empty()
+                    && p.media.is_none()
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if mute.is_empty() {
+            r.ok("models", "every enabled provider declares models in config.toml");
+        } else {
+            r.warn(
+                "models",
+                format!(
+                    "no models in config.toml, so nothing is served: {} — \
+                     `pxy refresh --generate` lists what each one offers",
+                    mute.join(", ")
+                ),
+            );
+        }
+
+        // 6. models.toml is a REPORT — pxy never loads it, so its age only
+        // says how stale the list you copy rows from is.
         let gen_path = crate::config::models_path(cfg_path);
         match std::fs::metadata(&gen_path).and_then(|m| m.modified()) {
             Ok(t) => {
                 let age = t.elapsed().map(|d| d.as_secs() / 86_400).unwrap_or(0);
-                if age > 14 {
-                    r.warn("models", format!("{age} days old — consider `pxy refresh --generate`"));
-                } else {
-                    r.ok("models", format!("{age} day(s) old"));
-                }
+                r.ok("catalog report", format!("models.toml {age} day(s) old (reference only)"));
             }
-            Err(_) => r.warn("models", "missing — `pxy refresh --generate` never run"),
+            Err(_) => r.ok("catalog report", "no models.toml — `pxy refresh --generate` writes one"),
         }
     }
 
-    // 6. Agent binaries on PATH.
+    // 7. Agent binaries on PATH.
     for agent in ["claude", "opencode", "pi", "codex"] {
         if on_path(agent) {
             r.ok(format!("agent {agent}").as_str(), "on PATH");

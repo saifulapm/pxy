@@ -85,8 +85,9 @@ enum Command {
     },
     /// Discover live provider catalogs; report drift and optionally regenerate
     Refresh {
-        /// Write models.toml (every model of every provider). Without this the
-        /// command only reports.
+        /// Write models.toml — the discovered catalog of every provider. pxy
+        /// never reads it: copy the rows you want into config.toml. Without
+        /// this the command only reports.
         #[arg(long)]
         generate: bool,
     },
@@ -192,8 +193,7 @@ fn main() -> Result<()> {
             route(&cfg, model.as_deref(), clear)
         }
         Command::Refresh { generate } => {
-            // Baseline only: generation must never consume its own output.
-            let cfg = config::Config::load_base(&cfg_path)?;
+            let cfg = config::Config::load(&cfg_path)?;
             let secrets = secrets::Secrets::new();
             let out = config::models_path(&cfg_path);
             tokio::runtime::Builder::new_current_thread()
@@ -242,7 +242,7 @@ fn main() -> Result<()> {
 }
 
 /// `pxy models [--json]` — group names first, then every "provider/model". The
-/// JSON form carries what a picker wants to show next to an id (provider, tier,
+/// JSON form carries what a picker wants to show next to an id (provider,
 /// window, tool calling, free-ness); the desktop panel reads it.
 fn models(cfg: &config::Config, json: bool) -> Result<()> {
     use std::io::Write;
@@ -281,14 +281,12 @@ fn models(cfg: &config::Config, json: bool) -> Result<()> {
     };
     for cand in catalog.models() {
         let id = cand.full_id();
-        let tier = cfg.providers.get(&cand.provider).map(|p| p.tier.as_str());
         rows.push(serde_json::json!({
             "id": id,
             "kind": "model",
             "provider": cand.provider,
             "model": cand.model.id,
             "name": cand.model.name,
-            "tier": tier,
             "contextLength": cand.model.context_length,
             "maxOutputTokens": cand.model.max_output_tokens,
             "toolCall": cand.model.tool_call,

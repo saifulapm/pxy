@@ -2,6 +2,8 @@
 # Secrets come from `pass` (entries under AI/, see docs/01-provider-inventory.md).
 # Model ids below are real (sampled from the OmniRoute catalog, 2026-08-24) —
 # trim/extend per provider as you like. `pxy models` lists what's exposed.
+# THIS FILE IS THE WHOLE CATALOG: a model is served only if a provider's
+# `models = [...]` here declares it. models.toml is a report pxy never reads.
 
 # Provider allowlist. Empty (or absent) = every enabled provider is exposed.
 # Non-empty = ONLY these are: their models are the whole catalog every picker
@@ -31,9 +33,11 @@ api_key = "pxy-local"   # soft gate; server binds 127.0.0.1 only
 # candidate with limit headroom, no cooldown and a big enough context serves
 # the request. Failures walk down the list.
 #
-# Groups are entirely hand-written. `pxy refresh --generate` regenerates
-# models.toml (every model of every provider, free and paid) and never touches
-# a chain — what spends money stays a decision, not a heuristic.
+# Everything is hand-written: this file is the whole catalog. `pxy refresh
+# --generate` only writes models.toml, a REPORT of what each provider lists
+# (free and paid) that pxy never reads — copy rows out of it into a provider's
+# `models = [...]` below. Nothing is auto-added to a chain, or to a provider:
+# what spends money stays a decision, not a heuristic.
 #
 # Design rules, each of which is somebody's post-mortem:
 #   * providers are INTERLEAVED so one provider's 429 doesn't stall the chain;
@@ -124,7 +128,6 @@ small_model = "github-free/gpt-5-mini"
 [providers.claude]
 kind = "claude-oauth"
 format = "anthropic"
-tier = "reserve"
 discover = false
 headers = { user-agent = "claude-cli/2.1.220 (external, cli)" }
 models = [
@@ -143,7 +146,6 @@ models = [
 # (haiku slightly overcounted). Context lengths from the live /models API
 # (max_prompt_tokens governs what fits).
 [providers.github]
-tier = "subscription"
 kind = "github-copilot"
 format = "openai"
 # Premium-request quota for `pxy status --remote` (github-free shares the
@@ -199,7 +201,6 @@ reset_tz = "UTC"
 # after the 300 premium requests are spent. Separate provider so their heavy
 # background use never eats the premium budget in pxy's accounting.
 [providers.github-free]
-tier = "subscription"
 kind = "github-copilot"
 format = "openai"
 credentials = { pass = "AI/github/main" }
@@ -220,7 +221,6 @@ models = [
 # base URL. Note: pxy's total_tokens guard is per-provider; Tencent enforces
 # quotas per-model.
 [providers.tencent]
-tier = "finite"
 base_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions"
 embeddings_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/embeddings"
 api_key = { pass = "AI/tencent/main" }
@@ -244,7 +244,6 @@ total_tokens = 5000000        # 5 activated models x 1M free quota
 # above; hy-mt2-* = INSUFFICIENT_BALANCE, hy-3d-3.1 = BILLING_PROVISION_FAILED,
 # tripo-3d = no trial quota — 3D/translation are dead without paid billing.
 [providers.tencent-vl]
-tier = "finite"
 embeddings_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/embeddings/multimodal"
 api_key = { pass = "AI/tencent/main" }
 discover = false
@@ -354,7 +353,6 @@ models = [
 # Account id from the old OmniRoute db (provider_connections). Tool calling
 # verified on all included models 2026-08-25.
 [providers.cloudflare]
-tier = "reserve"
 base_url = "https://api.cloudflare.com/client/v4/accounts/0a937759fca2672765c005345aebe060/ai/v1/chat/completions"
 api_key = { pass = "AI/cloudflare-ai/main" }
 # Discovery: the OpenAI-compat path has no /models, and in the real listing
@@ -396,7 +394,6 @@ daily_requests = 30
 # deepseek-v4-flash, so parse the tags out of content too — a no-op on the
 # responses that use the field properly.
 [providers.opencode-zen]
-tier = "subscription"
 base_url = "https://opencode.ai/zen/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/github" }
 parse_think_tags = true
@@ -416,7 +413,6 @@ models = [
 # upstream — $12 per 5h window, $30/week, $60/month. Two accounts; pxy's
 # 429+Retry-After cooldown rotates between them automatically.
 [providers.opencode-go-github]
-tier = "subscription"
 parse_think_tags = true   # same reasoning models as opencode-zen above
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 # Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
@@ -440,7 +436,6 @@ models = [
 ]
 
 [providers.opencode-go-google]
-tier = "subscription"
 parse_think_tags = true   # same reasoning models as opencode-zen above
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 # Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
@@ -471,7 +466,6 @@ models = [
 # list below is what GOAT actually serves. Monthly request allowances (plan
 # page) are in the comments; tool calling verified on every id 2026-08-28.
 [providers.commandcode]
-tier = "subscription"
 parse_think_tags = true # same reasoning families as opencode above; no-op otherwise
 base_url = "https://api.commandcode.ai/provider/v1/chat/completions"
 # Dollar windows + credits left — the endpoint Command Code's own CLI reads
@@ -590,7 +584,6 @@ rpm = 30
 # deepseek) are paid — deliberately not listed here. The china account is
 # not activated (AccessDenied.Unpurchased) — parked.
 [providers.alibaba]
-tier = "finite"
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 embeddings_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings"
 api_key = { pass = "AI/alibaba/global" }
@@ -625,7 +618,6 @@ default = "Cherry"
 # money. Cheap picks: gpt-oss-120b $0.15/$0.60 per M, deepseek-v4-flash
 # $0.14/$0.28. Fully-qualified model ids required.
 [providers.fireworks]
-tier = "reserve"
 base_url = "https://api.fireworks.ai/inference/v1/chat/completions"
 embeddings_url = "https://api.fireworks.ai/inference/v1/embeddings"
 api_key = { pass = "AI/fireworks/main" }
@@ -646,7 +638,6 @@ rpm = 10
 # is the minimal passing fingerprint (probed 2026-08-24). PAID balance
 # (prepaid credits) — [groups.payperuse] only; premium manual-use reserve.
 [providers.agentrouter]
-tier = "reserve"
 format = "anthropic"
 base_url = "https://agentrouter.org/v1/messages"
 # Same account/key as agentrouter-openai — one balance, fetched once here.
@@ -672,7 +663,6 @@ models = [
 # gpt-5.6-sol is OpenAI-endpoint-only; deepseek-v4f also lives here because
 # agentrouter's Anthropic route rejects it unless stream=true (probed).
 [providers.agentrouter-openai]
-tier = "reserve"
 base_url = "https://agentrouter.org/v1/chat/completions"
 api_key = { pass = "AI/agentrouter/main" }
 headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
@@ -689,7 +679,6 @@ models = [
 # returns dummy limits, so no remote balance readout. PAID balance — kept OUT
 # of [groups.free]; premium manual-use reserve.
 [providers.tabitoken]
-tier = "reserve"
 format = "anthropic"
 base_url = "https://tabitoken.com/v1/messages"
 balance_url = "https://tabitoken.com/v1/dashboard/billing/usage"
@@ -707,7 +696,6 @@ models = [
 # injection, `kiro_credits` leak). $70 referral credits (2026-08-25). Same
 # caveats apply. PAID balance — [groups.payperuse] only; premium manual-use reserve.
 [providers.gorouter]
-tier = "reserve"
 format = "anthropic"
 base_url = "https://gorouter.app/v1/messages"
 balance_url = "https://gorouter.app/v1/dashboard/billing/usage"
@@ -726,7 +714,6 @@ models = [
 # headers; concurrency probing showed sporadic 503s, so keep rpm modest and
 # rely on failover. total_usage on this account is $0 — free models only here.
 [providers.tokenrouter]
-tier = "finite"
 base_url = "https://api.tokenrouter.com/v1/chat/completions"
 balance_url = "https://api.tokenrouter.com/v1/dashboard/billing/usage"
 api_key = { pass = "AI/tokenrouter/main" }
@@ -748,7 +735,6 @@ rpm = 10
 # models are PAID-plan only (their "free/" prefix means free-*experimental*,
 # not free-to-you); only these 5 small models are callable — probed 2026-08-24.
 [providers.openadapter]
-tier = "reserve"
 base_url = "https://api.openadapter.in/v1/chat/completions"
 api_key = { pass = "AI/openadapter/main" }
 models = [
@@ -887,7 +873,6 @@ rpm = 5
 #    pre-2026-02-24 accounts — mercury-2 is the only model on this key.
 #    Flip the training opt-out in Account Settings after signup.
 [providers.inception]
-tier = "finite"
 base_url = "https://api.inceptionlabs.ai/v1/chat/completions"
 api_key = { pass = "AI/inception/main" }
 models = [{ id = "mercury-2", context_length = 128000, tool_call = true }]
@@ -982,7 +967,6 @@ rpm = 40
 # deepseek-3.2/minimax-m2.5 0.25x, haiku 0.4x, glm-5 0.5x, sonnet-4.5 1.3x).
 # NOT in a group: 50 credits/month is scarcer than every free pool above.
 [providers.kiro]
-tier = "finite"
 kind = "kiro"
 format = "kiro"
 credentials = { pass = "AI/kiro/main" }
@@ -1013,7 +997,6 @@ reset_tz = "UTC"
 # (Kimi's error hygiene is poor). Auth/refresh verified working end-to-end.
 # Keep OUT of the groups until a quota reset makes calls succeed.
 [providers.kimi-coding]
-tier = "finite"
 kind = "kimi-coding"
 format = "anthropic"
 credentials = { pass = "AI/kimi-coding/main" }
