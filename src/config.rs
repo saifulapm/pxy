@@ -469,8 +469,9 @@ pub struct ProviderConfig {
     pub promo: Option<Promo>,
     /// Remote billing endpoint for `pxy status --remote`. Recognized shapes:
     /// OpenRouter's `data.{total_credits,total_usage}` (dollars), new-api's
-    /// `data.{quota,used_quota}` (units of 1/500000 USD), and the OpenAI
-    /// dashboard's `total_usage` (cents).
+    /// `data.{quota,used_quota}` (units of 1/500000 USD), DeepSeek's
+    /// `balance_infos[]` + `is_available` (string amounts, per currency), and
+    /// the OpenAI dashboard's `total_usage` (cents).
     pub balance_url: Option<String>,
     /// Credential for `balance_url` when it is NOT the chat credential, sent
     /// RAW in `Authorization` (no `Bearer`). new-api gateways gate billing

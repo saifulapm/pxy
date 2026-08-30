@@ -603,6 +603,12 @@ groq + mistral (STT), agnes (images/video).
      (agentrouter, tokenrouter, tabitoken, gorouter = new-api cents-used shape;
      openrouter = real credits). new-api gateways return dummy hard limits, so only
      spend is visible, not remaining balance.
+     **deepseek added 2026-08-30** (`GET /user/balance`, chat key as Bearer):
+     amounts are STRINGS, one entry per currency, and `is_available` is a
+     separate flag that the line must never omit — an expired grant still counts
+     inside `total_balance`, so the money can read healthy on an account that
+     refuses every call. A missing flag is reported as unusable, not assumed OK.
+     Verified live against the real account: `0.00 USD left · ⚠ NOT usable`.
    - ~~Per-model `force_stream`~~ DONE: streams upstream, re-assembles JSON via
      `translate/aggregate.rs`. Also fixed the generated-overlay bug it exposed:
      the overlay was replacing curated ModelSpecs (max_output_tokens, format,

@@ -265,16 +265,20 @@ models = [
   "gemma4:31b",
 ]
 
-# UNUSABLE (commented out) — DeepSeek direct: balance $0.00 (checked via /user/balance, is_available
-# false), so every call returns "Insufficient Balance". No free tier; they
-# bill pay-as-you-go. Disabled until topped up — DeepSeek models are already
-# reachable free via tencent/ollama/openrouter anyway.
+# DeepSeek direct — pay-as-you-go, NO free tier. At $0.00 the account answers
+# `is_available: false` and every call returns "Insufficient Balance", so keep
+# it out of the free chains and watch the balance: `balance_url` puts it in
+# `pxy status --remote`, which prints the usability verdict next to the money
+# (an expired grant still counts inside total_balance, so the number alone
+# can read healthy on a dead account).
 # [providers.deepseek]
 # base_url = "https://api.deepseek.com/chat/completions"
+# balance_url = "https://api.deepseek.com/user/balance"
 # api_key = { pass = "AI/deepseek/main" }
 # models = [
-#   { id = "deepseek-v4-flash", context_length = 128000 },
-#   { id = "deepseek-v4-pro", context_length = 128000 },
+#   { id = "deepseek-v4-flash", context_length = 1000000 },
+#   { id = "deepseek-v4-flash-vision-exp", context_length = 1000000 },
+#   { id = "deepseek-v4-pro", context_length = 1000000 },
 # ]
 
 # OpenRouter, FREE models only (":free" ids never consume credits — free-model

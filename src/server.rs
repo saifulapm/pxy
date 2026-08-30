@@ -962,6 +962,41 @@ fn newapi_balance(body: &Value) -> Option<(f64, f64)> {
     Some((left / UNITS_PER_USD, (left + used) / UNITS_PER_USD))
 }
 
+/// DeepSeek's `GET /user/balance` as a status line, or `None` when this is not
+/// that shape. Two traps live here: the amounts are STRINGS (their precision
+/// choice), and the number is not the fact that matters — `is_available` is.
+/// An expired grant still counts inside `total_balance`, so an account can
+/// report money while every call returns "Insufficient Balance". Lead with the
+/// money, never omit the verdict, and treat a missing flag as unusable: we
+/// cannot claim it works.
+fn deepseek_balance(body: &Value) -> Option<String> {
+    let infos = body["balance_infos"].as_array()?;
+    let num = |v: &Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let mut parts: Vec<String> = infos
+        .iter()
+        .map(|b| {
+            let cur = b["currency"].as_str().unwrap_or("?");
+            let granted = num(&b["granted_balance"]);
+            let total = format!("{:.2} {cur}", num(&b["total_balance"]));
+            if granted > 0.0 {
+                format!("{total} ({granted:.2} granted)")
+            } else {
+                total
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        parts.push("no balance reported".into());
+    }
+    Some(match body["is_available"].as_bool() {
+        Some(true) => format!("{} left", parts.join(" + ")),
+        _ => format!(
+            "{} left · ⚠ NOT usable — calls return Insufficient Balance",
+            parts.join(" + ")
+        ),
+    })
+}
+
 async fn fetch_balance(
     name: &str,
     p: &crate::config::ProviderConfig,
@@ -1052,6 +1087,9 @@ async fn fetch_balance(
     if let Some((left, grant)) = newapi_balance(&body) {
         return (format!("${left:.2} left of ${grant:.2}"), Some(body));
     }
+    if let Some(line) = deepseek_balance(&body) {
+        return (line, Some(body));
+    }
     // opencode Go: percent used per window (GET /zen/go/v1/usage).
     if body["usage"]["monthly"].is_object() {
         let win = |w: &str| {
@@ -1121,6 +1159,44 @@ mod tests {
         // lets the other shapes (and the "unrecognized" line) have their turn.
         assert!(newapi_balance(&json!({"data": {"quota": 5_000_000}})).is_none());
         assert!(newapi_balance(&json!({"data": {"total_credits": 10.0}})).is_none());
+    }
+
+    /// DeepSeek reports money as strings and usability as a separate flag.
+    /// Reading the number alone is the trap: an account whose grant expired
+    /// still reports a total while refusing every call.
+    #[test]
+    fn deepseek_balance_reads_strings_and_leads_with_usability() {
+        let ok = deepseek_balance(&json!({
+            "is_available": true,
+            "balance_infos": [{"currency": "CNY", "total_balance": "110.00",
+                               "granted_balance": "10.00", "topped_up_balance": "100.00"}],
+        }))
+        .unwrap();
+        assert_eq!(ok, "110.00 CNY (10.00 granted) left");
+        // Money on the books, account still dead — the case that bit us.
+        let dead = deepseek_balance(&json!({
+            "is_available": false,
+            "balance_infos": [{"currency": "USD", "total_balance": "5.00",
+                               "granted_balance": "5.00", "topped_up_balance": "0"}],
+        }))
+        .unwrap();
+        assert!(dead.contains("NOT usable"), "{dead}");
+        // A missing flag must not read as usable either.
+        let unknown = deepseek_balance(&json!({
+            "balance_infos": [{"currency": "USD", "total_balance": "5.00"}],
+        }))
+        .unwrap();
+        assert!(unknown.contains("NOT usable"), "{unknown}");
+        // Purely topped-up account: no "(granted)" noise.
+        let paid = deepseek_balance(&json!({
+            "is_available": true,
+            "balance_infos": [{"currency": "USD", "total_balance": "20.00",
+                               "granted_balance": "0", "topped_up_balance": "20.00"}],
+        }))
+        .unwrap();
+        assert_eq!(paid, "20.00 USD left");
+        // Not this shape: fall through so the other sniffers get their turn.
+        assert!(deepseek_balance(&json!({"data": {"total_credits": 10.0}})).is_none());
     }
 
     #[test]
