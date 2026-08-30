@@ -27,7 +27,7 @@ pxy route [MODEL|--clear]     # pin the auto route to one model (chain stays as 
 pxy explain <model> [--json]  # why each candidate would (not) be routed; --json for the panel
 pxy doctor                    # config/daemon/credentials/agents health, exit 1 on FAIL
 pxy explain <model>           # why each candidate would (not) be routed right now
-pxy refresh [--write]         # discover catalogs; report drift / regenerate generated.toml
+pxy refresh [--generate]      # discover catalogs; report drift / regenerate models.toml
 pxy search "query" [-n N]     # web search (brave -> jina -> firecrawl)
 pxy fetch <url>               # URL -> markdown (jina-reader -> firecrawl)
 pxy transcribe <file>         # STT (groq whisper default)
@@ -82,10 +82,12 @@ pxy is the only party that knows which model answered. So:
   are recorded but have no panel consumer yet. CLI logging goes to stderr so
   `status --json` stdout stays parseable.
 
-**Auto-route pin (added 2026-08-26):** `pxy route <model>` pins the auto route
-to one model — the pin is walked FIRST on every auto request and the
-configured chain stays behind it as fallback, so pinning never costs the
-failover safety auto exists for. The pin lives in state.sqlite kv
+**Group pin (added 2026-08-26):** `pxy route <model>` pins a group walk to one
+model — the pin is walked FIRST on every group request and the configured
+chain stays behind it as fallback, so pinning never costs the failover safety
+groups exist for. (Originally the "auto-route pin" for the generated `auto`
+chain; since e75a49c it applies to hand-written group requests.) The pin lives
+in state.sqlite kv
 (`route_pin`, canonical `provider/model`), is read per request
 (router::resolve_candidates — no daemon restart to take effect), and degrades
 to the plain chain when it stops resolving. Explicit model requests ignore it.
@@ -239,6 +241,50 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   `model`/`stream` are pxy's own keys and are ignored if listed; kiro's body_patch
   merges later and can't be stripped. Curated `drop_params` survives the generated
   overlay like tool_call/force_stream.
+
+**Routing feature round (added 2026-08-30):**
+- **Failure-rate cooldown** (litellm's rule): `state.model_health` tracks
+  per-`provider/model` request/failure two-bucket windows (60s); ≥50% of ≥5
+  attempts failing skips the model on multi-candidate walks even after each
+  individual error cooldown expires (flapping 200/500 upstreams never trip the
+  per-error ladder). Real attempts only — pre-filter skips and
+  context-window skips don't count; a success repairs the record. In-memory
+  only; cooldown persistence already covers the decisive failures.
+- **Request-scoped error rules**: `[[providers.X.errors]]` with `match`
+  (case-insensitive substring on the error body) + `action` = `skip` |
+  `skip-cooldown` | `passthrough` | `passthrough-cooldown`. Checked in
+  `classify_error` AFTER the context-window carve-out, BEFORE the status
+  ladder; first match wins. Absorbs aggregator/WAF error text
+  (agentrouter's 无可用渠道 503s…) without code changes.
+- **Session affinity**: conversations stick to their last WINNING candidate
+  for prompt-cache locality instead of bouncing back to the chain head after
+  a failover. Key ladder: `metadata.user_id` (Claude Code) → `user` (OpenAI
+  shape) → FNV-1a of the first message (fixed hash — DefaultHasher is keyed
+  per process, which would invalidate every stored binding on restart).
+  Binding lives in kv `session:<key>` as `{candidate, seen}`, 1h TTL enforced
+  on read; walks first when fresh+listed, BELOW a manual pin, and rebinds on
+  every `Done` (self-healing after failover).
+- **Multi-account providers**: `[[providers.X.accounts]]` — each entry has
+  `name` ([a-z0-9-], part of the state key), `api_key` or `credentials`, and
+  optional per-account `headers` that override the provider's same-named
+  ones. Mutually exclusive with top-level api_key/credentials; claude-oauth
+  has no account dimension (it reads the shared CC credentials file).
+  `resolve_candidates` expands a bare candidate into per-account candidates
+  (config order = fill-first: one account burns before the next starts), so
+  the ordinary walk/cooldown machinery works per account unchanged. State
+  keys are scoped per account — cooldowns, usage windows, limit enforcement,
+  rpm and the failure-rate record all live under `provider#account` (the
+  media-key convention) — while `x-pxy-provider` and the `model_usage` table
+  keep the BARE provider name so the desktop panel and usage-scan consumers
+  never see `#`. `pxy status` sums accounts into the provider row;
+  `pxy explain` shows `[account n]` per candidate; refresh discovery
+  authenticates as the FIRST account. A provider without `accounts` behaves
+  identically to before (implicit default account,
+  `state_provider == provider`).
+- **Estimator**: `estimate_tokens` counts ASCII codepoints /4 + every
+  non-ASCII codepoint ×1 — CJK at chars/4 was the big under-count (400 CJK
+  chars ≈ 400 tokens, not 300). The `/v1/messages/count_tokens` endpoint
+  inherits the accuracy.
 
 ## Provider catalog (31 active)
 
@@ -493,71 +539,45 @@ groq + mistral (STT), agnes (images/video).
    (the last hard piece of work in Phase 3) would buy nothing. Re-verify with those two
    calls BEFORE writing any code if Antigravity ships a new client/API. Free Gemini is
    already covered by the `google` (AI Studio) provider in `auto`.
-4. **Catalog automation (`pxy refresh`) — ALL THREE STAGES DONE 2026-08-25.**
-   `pxy refresh` = dry-run report; `pxy refresh --write` = regenerate
-   `~/.config/pxy/generated.toml` (model lists + auto chain), which Config::load
-   overlays onto config.toml at startup. Restart pxy after a --write.
-   - **Auto chain ordering (rewritten 2026-08-27, replaces tier-first + preference-first):**
-     only `tier = "free"` providers are generated at all — subscriptions (opencode Go,
-     Copilot), promotional balances (agentrouter, gorouter, tabitoken) and finite grants
-     (inception, tencent, alibaba, tokenrouter, kiro) are **manual-only** now, not a
-     lower tier of `auto`. Within that, the order is **context bucket (widest first)
-     -> open weights before proprietary -> newest `release_date`**, with `open_weights`
-     and `release_date` joined from models.dev (it carries both for 127/130 of our
-     free-tier models; unknown openness counts as proprietary, unknown date sorts last).
-     Contexts are BUCKETED (1M / 500k / 256k / 131k / 65k / 32k / 8k) because 1,048,756
-     vs 1,000,000 is not a real difference and exact numbers would rank pools by
-     rounding. `[preferences] models` is now a TIE-BREAKER applied AFTER all three, not
-     the primary key — it can no longer lift a narrower or older model up the chain, and
-     with the list empty the automatic order stands alone.
-   - `max_unranked` is effectively the CHAIN LENGTH while `models` is empty; it is 24 on
-     purpose, which is exactly the 1M-context bucket. `/v1/models` advertises the MIN
-     context over the chain, so a longer tail would tell agents `auto` holds 32k.
-     Verified after the change: `auto` advertises 1,000,000.
-   - ⚠️ **Generation must use the CURATED context, not the discovered one.** `models` is
-     seeded from config.toml and discovery now `or_insert`s (never overwrites), because
-     `Config::apply_generated` gives the hand-written ModelSpec wholesale priority at
-     load. Overwriting made generated.toml claim aihubmix/coding-kimi-k3-free was 1M
-     when the router pins it to 262k — harmless while tier/rank drove the sort, but it
-     put four fake-1M models at the head of the chain the moment context became the
-     primary key, and dropped advertised `auto` context to 131k.
-   - `max_pools_per_model` (3) and `deny` (listed-but-broken ids) are unchanged.
-   - Per-provider: `tier`, `discover`, `models_url`, `id_field`, `[providers.X.promo]`
-     (`expires = "YYYY-MM-DD"`, fails closed on bad dates).
-   - Per-model: `tool_call = true|false` — a CURATED fact that beats discovery and
-     probing (zai's 1-concurrent throttle makes probing it unreliable; its glm-4.7-flash
-     is also absent from Z.AI's own /models yet works).
-   - Probes: only for ranked models with unknown capability; YES cached forever, NO for
-     7 days (aihubmix's gemini tool-called in the morning and stopped by afternoon —
-     free pools degrade and recover), truncated answers (finish=length) cache nothing.
-   - **Write guard**: --write ABORTS if any discovery failure is credential-shaped or
-     >half of providers fail (a locked gpg agent takes out every provider at once;
-     generating from that would shrink the chain and then be loaded as truth).
-   - **Feedback-loop guard**: refresh reads `Config::load_base` (baseline WITHOUT the
-     generated overlay) — generation consuming its own output erased curated marks.
-   - Stage-1 history (research + rules):
-   Design research: OmniRoute + litellm + our own config (see the commit message).
-   - **Stage 1 (done)**: `pxy refresh` discovers every provider's live `/models`
-     (default-ON, seed fallback — an opt-in allowlist is how OmniRoute silently served
-     stale catalogs), joins **models.dev** (7285 models, 100% carry `tool_call`; covers
-     94% of our config and 27/27 of `auto`), and prints drift + free-and-tool-capable
-     candidates + cross-provider pools. Read-only.
-   - **Stage 2 (todo)**: probe cache in sqlite for the ~6% models.dev can't answer;
-     generate per-provider `models` lists into `generated.toml` (merged at load, so
-     hand-written auth/limits/quirks are never touched).
-   - **Stage 3 (todo)**: `[preferences]` list of bare model names + per-provider `tier`;
-     generate the `auto` chain. **Open decision**: tier-first (free pools before paid,
-     preference orders within a tier — recommended) vs literal preference-first.
-     Also: `[providers.X.promo] expires = "…"` to auto-drop promos (openrouter's own
-     `expiration_date` is present on only 8/419 models and absent on the GMI promo, so
-     upstream expiry data can NOT be relied on).
+4. **Catalog automation (`pxy refresh`) — REWRITTEN 2026-08-29 (commit e75a49c).**
+   `pxy refresh` = dry-run report; `pxy refresh --generate` = regenerate
+   `~/.config/pxy/models.toml`, which Config::load overlays onto config.toml at
+   startup. Restart pxy after a --generate.
+   - **Groups replaced the auto route.** The generated `[auto]` chain — context
+     buckets, `max_unranked`, open-weights ordering, the `[preferences]`
+     tie-breaker, `deny`, `max_pools_per_model` — is ALL GONE. `[groups.*]`
+     chains are hand-written in config.toml, and generation produces only
+     per-provider MODEL LISTS (free and paid alike; `free` is a display fact,
+     routing never reads it). Model lists are a UNION with config.toml: a
+     provider's /models can omit a model that works, and for a model
+     config.toml also declares, the hand-written spec wins wholesale (so
+     curated context_length beats discovery — the fake-1M chain-head bug is
+     structurally impossible again).
+   - **Probes are removed.** Capabilities come from the models.dev join
+     (7285 models; `tool_call`, `context_length`) plus hand-written overrides.
+     Pre-rewrite artifacts — `~/.config/pxy/generated.toml` and the
+     `probe:tools:*` kv rows — are dead weight; deleted 2026-08-30.
+   - Per-provider: `tier` echo, `discover`, `models_url`, `id_field`,
+     `[providers.X.promo]` `expires` — STRICT `YYYY-MM-DD` since 2026-08-30,
+     unparseable fails CLOSED (expired). Before that, a bare string compare
+     let a typo like "2026-9-6" keep a paid model in the free chains forever.
+   - **Write guard**: --generate ABORTS if any discovery failure is
+     credential-shaped (secret resolution failure, or HTTP 401/402/403 from a
+     revoked-but-present key) or >half of providers fail; the previous
+     models.toml stays in force. Writes are atomic (tmp+rename) — models.toml
+     is parsed at every startup.
+   - **Feedback-loop guard**: refresh reads `Config::load_base` (baseline
+     WITHOUT the models.toml overlay) — generation consuming its own output
+     erased curated marks once.
    - **Rules that must not be relaxed** (each is somebody's post-mortem):
-     absence from a listing is REPORTED, never auto-deleted; capabilities are tri-state
-     (Unknown never collapses to No or to an optimistic Yes); a failed fetch is distinct
-     from an empty catalog; billing-safety stays hand-curated.
-   - **Proof the no-auto-delete rule is load-bearing**: `zai/glm-4.7-flash` (our best free
-     coding model, 59.2 SWE-bench) does NOT appear in Z.AI's own `/models` listing but
-     works fine — verified live. Auto-deletion would have removed it.
+     absence from a listing is REPORTED, never auto-deleted; capabilities are
+     tri-state (Unknown never collapses to No or to an optimistic Yes); a
+     failed fetch is distinct from an empty catalog; billing-safety stays
+     hand-curated.
+   - **Proof the no-auto-delete rule is load-bearing**: `zai/glm-4.7-flash`
+     (our best free coding model, 59.2 SWE-bench) does NOT appear in Z.AI's
+     own /models listing but works fine — verified live. Auto-deletion would
+     have removed it.
 5. **Nice-to-haves — ALL RESOLVED 2026-08-25** (one commit each, see git log):
    - ~~Quota headers~~ DONE: on a SUCCESS response, openadapter's `X-Quota-*` (≥100%)
      and `x-ratelimit-remaining-*: 0` (reset parsed from plain-secs / Go-duration /

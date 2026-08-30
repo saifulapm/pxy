@@ -162,6 +162,39 @@ monthly_requests = 300        # premium request allowance (Pro)
 reset = "00:00"
 reset_tz = "UTC"
 
+# ---------------------------------------------------------------------------
+# MULTI-ACCOUNT providers: several subscription accounts behind ONE entry.
+# The walk tries them in config order (fill-first: one account burns before
+# the next starts, which staggers rolling subscription windows). Cooldowns,
+# usage windows and limit enforcement are tracked PER ACCOUNT under the
+# `provider#account` state key — each account gets its own quota buckets,
+# which is what you want for subscriptions. `accounts` is mutually exclusive
+# with top-level api_key/credentials; claude-oauth has no account dimension.
+# x-pxy-provider and the model_usage table keep the BARE provider name.
+#
+# [[providers.opencode-go.accounts]]
+# name = "github"                      # [a-z0-9-], part of the state key
+# api_key = { pass = "AI/oc/go-gh" }
+# [providers.opencode-go.accounts.headers]
+# x-org = "org-123"                    # overrides the provider's same-named header
+# [[providers.opencode-go.accounts]]
+# name = "google"
+# api_key = { pass = "AI/oc/go-g" }
+#
+# REQUEST-SCOPED ERROR RULES: per-provider body overrides that beat the
+# status ladder. FIRST matching rule wins (case-insensitive substring on the
+# upstream error body). Actions:
+#   skip                 — try the next candidate, no cooldown
+#   skip-cooldown        — next candidate + model-scoped retryable cooldown
+#   passthrough          — return the raw error to the client
+#   passthrough-cooldown — raw error to the client AND cool the candidate
+# (The context-window failover carve-out still runs before the rules.)
+#
+# [[providers.agentrouter.errors]]
+# match = "无可用渠道"
+# action = "skip-cooldown"
+# ---------------------------------------------------------------------------
+
 # 0x-multiplier Copilot models: unlimited on paid plans, keep working even
 # after the 300 premium requests are spent. Separate provider so their heavy
 # background use never eats the premium budget in pxy's accounting.
