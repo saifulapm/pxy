@@ -625,7 +625,14 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
     use std::io::Write;
     let state = PxyState::open(&crate::config::data_dir().join("state.sqlite"))?;
     let now = Timestamp::now();
-    let wanted = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
+    // `--provider X` also matches the per-account synthetic keys
+    // (`X#account`) that multi-account providers report under.
+    let wanted = |name: &str| {
+        only.is_empty()
+            || only
+                .iter()
+                .any(|o| o == name || name.split('#').next() == Some(o.as_str()))
+    };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut json_providers = serde_json::Map::new();
@@ -748,12 +755,20 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
         let secrets = Secrets::new();
-        let targets: Vec<(&String, &crate::config::ProviderConfig, &String)> = cfg
-            .providers
-            .iter()
-            .filter(|(n, p)| p.enabled && wanted(n))
-            .filter_map(|(n, p)| p.balance_url.as_ref().map(|u| (n, p, u)))
-            .collect();
+        let mut targets: Vec<(String, &crate::config::ProviderConfig, &String, Option<&crate::config::Account>)> =
+            Vec::new();
+        for (n, p) in cfg.providers.iter().filter(|(n, p)| p.enabled && wanted(n)) {
+            let Some(url) = &p.balance_url else { continue };
+            if p.accounts.is_empty() {
+                targets.push((n.clone(), p, url, None));
+            } else {
+                // One balance fetch per ACCOUNT: the usage endpoint reads the
+                // key's own windows, and the key is the account's.
+                for a in &p.accounts {
+                    targets.push((format!("{n}#{}", a.name), p, url, Some(a)));
+                }
+            }
+        }
         // Providers that report their allowance in RESPONSE HEADERS instead of
         // at a URL (tokenharbor's rolling 7x24h free tier): the router's last
         // snapshot is the only readout there is. It costs no HTTP, so it can
@@ -774,13 +789,14 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
             let _ = writeln!(out, "\nno remote quota source on any provider");
             return Ok(());
         }
-        let fetches = targets.iter().map(|(name, p, url)| {
+        let fetches = targets.iter().map(|(name, p, url, acct)| {
             let http = &http;
             let secrets = &secrets;
             let state = &state;
             async move {
-                let (line, body) = fetch_balance(name, p, url, secrets, state, http).await;
-                (name.to_string(), line, body)
+                let (line, body) =
+                    fetch_balance(name, p, url, *acct, secrets, state, http).await;
+                (name.clone(), line, body)
             }
         });
         let results = futures_util::future::join_all(fetches).await;
@@ -950,6 +966,7 @@ async fn fetch_balance(
     name: &str,
     p: &crate::config::ProviderConfig,
     url: &str,
+    acct: Option<&crate::config::Account>,
     secrets: &Secrets,
     state: &PxyState,
     http: &reqwest::Client,
@@ -997,7 +1014,8 @@ async fn fetch_balance(
             req = req.header(k, v);
         }
     } else {
-        let prepared = match crate::providers::prepare(name, p, secrets, state, http, None).await {
+        let prepared =
+            match crate::providers::prepare(name, p, secrets, state, http, acct).await {
             Ok(pr) => pr,
             Err(e) => return (format!("credential error: {e:#}"), None),
         };

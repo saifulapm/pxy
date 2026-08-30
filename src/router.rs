@@ -82,10 +82,17 @@ pub fn resolve_candidates(
     requested: &str,
     session: Option<&str>,
 ) -> Vec<Candidate> {
-    let mut chain = catalog.resolve(cfg, requested);
+    // Explicit single-model requests skip the pin/affinity logic but STILL
+    // get the multi-account expansion — an account walk is exactly what an
+    // explicit request wants when account #1 is cooling.
     if !catalog.is_group(requested) {
-        return chain;
+        return catalog
+            .resolve(cfg, requested)
+            .into_iter()
+            .flat_map(|c| expand_accounts(cfg, c))
+            .collect();
     }
+    let mut chain = catalog.resolve(cfg, requested);
     // Manual pin: walked FIRST, ahead of session affinity — `pxy route` is an
     // explicit human decision.
     let mut pinned = None;

@@ -298,13 +298,19 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   ⚠️ `overage_permitted: true` on the account — premium requests past 300 BILL
   ($0.04 each); the status line flags it. Disable in github.com → Settings → Copilot
   if surprise billing is unwanted.
-- `opencode-go-github` + `opencode-go-google` — $10/mo Go plan per account; usage-dollar
+- `opencode-go` — $10/mo Go plan per account; usage-dollar
   limits $12/5h (rolling), $30/wk, $60/mo, enforced upstream (429 → pxy cooldown +
   account rotation; pxy does no dollar accounting itself). Live utilization:
   `GET /zen/go/v1/usage` with the API key (found in the opencode source, wired into
   `pxy status --remote` 2026-08-25 — shows percent per window + reset time).
+  **Merged 2026-08-30 into ONE multi-account provider** (was
+  `opencode-go-github` + `opencode-go-google`): two `[[providers.opencode-go.accounts]]`
+  (github, google), fill-first walk, per-account cooldowns/usage/limits under
+  `opencode-go#<account>` state keys, `status --remote` reports both accounts'
+  windows. `ox-alpha-free` started answering "Model not supported" on 2026-08-30
+  (upstream churn — both accounts, same error) — re-verify before re-adding.
   **Per-model allowances vary 400×** — table in docs/07. Only high-allowance models are in
-  `auto`; kimi-k3 (110/5h), grok-4.5 (120), qwen3.8-max (160), glm-5.3 (220) are excluded.
+  `subscription`; kimi-k3 (110/5h), grok-4.5 (120), qwen3.8-max (160), glm-5.3 (220) are excluded.
   - `muse-spark-1.2-contributor` (45,300/5h): data-collection opt-in was enabled on both
     accounts 2026-08-24, which cleared the `DataPolicyError` — but the model then returned
     **HTTP 500 on every call** (both accounts, all three routes, streaming and not, while
