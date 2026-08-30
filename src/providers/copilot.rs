@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::ProviderConfig;
+use crate::config::{ProviderConfig, SecretRef};
 use crate::secrets::Secrets;
 use crate::state::State;
 
@@ -29,12 +29,13 @@ const REFRESH_LEAD_SECS: u64 = 300;
 pub async fn prepare(
     name: &str,
     cfg: &ProviderConfig,
+    cred: Option<&SecretRef>,
     secrets: &Secrets,
     state: &State,
     http: &reqwest::Client,
     mut headers: Vec<(String, String)>,
 ) -> Result<PreparedRequest> {
-    let copilot_token = current_token(name, cfg, secrets, state, http).await?;
+    let copilot_token = current_token(name, cred, secrets, state, http).await?;
 
     headers.extend([
         ("authorization".into(), format!("Bearer {copilot_token}")),
@@ -97,7 +98,7 @@ pub async fn fetch_quota(
 
 async fn current_token(
     name: &str,
-    cfg: &ProviderConfig,
+    cred: Option<&SecretRef>,
     secrets: &Secrets,
     state: &State,
     http: &reqwest::Client,
@@ -116,10 +117,7 @@ async fn current_token(
     }
 
     // Mint a fresh one from the long-lived GitHub token stored in pass.
-    let cred_ref = cfg
-        .credentials
-        .as_ref()
-        .or(cfg.api_key.as_ref())
+    let cred_ref = cred
         .with_context(|| format!("provider {name}: credentials required"))?;
     let blob = secrets.resolve(cred_ref)?;
     let gh_token = github_access_token(&blob)?;

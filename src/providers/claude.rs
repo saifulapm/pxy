@@ -62,7 +62,7 @@ pub async fn prepare(
         // useless). Fully closes the rotation race against any other locker
         // (a second pxy, future tooling); the CLI itself may not lock, so
         // the staleness re-read below stays load-bearing.
-        let _flock = FileLock::acquire(path.with_extension("json.lock")).await?;
+        let _flock = super::RefreshLock::acquire(path.with_extension("json.lock")).await?;
         // Staleness re-read inside both locks: Claude Code (or a parallel
         // pxy request) may have refreshed while we waited.
         creds = read_credentials(&path)?;
@@ -110,30 +110,6 @@ pub fn ensure_sentinel(body: &mut Value) {
     };
     blocks.insert(0, json!({"type": "text", "text": SENTINEL}));
     body["system"] = Value::Array(blocks);
-}
-
-/// Exclusive advisory lock, released when dropped (fd close). Acquired on a
-/// blocking thread so a contended lock never stalls a runtime worker.
-struct FileLock(#[allow(dead_code)] std::fs::File);
-
-impl FileLock {
-    async fn acquire(path: std::path::PathBuf) -> Result<Self> {
-        tokio::task::spawn_blocking(move || {
-            use std::os::unix::fs::OpenOptionsExt;
-            use std::os::unix::io::AsRawFd;
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .mode(0o600)
-                .open(&path)
-                .with_context(|| format!("opening lock file {}", path.display()))?;
-            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
-            anyhow::ensure!(rc == 0, "flock failed: {}", std::io::Error::last_os_error());
-            Ok(Self(f))
-        })
-        .await
-        .context("lock task panicked")?
-    }
 }
 
 fn credentials_path(cfg: &ProviderConfig) -> std::path::PathBuf {
@@ -225,9 +201,17 @@ async fn refresh(
 
 fn write_credentials(path: &std::path::Path, creds: &Value) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    // Backup the previous content once per write.
+    // Backup the previous content once per write — at 0600 like the live
+    // file: the backup carries the same access+refresh pair.
     if let Ok(old) = std::fs::read(path) {
-        let _ = std::fs::write(path.with_extension("json.bak"), old);
+        let bak = path.with_extension("json.bak");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&bak)?;
+        std::io::Write::write_all(&mut f, old.as_slice())?;
     }
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string(creds)?;

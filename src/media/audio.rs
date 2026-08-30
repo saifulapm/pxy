@@ -261,6 +261,8 @@ async fn attempt_speech(
         .to_string();
     if r.media.kind == MediaKind::Dashscope {
         // DashScope answers with a signed OSS URL; fetch and relay the bytes.
+        // https + aliyun host only: pxy would otherwise fetch whatever origin
+        // the upstream names (SSRF by upstream JSON).
         let v: Value = resp.json().await.unwrap_or_default();
         let Some(url) = super::dashscope::speech_audio_url(&v) else {
             return Attempt::Retryable(error_response(
@@ -268,6 +270,17 @@ async fn attempt_speech(
                 format!("no audio url in upstream response: {v}"),
             ));
         };
+        let url_ok = url.starts_with("https://")
+            && url
+                .strip_prefix("https://")
+                .and_then(|rest| rest.split('/').next())
+                .is_some_and(|host| host.ends_with("aliyuncs.com") || host.ends_with("aliyun.com"));
+        if !url_ok {
+            return Attempt::Retryable(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("refusing upstream audio url: {url}"),
+            ));
+        }
         return match app.http.get(&url).timeout(std::time::Duration::from_secs(60)).send().await {
             Ok(audio) if audio.status().is_success() => {
                 let ct = audio

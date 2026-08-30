@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::config::ProviderConfig;
+use crate::config::{ProviderConfig, SecretRef};
 use crate::secrets::Secrets;
 use crate::state::State;
 
@@ -35,15 +35,13 @@ static REFRESH_LOCK: Mutex<()> = Mutex::const_new(());
 pub async fn prepare(
     name: &str,
     cfg: &ProviderConfig,
+    cred: Option<&SecretRef>,
     secrets: &Secrets,
     state: &State,
     http: &reqwest::Client,
     mut headers: Vec<(String, String)>,
 ) -> Result<PreparedRequest> {
-    let cred_ref = cfg
-        .credentials
-        .as_ref()
-        .or(cfg.api_key.as_ref())
+    let cred_ref = cred
         .with_context(|| format!("provider {name}: credentials required"))?;
     let blob = secrets.resolve(cred_ref)?;
     let seed: Value = serde_json::from_str(blob.trim())
@@ -86,12 +84,24 @@ pub async fn prepare(
 }
 
 /// `arn:aws:codewhisperer:<region>:...` decides the host. us-east-1 keeps the
-/// codewhisperer.* name; every other region lives under q.<region>.
+/// codewhisperer.* name; every other region lives under q.<region>. The
+/// region is strictly validated: it is interpolated into the request host, so
+/// a tampered ARN must not turn it into a different origin.
 fn runtime_host(profile_arn: &str) -> String {
     let region = profile_arn
         .split(':')
         .nth(3)
         .filter(|r| !r.is_empty())
+        .filter(|r| {
+            // AWS region shape: eu-west-1, us-gov-west-1, cn-north-1 — never
+            // "evil.com" or anything with dots/slashes.
+            let mut parts = r.split('-');
+            let first_ok = parts.next().is_some_and(|p| {
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase())
+            });
+            first_ok && parts.all(|p| p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+                && r.len() <= 20
+        })
         .unwrap_or("us-east-1");
     if region == "us-east-1" {
         "https://codewhisperer.us-east-1.amazonaws.com".into()
@@ -151,6 +161,28 @@ async fn current_token(
     }
 
     let _guard = REFRESH_LOCK.lock().await;
+    if let Some(cached) = state.kv_get(&kv_key)? {
+        if let Ok(v) = serde_json::from_str::<Value>(&cached) {
+            if let (Some(t), Some(exp)) = (v["access_token"].as_str(), v["expires_at"].as_u64()) {
+                if exp > now_secs() + REFRESH_LEAD_SECS {
+                    let arn = match arn_from(&v) {
+                        s if s.is_empty() => arn_from(seed),
+                        s => s,
+                    };
+                    return Ok((t.to_string(), arn));
+                }
+            }
+        }
+    }
+    // Cross-process guard, same rationale as kimi's: a second pxy process
+    // refreshing in the same seconds would race the (non-rotating, but
+    // single-use-checked) refresh exchange. External CLIs keep their own
+    // locking; this serializes pxy processes against each other.
+    let _flock = super::RefreshLock::acquire(
+        crate::config::data_dir().join(format!("refresh-{name}.lock")),
+    )
+    .await?;
+    // Re-check under the file lock too.
     if let Some(cached) = state.kv_get(&kv_key)? {
         if let Ok(v) = serde_json::from_str::<Value>(&cached) {
             if let (Some(t), Some(exp)) = (v["access_token"].as_str(), v["expires_at"].as_u64()) {
