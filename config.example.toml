@@ -271,14 +271,36 @@ models = [
 # `pxy status --remote`, which prints the usability verdict next to the money
 # (an expired grant still counts inside total_balance, so the number alone
 # can read healthy on a dead account).
+#
+# Deliberately their ANTHROPIC endpoint, not /chat/completions. DeepSeek serves
+# both, and for an Anthropic-speaking client (Claude Code) this side keeps two
+# things the openai path drops: images inside a tool_result (verified 2026-08-30
+# — anthropic_to_openai flattens those to "[image omitted]", since openai tool
+# messages are text-only), and prior-turn thinking blocks, which DeepSeek says
+# must be replayed once tools are in play. The reverse direction costs nothing:
+# an openai-format client cannot put an image in a tool result anyway.
+# `thinking: {type: adaptive|enabled|disabled}` all work; temperature/top_p are
+# ignored, not rejected, so no drop_params. `cache_control` is ignored but
+# caching still happens automatically, reported in Anthropic's cache fields
+# (input_tokens EXCLUDES them, so pxy's usage sum stays exact).
+#
+# models_url is REQUIRED here and only here: discovery derives a listing URL by
+# stripping /chat/completions, so an Anthropic base_url leaves it nothing to
+# derive and the provider is skipped. There is no Anthropic-format listing —
+# /anthropic/v1/models is a 404 — so point it at the openai-format host.
 # [providers.deepseek]
-# base_url = "https://api.deepseek.com/chat/completions"
+# base_url = "https://api.deepseek.com/anthropic/v1/messages"
+# format = "anthropic"
+# auth_header = "x-api-key"
+# models_url = "https://api.deepseek.com/models"
 # balance_url = "https://api.deepseek.com/user/balance"
 # api_key = { pass = "AI/deepseek/main" }
 # models = [
-#   { id = "deepseek-v4-flash", context_length = 1000000 },
-#   { id = "deepseek-v4-flash-vision-exp", context_length = 1000000 },
-#   { id = "deepseek-v4-pro", context_length = 1000000 },
+#   # vision-exp is the ONLY one that takes images, and costs the same as flash;
+#   # the others answer 400 "This model does not support image".
+#   { id = "deepseek-v4-flash", context_length = 1000000, max_output_tokens = 8192 },
+#   { id = "deepseek-v4-flash-vision-exp", context_length = 1000000, max_output_tokens = 8192 },
+#   { id = "deepseek-v4-pro", context_length = 1000000, max_output_tokens = 8192 },
 # ]
 
 # OpenRouter, FREE models only (":free" ids never consume credits — free-model
