@@ -369,9 +369,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   credits purchased). ⏰ **GMI Cloud promo until Sep 6 2026**: `minimax/minimax-m3:free`
   (1M ctx, in `auto`) + `minimax-m2.7:free` (196k) — unlimited, tool calling verified,
   $0 cost confirmed per-request. **Remove both + the `auto` entry after Sep 6** (they go paid).
-  Safety net: `[providers.openrouter.promo] expires = "2026-09-06"` IS declared in the live
-  config (verified 2026-08-26), so `pxy refresh --write` drops them from generated chains
-  automatically — only the hand-written entries need the manual edit.
+  No safety net: the `promo`/`expires` config key was deleted 2026-08-30, so this is a
+  fully manual edit of config.toml.
   Free models never touch the credit balance.
 - `aihubmix` — aggregator, free catalog opened ~2026-08 (added 2026-08-25): 50 `-free`
   models on one key, no card. In `auto`: `gemini-3.7-flash-free` (only Gemini in the stack,
@@ -566,11 +565,13 @@ groq + mistral (STT), agnes (images/video).
      (7285 models; `tool_call`, `context_length`) plus hand-written overrides.
      Pre-rewrite artifacts — `~/.config/pxy/generated.toml` and the
      `probe:tools:*` kv rows — are dead weight; deleted 2026-08-30.
-   - Per-provider: `discover`, `models_url`, `id_field`,
-     `[providers.X.promo]` `expires` — STRICT `YYYY-MM-DD` since 2026-08-30,
-     unparseable fails CLOSED (expired: dropped from the report). Before that,
-     a bare string compare let a typo like "2026-9-6" keep a paid model in the
-     free chains forever.
+   - Per-provider: `discover`, `models_url`, `id_field`.
+   - **`[providers.X.promo]` is GONE as a config key (2026-08-30).** It dropped
+     expired promo ids from the generated report so a now-paid model couldn't be
+     pasted into a free chain. The report is read by a human who curates rows by
+     hand anyway, so the machinery bought nothing. config.toml is
+     `deny_unknown_fields`: a leftover `[providers.X.promo]` table now fails
+     startup — delete it.
    - **`tier` is GONE as a config key (2026-08-30).** It was the cost class the
      dead `auto` generator ranked by; afterwards it only echoed into models.toml
      and `pxy models --json` (the desktop panel copied it, rendered it nowhere).

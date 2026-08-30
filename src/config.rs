@@ -461,12 +461,6 @@ pub struct ProviderConfig {
     /// Field holding the usable model id in the discovery response. Default
     /// "id"; Cloudflare needs "name" because its `id` is a UUID.
     pub id_field: Option<String>,
-    /// Time-limited promotional models, dropped from the discovery report once
-    /// expired.
-    /// Upstream expiry metadata is not trustworthy (OpenRouter carries
-    /// `expiration_date` on 8 of 419 models, and not on the promo we use), so
-    /// the deadline is declared here.
-    pub promo: Option<Promo>,
     /// Remote billing endpoint for `pxy status --remote`. Recognized shapes:
     /// OpenRouter's `data.{total_credits,total_usage}` (dollars), new-api's
     /// `data.{quota,used_quota}` (units of 1/500000 USD), DeepSeek's
@@ -593,33 +587,6 @@ pub enum MediaKind {
     Dashscope,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Promo {
-    /// Model ids that are only free until `expires`.
-    #[serde(default)]
-    pub models: Vec<String>,
-    /// Last day the promo is valid, `YYYY-MM-DD` (inclusive).
-    pub expires: String,
-}
-
-impl Promo {
-    /// True once `today` is past `expires`. An unparseable date is treated as
-    /// expired: failing closed drops a model, failing open spends money. The
-    /// parse must be STRICT — a bare string compare let "2026-9-6" (or any
-    /// typo sorting after today) keep a paid model in the free chains forever.
-    pub fn is_expired(&self, today: &str) -> bool {
-        use std::str::FromStr;
-        match (
-            jiff::civil::Date::from_str(&self.expires),
-            jiff::civil::Date::from_str(today),
-        ) {
-            (Ok(expires), Ok(today)) => today > expires,
-            _ => true,
-        }
-    }
-}
-
 #[cfg(test)]
 impl ProviderConfig {
     /// Minimal instance for unit tests.
@@ -646,7 +613,6 @@ impl ProviderConfig {
             discover: true,
             models_url: None,
             id_field: None,
-            promo: None,
             balance_url: None,
             balance_key: None,
             media: None,

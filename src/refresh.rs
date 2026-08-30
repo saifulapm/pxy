@@ -531,23 +531,15 @@ fn generate(
     println!("\n── generating ──");
 
     let mut per_provider: BTreeMap<String, Vec<Row>> = BTreeMap::new();
-    let mut dropped_promo: Vec<String> = Vec::new();
 
     for (name, models) in &discovered {
-        let Some(pcfg) = cfg.providers.get(name) else {
+        if !cfg.providers.contains_key(name) {
             continue;
-        };
-        let promo = pcfg.promo.as_ref().filter(|p| p.is_expired(&today));
+        }
         // Keyed by id: a listing that repeats an id must not produce a row
         // twice, and the key orders the output.
         let mut rows: BTreeMap<String, Row> = BTreeMap::new();
         for d in models {
-            // An expired promo model is still listed upstream — at a price now.
-            // Reporting it invites pasting a paying model into a free chain.
-            if promo.is_some_and(|p| p.models.contains(&d.id)) {
-                dropped_promo.push(format!("{name}/{}", d.id));
-                continue;
-            }
             rows.insert(
                 d.id.clone(),
                 Row {
@@ -570,12 +562,6 @@ fn generate(
     let rows = || per_provider.values().flatten();
     let total = rows().count();
     let free = rows().filter(|r| r.free == Some(true)).count();
-    if !dropped_promo.is_empty() {
-        println!("dropped {} expired promo model(s):", dropped_promo.len());
-        for d in &dropped_promo {
-            println!("  {d}");
-        }
-    }
     println!(
         "wrote {} — {total} models across {} providers ({free} priced at zero). \
          pxy does NOT read this file: copy the rows you want into config.toml \
@@ -590,7 +576,7 @@ fn generate(
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Today as YYYY-MM-DD, for promo expiry.
+/// Today as YYYY-MM-DD, for the generated report's stamp.
 fn today() -> String {
     jiff::Zoned::now().date().to_string()
 }
@@ -734,10 +720,6 @@ mod tests {
             // hand-added, absent from the listing
             ModelEntry::Id("hand-only".into()),
         ];
-        pcfg.promo = Some(crate::config::Promo {
-            models: vec!["promo".into()],
-            expires: "2020-01-01".into(),
-        });
         let cfg = Config {
             server: crate::config::ServerConfig { port: 1, api_key: "k".into() },
             providers: BTreeMap::from([("p".to_string(), pcfg)]),
@@ -755,8 +737,6 @@ mod tests {
                              tool_call: Tri::No, context: Some(1_000_000) },
                 Discovered { id: "new".into(), canonical: "new".into(), free: Tri::No,
                              tool_call: Tri::Unknown, context: Some(400_000) },
-                Discovered { id: "promo".into(), canonical: "promo".into(), free: Tri::Yes,
-                             tool_call: Tri::Yes, context: Some(128_000) },
             ],
         )]);
 
@@ -768,9 +748,8 @@ mod tests {
         // Discovery's numbers, verbatim — including for a model config.toml pins.
         assert!(out.contains(r#"{ id = "pinned", context_length = 1000000, tool_call = false, free = true }"#), "{out}");
         assert!(out.contains(r#"{ id = "new", context_length = 400000, free = false }"#), "{out}");
-        // Hand-written models are NOT copied in; an expired promo is dropped.
+        // Hand-written models are NOT copied in.
         assert!(!out.contains("hand-only"), "{out}");
-        assert!(!out.contains(r#"id = "promo""#), "{out}");
     }
 
     #[test]
@@ -802,35 +781,6 @@ mod tests {
         assert_eq!(parsed.providers["p"].models.len(), 2);
     }
 
-
-    #[test]
-    fn promo_expiry_is_date_ordered_and_fails_closed() {
-        let p = crate::config::Promo {
-            models: vec!["m".into()],
-            expires: "2026-09-06".into(),
-        };
-        assert!(!p.is_expired("2026-09-06"), "expiry day is inclusive");
-        assert!(!p.is_expired("2026-08-25"));
-        assert!(p.is_expired("2026-09-07"));
-        // An unparseable date must drop the model, not keep spending on it.
-        let bad = crate::config::Promo {
-            models: vec!["m".into()],
-            expires: "".into(),
-        };
-        assert!(bad.is_expired("2026-08-25"));
-        // Strictly: a typo that STRING-sorts after today ("2026-9-6" > 
-        // "2026-08-30" lexicographically) is still unparseable -> expired.
-        let sloppy = crate::config::Promo {
-            models: vec!["m".into()],
-            expires: "2026-9-6".into(),
-        };
-        assert!(sloppy.is_expired("2026-08-25"));
-        let american = crate::config::Promo {
-            models: vec!["m".into()],
-            expires: "09/06/2026".into(),
-        };
-        assert!(american.is_expired("2026-08-25"));
-    }
 
     #[test]
     fn models_url_derives_from_chat_endpoint_and_honours_override() {

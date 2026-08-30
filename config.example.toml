@@ -329,12 +329,6 @@ models = [
   { id = "dots-studio/dots-3-note-preview:free", context_length = 512000 },
   { id = "google/gemma-4-31b-it:free", context_length = 262144 },
 ]
-# GMI Cloud promo: these ids are free only until Sep 6 2026. pxy refresh
-# --write drops them from generation automatically once expired.
-[providers.openrouter.promo]
-models = ["minimax/minimax-m3:free", "minimax/minimax-m2.7:free"]
-expires = "2026-09-06"
-
 [providers.openrouter.limits]
 rpm = 20
 daily_requests = 1000
