@@ -29,7 +29,7 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
     let st = state()?;
     // Same resolution the daemon runs, pin included: explain must describe
     // the walk a request would actually take, not the config-only chain.
-    let candidates = crate::router::resolve_candidates(&catalog, cfg, &st, requested);
+    let candidates = crate::router::resolve_candidates(&catalog, cfg, &st, requested, None);
     let pin = st
         .kv_get(crate::router::ROUTE_PIN_KEY)
         .ok()
@@ -80,7 +80,7 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
         match provider {
             Some(p) if p.enabled => {
                 let limits = p.limits.as_ref().unwrap_or(&default_limits);
-                if let Some(cd) = st.cooldown(&cand.provider, &cand.model.id) {
+                if let Some(cd) = st.cooldown(&cand.state_provider(), &cand.model.id) {
                     let left = cd.until.saturating_duration_since(std::time::Instant::now());
                     skips.push(format!(
                         "cooldown: {} ({}s left{})",
@@ -90,9 +90,9 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                     ));
                 }
                 if let Ok(w) = crate::usage::current_windows(limits, now) {
-                    let day = st.usage(&cand.provider, "day", w.day_start).unwrap_or_default();
+                    let day = st.usage(&cand.state_provider(), "day", w.day_start).unwrap_or_default();
                     let month =
-                        st.usage(&cand.provider, "month", w.month_start).unwrap_or_default();
+                        st.usage(&cand.state_provider(), "month", w.month_start).unwrap_or_default();
                     let mut gate = |used: u64, cap: Option<u64>, what: &str| match cap {
                         Some(c) if used >= c => skips.push(format!("{what}: {used}/{c} EXHAUSTED")),
                         Some(c) => notes.push(format!("{what}: {used}/{c}")),
@@ -103,7 +103,7 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                     gate(month.requests, limits.monthly_requests, "monthly requests");
                     gate(month.tokens, limits.monthly_tokens, "monthly tokens");
                     if limits.total_requests.is_some() || limits.total_tokens.is_some() {
-                        let total = st.usage_total(&cand.provider).unwrap_or_default();
+                        let total = st.usage_total(&cand.state_provider()).unwrap_or_default();
                         gate(total.requests, limits.total_requests, "total requests");
                         gate(total.tokens, limits.total_tokens, "total tokens");
                     }
@@ -136,6 +136,7 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                 "position": i + 1,
                 "id": cand.full_id(),
                 "provider": cand.provider,
+                "account": cand.account,
                 "model": cand.model.id,
                 "free": cand.model.free,
                 "pinned": pinned,
@@ -147,7 +148,12 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
         }
         let verdict = if eligible { "ELIGIBLE" } else { "would skip" };
         let pin_mark = if pinned { "  [pinned]" } else { "" };
-        println!("{:>2}. {}  [{verdict}]{pin_mark}", i + 1, cand.full_id());
+        let acct = cand
+            .account
+            .as_ref()
+            .map(|a| format!("  [account {a}]"))
+            .unwrap_or_default();
+        println!("{:>2}. {}{acct}  [{verdict}]{pin_mark}", i + 1, cand.full_id());
         for s in &skips {
             println!("      ✗ {s}");
         }

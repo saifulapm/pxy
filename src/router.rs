@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::catalog::{Candidate, Catalog};
-use crate::config::{Config, WireFormat};
+use crate::config::{Config, ErrorAction, WireFormat};
 use crate::secrets::Secrets;
 use crate::state::State;
 use crate::translate::sse::SseParser;
@@ -80,28 +80,112 @@ pub fn resolve_candidates(
     cfg: &Config,
     state: &State,
     requested: &str,
+    session: Option<&str>,
 ) -> Vec<Candidate> {
     let mut chain = catalog.resolve(cfg, requested);
     if !catalog.is_group(requested) {
         return chain;
     }
-    let Some(pin) = state.kv_get(ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty()) else {
-        return chain;
-    };
-    let pinned = catalog.resolve(cfg, &pin);
-    // is_listed, not just resolves: resolve() fabricates a candidate for any
-    // id under an enabled provider, and a pin gone stale (config edit,
-    // refresh dropping the model) must degrade to the chain, not put a
-    // phantom at the head of every group walk.
-    if pinned.is_empty() || !pinned.iter().all(|c| catalog.is_listed(&c.full_id())) {
-        warn!(pin, "route pin is not in the catalog; using the group chain");
-        return chain;
+    // Manual pin: walked FIRST, ahead of session affinity — `pxy route` is an
+    // explicit human decision.
+    let mut pinned = None;
+    if let Some(pin) = state.kv_get(ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty()) {
+        // is_listed, not just resolves: resolve() fabricates a candidate for
+        // any id under an enabled provider, and a pin gone stale (config
+        // edit, refresh dropping the model) must degrade to the chain, not
+        // put a phantom at the head of every group walk.
+        let resolved = catalog.resolve(cfg, &pin);
+        if !resolved.is_empty() && resolved.iter().all(|c| catalog.is_listed(&c.full_id())) {
+            pinned = Some(resolved);
+        } else {
+            warn!(pin, "route pin is not in the catalog; using the group chain");
+        }
     }
-    let pinned_ids: Vec<String> = pinned.iter().map(|c| c.full_id()).collect();
-    chain.retain(|c| !pinned_ids.contains(&c.full_id()));
-    let mut out = pinned;
+    // Session affinity: the candidate this conversation last won on walks
+    // first, so a post-failover conversation keeps its prompt-cache locality
+    // instead of bouncing back to the chain head. A stale or unlisted
+    // binding is ignored — the walk's winner rebinds it (self-healing).
+    let mut affinity = None;
+    if pinned.is_none() {
+        if let Some(key) = session {
+            if let Some(full_id) = state.session_get(key) {
+                let bound = catalog.resolve(cfg, &full_id);
+                if !bound.is_empty() && bound.iter().all(|c| catalog.is_listed(&c.full_id())) {
+                    affinity = Some(bound);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(p) = &pinned {
+        let ids: Vec<String> = p.iter().map(|c| c.full_id()).collect();
+        chain.retain(|c| !ids.contains(&c.full_id()));
+        out.extend(p.clone());
+    }
+    if let Some(a) = &affinity {
+        let ids: Vec<String> = a.iter().map(|c| c.full_id()).collect();
+        chain.retain(|c| !ids.contains(&c.full_id()));
+        out.extend(a.clone());
+    }
     out.extend(chain);
-    out
+    // Multi-account expansion, LAST: every bare candidate becomes one
+    // candidate per configured account (config order = fill-first), so the
+    // ordinary walk/cooldown machinery below works per account unchanged.
+    out.into_iter().flat_map(|c| expand_accounts(cfg, c)).collect()
+}
+
+/// Expand one bare candidate into its configured accounts. Providers without
+/// `accounts` yield themselves unchanged (implicit single default).
+fn expand_accounts(cfg: &Config, c: Candidate) -> Vec<Candidate> {
+    let Some(pc) = cfg.providers.get(&c.provider) else { return vec![c] };
+    if pc.accounts.is_empty() {
+        return vec![c];
+    }
+    pc.accounts
+        .iter()
+        .map(|a| Candidate {
+            account: Some(a.name.clone()),
+            provider: c.provider.clone(),
+            model: c.model.clone(),
+        })
+        .collect()
+}
+
+/// Stable conversation fingerprint for session affinity: Claude Code always
+/// sends `metadata.user_id`; opencode sends `user`; otherwise hash the first
+/// message (stable within a conversation). FNV-1a, not DefaultHasher — the
+/// std hasher is keyed per process, which would silently invalidate every
+/// stored binding on daemon restart.
+fn session_key(payload: &Value) -> Option<String> {
+    if let Some(id) = payload["metadata"]["user_id"].as_str().filter(|s| !s.is_empty()) {
+        return Some(format!("uid:{id}"));
+    }
+    if let Some(id) = payload["user"].as_str().filter(|s| !s.is_empty()) {
+        return Some(format!("user:{id}"));
+    }
+    let first = payload["messages"].as_array()?.first()?;
+    let text = match &first["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    if text.is_empty() {
+        return None;
+    }
+    Some(format!("hash:{:016x}", fnv1a(text.as_bytes())))
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 pub async fn handle_chat(
@@ -123,7 +207,11 @@ pub async fn handle_chat(
         return usage_outcome(usage_report(&app), client_format, stream);
     }
 
-    let candidates = resolve_candidates(&app.catalog, &app.cfg, &app.state, &requested);
+    // Session affinity key (group walks only): keeps a conversation on its
+    // last winning candidate for prompt-cache locality.
+    let session_key = if app.catalog.is_group(&requested) { session_key(&payload) } else { None };
+    let candidates =
+        resolve_candidates(&app.catalog, &app.cfg, &app.state, &requested, session_key.as_deref());
     if candidates.is_empty() {
         return error_outcome(
             client_format,
@@ -170,10 +258,20 @@ pub async fn handle_chat(
             match try_candidate(&app, cand, client_format, &payload, stream, input_estimate, &ctx, multi)
                 .await
             {
-                AttemptResult::Done(outcome) => return outcome,
+                AttemptResult::Done(outcome) => {
+                    // A real success repairs the model's failure-rate record.
+                    app.state.model_result(&cand.state_provider(), &cand.model.id, true);
+                    // ...and rebinds the conversation's session affinity.
+                    if let Some(key) = &session_key {
+                        app.state.session_set(key, &cand.full_id());
+                    }
+                    return outcome;
+                }
                 AttemptResult::Skip(reason) => {
                     warn!(candidate = %cand.full_id(), %reason, "failover");
                     other_failures = true;
+                    // A real attempt failed: feed the failure-rate rule.
+                    app.state.model_result(&cand.state_provider(), &cand.model.id, false);
                     skipped.push(format!("{}: {reason}", cand.full_id()));
                 }
                 AttemptResult::SkipContextWindow(reason) => {
@@ -447,8 +545,14 @@ fn check_candidate(
     // single-deployment exemption): blocking your only option converts a
     // partial outage into a total one.
     if multi_candidate {
-        if let Some(cd) = app.state.cooldown(&cand.provider, &cand.model.id) {
+        if let Some(cd) = app.state.cooldown(&cand.state_provider(), &cand.model.id) {
             return Err(format!("cooldown ({})", cd.reason));
+        }
+        // Failure-rate rule: a model that fails half its recent attempts sits
+        // out even after each individual error cooldown expires (flapping
+        // 200/500 upstreams never trip the per-error ladder).
+        if app.state.model_unhealthy(&cand.state_provider(), &cand.model.id) {
+            return Err("recent failure rate".into());
         }
     }
 
@@ -461,17 +565,17 @@ fn check_candidate(
 
     if let Some(limits) = &provider.limits {
         if let Some(rpm) = limits.rpm {
-            if app.state.rpm_effective(&cand.provider) >= rpm as f64 {
+            if app.state.rpm_effective(&cand.state_provider()) >= rpm as f64 {
                 return Err("rpm limit".into());
             }
         }
         // Limit checks fail open on infrastructure errors (litellm rule):
         // a broken tzdb/db must never block routing.
         if let Ok(w) = current_windows(limits, Timestamp::now()) {
-            let day = app.state.usage(&cand.provider, "day", w.day_start).unwrap_or_default();
+            let day = app.state.usage(&cand.state_provider(), "day", w.day_start).unwrap_or_default();
             let month = app
                 .state
-                .usage(&cand.provider, "month", w.month_start)
+                .usage(&cand.state_provider(), "month", w.month_start)
                 .unwrap_or_default();
             if let Some(l) = limits.daily_requests {
                 if day.requests >= l {
@@ -495,7 +599,7 @@ fn check_candidate(
             }
         }
         if limits.total_requests.is_some() || limits.total_tokens.is_some() {
-            let total = app.state.usage_total(&cand.provider).unwrap_or_default();
+            let total = app.state.usage_total(&cand.state_provider()).unwrap_or_default();
             if let Some(l) = limits.total_requests {
                 if total.requests >= l {
                     return Err("total request budget exhausted".into());
@@ -597,12 +701,21 @@ async fn try_candidate(
         }
     }
 
+    // This candidate's configured account (multi-account providers expand
+    // into one candidate per account at resolve time).
+    let account = cand.account.as_ref().and_then(|name| {
+        provider_cfg
+            .accounts
+            .iter()
+            .find(|a| &a.name == name)
+    });
     let prepared = match crate::providers::prepare(
         &cand.provider,
         provider_cfg,
         &app.secrets,
         &app.state,
         &app.http,
+        account,
     )
     .await
     {
@@ -637,11 +750,16 @@ async fn try_candidate(
         .as_deref()
         .filter(|v| *v == "agent" || *v == "user");
 
-    let mut req = app
-        .http
-        .post(&prepared.url)
-        .timeout(Duration::from_secs(provider_cfg.timeout_secs))
-        .header("content-type", "application/json");
+    // The total timeout must NOT apply to client-streaming requests: it
+    // spans "connect until the body finishes" (reqwest semantics), so a long
+    // agentic turn dies mid-stream at timeout_secs with a clean-looking
+    // end_turn. Streams are bounded instead by the headers deadline below
+    // and a per-read stall deadline in the unfold. Non-streaming keeps the
+    // total timeout (it also bounds force_stream's re-assembly).
+    let mut req = app.http.post(&prepared.url).header("content-type", "application/json");
+    if !stream {
+        req = req.timeout(Duration::from_secs(provider_cfg.timeout_secs));
+    }
     for (k, v) in &prepared.headers {
         if k == "x-initiator" && initiator_override.is_some() {
             continue;
@@ -680,7 +798,7 @@ async fn try_candidate(
         timeout: Duration::from_secs(provider_cfg.timeout_secs),
     });
 
-    app.state.rpm_increment(&cand.provider);
+    app.state.rpm_increment(&cand.state_provider());
     // A streaming upstream returns headers as soon as it accepts the request,
     // so silence here means it is not answering at all. With a chain to fall
     // back on, waiting out timeout_secs (600s by default) for that is the
@@ -699,7 +817,7 @@ async fn try_candidate(
                 // starts at 3s — long gone by the next candidate from the same
                 // provider, so the walk would pay the deadline again and again.
                 app.state.set_cooldown(
-                    &cand.provider,
+                    &cand.state_provider(),
                     None,
                     Some(HEADERS_COOLDOWN),
                     true,
@@ -711,6 +829,21 @@ async fn try_candidate(
                 ));
             }
         }
+    } else if stream {
+        // Single-candidate stream: nothing to fail over to, so keep today's
+        // full timeout_secs wait for headers (the per-request total timeout
+        // that used to bound this phase is gone). Once headers arrive, the
+        // body streams without a total bound.
+        match tokio::time::timeout(Duration::from_secs(provider_cfg.timeout_secs), send).await {
+            Ok(r) => r,
+            Err(_) => {
+                app.state.set_cooldown(&cand.state_provider(), None, None, true, "network error");
+                return AttemptResult::Skip(format!(
+                    "no response after {}s",
+                    provider_cfg.timeout_secs
+                ));
+            }
+        }
     } else {
         send.await
     };
@@ -718,7 +851,7 @@ async fn try_candidate(
         Ok(r) => r,
         Err(e) => {
             // Network failures are our-side/transport, not model-specific.
-            app.state.set_cooldown(&cand.provider, None, None, true, "network error");
+            app.state.set_cooldown(&cand.state_provider(), None, None, true, "network error");
             return AttemptResult::Skip(format!("network: {e}"));
         }
     };
@@ -732,12 +865,12 @@ async fn try_candidate(
 
     // Success: count the request now; tokens follow when usage is known.
     let agent = ctx.agent.as_deref().unwrap_or("");
-    record_request(app, agent, &cand.provider, &cand.model.id);
-    app.state.clear_cooldown(&cand.provider, &cand.model.id);
+    record_request(app, agent, &cand.state_provider(), &cand.provider, &cand.model.id);
+    app.state.clear_cooldown(&cand.state_provider(), &cand.model.id);
     // After the clear: a success response can still carry "you just used the
     // last of your quota" headers, and that cooldown must survive it.
-    check_quota_exhaustion(&app.state, &cand.provider, resp.headers());
-    record_free_allowance(&app.state, &cand.provider, resp.headers());
+    check_quota_exhaustion(&app.state, &cand.state_provider(), resp.headers());
+    record_free_allowance(&app.state, &cand.state_provider(), resp.headers());
     if !stream {
         info!(candidate = %cand.full_id(), stream, "routed");
     }
@@ -771,7 +904,7 @@ async fn try_candidate(
                     }
                     None => {
                         app.state.set_cooldown(
-                            &cand.provider,
+                            &cand.state_provider(),
                             Some(&cand.model.id),
                             None,
                             true,
@@ -784,7 +917,7 @@ async fn try_candidate(
             Err(StreamFailure::Dead(reason)) => {
                 // Same scope as a 5xx: the model misbehaved, not the account.
                 app.state.set_cooldown(
-                    &cand.provider,
+                    &cand.state_provider(),
                     Some(&cand.model.id),
                     None,
                     true,
@@ -797,11 +930,22 @@ async fn try_candidate(
         // Kiro has no non-streaming mode; collect the eventstream instead.
         let bytes = match resp.bytes().await {
             Ok(b) => b,
-            Err(e) => return AttemptResult::Skip(format!("kiro body read: {e}")),
+            Err(e) => {
+                // A 200 whose body can't be read is a misbehaving model: cool
+                // it like a dead stream instead of re-probing for free.
+                app.state.set_cooldown(
+                    &cand.state_provider(),
+                    Some(&cand.model.id),
+                    None,
+                    true,
+                    "kiro body read",
+                );
+                return AttemptResult::Skip(format!("kiro body read: {e}"));
+            }
         };
         let (openai_body, usage) =
             kiro::collect_response(&bytes, &cand.model.id, &cand.full_id(), cand.model.context_length);
-        record_tokens(app, agent, &cand.provider, &cand.model.id, usage);
+        record_tokens(app, agent, &cand.state_provider(), &cand.provider, &cand.model.id, usage);
         let client_body = match client_format {
             ClientFormat::Openai => openai_body,
             // kiro::collect_response returns an OpenAI-shaped body, so this is
@@ -821,7 +965,18 @@ async fn try_candidate(
             // response the client actually asked for.
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
-                Err(e) => return AttemptResult::Skip(format!("stream read: {e}")),
+                Err(e) => {
+                    // Same as the kiro body read: cool the model instead of
+                    // re-probing a 200-then-truncate upstream for free.
+                    app.state.set_cooldown(
+                        &cand.state_provider(),
+                        Some(&cand.model.id),
+                        None,
+                        true,
+                        "stream read",
+                    );
+                    return AttemptResult::Skip(format!("stream read: {e}"));
+                }
             };
             let mut parser = SseParser::new();
             let mut events = parser.feed(&bytes);
@@ -835,7 +990,20 @@ async fn try_candidate(
         } else {
             match resp.json().await {
                 Ok(v) => v,
-                Err(e) => return AttemptResult::Skip(format!("bad upstream json: {e}")),
+                Err(e) => {
+                    // A 200 with an unparseable body counts as a request and
+                    // already cleared cooldowns above — without this cooldown
+                    // a garbage-200 upstream would be re-attempted first on
+                    // every walk, burning counted requests with no backoff.
+                    app.state.set_cooldown(
+                        &cand.state_provider(),
+                        Some(&cand.model.id),
+                        None,
+                        true,
+                        "unparseable 200",
+                    );
+                    return AttemptResult::Skip(format!("bad upstream json: {e}"));
+                }
             }
         };
         if provider_cfg.parse_think_tags && upstream_format == WireFormat::Openai {
@@ -849,7 +1017,7 @@ async fn try_candidate(
             WireFormat::Anthropic => TokenUsage::from_anthropic(&upstream_body["usage"]),
             WireFormat::Kiro => unreachable!("kiro handled above"),
         };
-        record_tokens(app, agent, &cand.provider, &cand.model.id, usage);
+        record_tokens(app, agent, &cand.state_provider(), &cand.provider, &cand.model.id, usage);
         let client_body = match (client_format, upstream_format) {
             (ClientFormat::Openai, WireFormat::Openai)
             | (ClientFormat::Anthropic, WireFormat::Anthropic) => upstream_body,
@@ -1002,6 +1170,41 @@ fn classify_error(
         ));
     }
 
+    // Request-scoped error rules: per-provider body overrides that beat the
+    // status ladder. First matching rule wins (case-insensitive substring).
+    let rule = app.cfg.providers.get(&cand.provider).and_then(|p| {
+        let lower = err_body.to_ascii_lowercase();
+        p.errors
+            .iter()
+            .find(|r| !r.matches.is_empty() && lower.contains(&r.matches.to_ascii_lowercase()))
+    });
+    if let Some(rule) = rule {
+        let reason = format!("error rule: {}", truncate(&err_body, 200));
+        let cool = || {
+            app.state.set_cooldown(
+                &cand.provider,
+                Some(&cand.model.id),
+                None,
+                true,
+                "error rule match",
+            );
+        };
+        return match rule.action {
+            ErrorAction::Skip => AttemptResult::Skip(reason),
+            ErrorAction::SkipCooldown => {
+                cool();
+                AttemptResult::Skip(reason)
+            }
+            ErrorAction::Passthrough => {
+                passthrough_outcome(client_format, status, &err_body, &cand.full_id())
+            }
+            ErrorAction::PassthroughCooldown => {
+                cool();
+                passthrough_outcome(client_format, status, &err_body, &cand.full_id())
+            }
+        };
+    }
+
     // 402 included: aggregators (ZenMux, OpenRouter, DeepSeek) use it for
     // exhausted quota/credits — an account problem, not a request problem.
     let skip = matches!(status, 401 | 402 | 403 | 408 | 409 | 429)
@@ -1038,15 +1241,28 @@ fn classify_error(
             }
             None => (None, retryable, format!("{status} {reason}")),
         };
-        app.state.set_cooldown(&cand.provider, model_scope, wait, retryable, &why);
+        app.state.set_cooldown(&cand.state_provider(), model_scope, wait, retryable, &why);
         return AttemptResult::Skip(format!("{status}: {}", truncate(&err_body, 200)));
     }
-    let body = serde_json::from_str::<Value>(&err_body)
-        .unwrap_or_else(|_| error_body(client_format, "api_error", &truncate(&err_body, 500)));
+    passthrough_outcome(client_format, status, &err_body, &cand.full_id())
+}
+
+/// Return the upstream error to the client unmodified (the upstream's JSON
+/// when it parses, pxy's error shape otherwise). Claude Code's auto-retry
+/// depends on unmodified error bodies — this is also what `passthrough`
+/// error rules resolve to.
+fn passthrough_outcome(
+    client_format: ClientFormat,
+    status: u16,
+    err_body: &str,
+    full_id: &str,
+) -> AttemptResult {
+    let body = serde_json::from_str::<Value>(err_body)
+        .unwrap_or_else(|_| error_body(client_format, "api_error", &truncate(err_body, 500)));
     AttemptResult::Fatal(Outcome::Json {
         status,
         body,
-        provider: Some(cand.full_id()),
+        provider: Some(full_id.to_string()),
     })
 }
 
@@ -1223,14 +1439,26 @@ fn parse_go_duration(s: &str) -> Option<Duration> {
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let v = headers.get("retry-after")?.to_str().ok()?.trim();
-    // Bare seconds (the RFC form) or a duration like "5m" / "2m59s" (groq).
+    // Bare seconds (the RFC form), a duration like "5m" / "2m59s" (groq), or
+    // the RFC IMF-fixdate form ("Wed, 21 Oct 2026 07:28:00 GMT") — ignored
+    // before, which re-probed the provider every ≤2m instead of at the
+    // stated time.
     let dur = match v.parse::<u64>() {
         Ok(secs) => Duration::from_secs(secs),
-        Err(_) => parse_go_duration(v)?,
+        Err(_) => parse_go_duration(v).or_else(|| parse_http_date(v))?,
     };
     let secs = dur.as_secs();
     // Sanity clamp (litellm): obey only reasonable waits; else exponential backoff.
     if secs > 0 && secs <= 3600 { Some(dur) } else { None }
+}
+
+/// IMF-fixdate as used in Retry-After / Date headers. Returns the wait from
+/// now; a past date yields None (the caller falls back to backoff).
+fn parse_http_date(v: &str) -> Option<Duration> {
+    let parsed = jiff::fmt::strtime::parse("%a, %d %b %Y %H:%M:%S GMT", v).ok()?;
+    let at = parsed.to_datetime().ok()?.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+    let secs = at.timestamp().as_second() - jiff::Timestamp::now().as_second();
+    (secs > 0).then_some(Duration::from_secs(secs as u64))
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,11 +1493,18 @@ struct StreamCtx {
     tooltext: Option<ToolTextFilter>,
     usage: TokenUsage,
     agent: String,
+    /// Bare provider name: logs and model_usage.
     provider: String,
+    /// The state-key provider scope (`provider#account`): usage windows.
+    state_provider: String,
     model: String,
     app: SharedApp,
     upstream: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
     done: bool,
+    /// Max gap between upstream chunks. Streaming requests carry no total
+    /// timeout (a long turn must not die at timeout_secs), so this is the
+    /// death signal instead: silence for this long ends the stream.
+    stall: Duration,
     /// Present when the request carried the web_search server tool and the
     /// upstream speaks OpenAI: pxy runs the search and continues the turn.
     search: Option<SearchLoop>,
@@ -1301,12 +1536,21 @@ struct SearchLoop {
 }
 
 impl SearchLoop {
-    /// The one captured call, when it's this turn's only tool call.
-    fn pending(&self) -> Option<(String, String)> {
+    /// Every captured search call this turn, lowest tool-call index first: a
+    /// model may issue SEVERAL in one turn (parallel calls), and running only
+    /// an arbitrary one silently lost the model's other queries. Capped by
+    /// the remaining search budget; empty when another tool call shared the
+    /// turn (the continuation can't fake that one) or the budget is spent.
+    fn pending(&self) -> Vec<(String, String)> {
         if self.filter.saw_other || self.uses_left == 0 {
-            return None;
+            return Vec::new();
         }
-        self.filter.ours.values().next().cloned()
+        let mut keys: Vec<u64> = self.filter.ours.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter()
+            .take(self.uses_left as usize)
+            .filter_map(|k| self.filter.ours.get(&k).cloned())
+            .collect()
     }
 }
 
@@ -1317,6 +1561,11 @@ fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
         return data.to_string();
     };
     if v["choices"][0].is_null() {
+        return data.to_string();
+    }
+    // `choices[0]` must be an object for the mutable indexes below: serde_json
+    // panics on `["key"]` against a scalar (IndexMut only auto-vivifies Null).
+    if !v["choices"][0].is_object() {
         return data.to_string();
     }
     let mut changed = false;
@@ -1392,12 +1641,16 @@ fn rewrite_chunk_tools(data: &str, filter: &mut ToolTextFilter) -> String {
         return data.to_string();
     };
     // The include_usage final chunk is `{"choices":[],"usage":{...}}` — a
-    // mutable index into the empty array PANICS (serde_json semantics).
+    // mutable index into the empty array PANICS (serde_json semantics), and
+    // a scalar `choices[0]`/`delta` would panic the same way.
     if !v["choices"].as_array().is_some_and(|c| !c.is_empty()) {
         return data.to_string();
     }
-    let delta = &mut v["choices"][0]["delta"];
-    if let Some(text) = delta["content"].as_str().map(String::from) {
+    let Some(delta) = v["choices"][0].get_mut("delta").filter(|d| d.is_object()) else {
+        return data.to_string();
+    };
+    let delta = delta.as_object_mut().unwrap();
+    if let Some(text) = delta.get("content").and_then(|c| c.as_str()).map(String::from) {
         let ops = filter.push(&text);
         let mut kept = String::new();
         let mut calls: Vec<Value> = Vec::new();
@@ -1415,17 +1668,19 @@ fn rewrite_chunk_tools(data: &str, filter: &mut ToolTextFilter) -> String {
                 }
             }
         }
-        delta["content"] = json!(kept);
+        delta.insert("content".into(), json!(kept));
         if !calls.is_empty() {
-            let mut existing = delta["tool_calls"].as_array().cloned().unwrap_or_default();
+            let mut existing = delta.get("tool_calls").and_then(|t| t.as_array()).cloned().unwrap_or_default();
             existing.extend(calls);
-            delta["tool_calls"] = Value::Array(existing);
+            delta.insert("tool_calls".into(), Value::Array(existing));
         }
     }
-    let finish = &mut v["choices"][0]["finish_reason"];
-    if finish.as_str() == Some("stop") && filter.calls > 0 {
+    let finish = v["choices"][0].get_mut("finish_reason");
+    if finish.as_deref().and_then(Value::as_str) == Some("stop") && filter.calls > 0 {
         // Clients gate tool execution on this value (audit §2.4).
-        *finish = json!("tool_calls");
+        if let Some(finish) = finish {
+            *finish = json!("tool_calls");
+        }
     }
     v.to_string()
 }
@@ -1444,18 +1699,22 @@ fn rewrite_chunk_think(data: &str, filter: &mut ThinkFilter) -> String {
         return data.to_string();
     };
     // Same empty-choices guard as rewrite_chunk_tools: the include_usage
-    // final chunk has `choices: []` and a mutable index would panic.
+    // final chunk has `choices: []` and a mutable index would panic; a
+    // scalar `choices[0]`/`delta` would panic the same way.
     if !v["choices"].as_array().is_some_and(|c| !c.is_empty()) {
         return data.to_string();
     }
-    let delta = &mut v["choices"][0]["delta"];
-    if let Some(text) = delta["content"].as_str() {
-        let (reasoning, content) = filter.push(text);
+    let Some(delta) = v["choices"][0].get_mut("delta").filter(|d| d.is_object()) else {
+        return data.to_string();
+    };
+    let delta = delta.as_object_mut().unwrap();
+    if let Some(text) = delta.get("content").and_then(|c| c.as_str()).map(String::from) {
+        let (reasoning, content) = filter.push(&text);
         if !reasoning.is_empty() {
-            let prior = delta["reasoning_content"].as_str().unwrap_or("");
-            delta["reasoning_content"] = json!(format!("{prior}{reasoning}"));
+            let prior = delta.get("reasoning_content").and_then(Value::as_str).unwrap_or("");
+            delta.insert("reasoning_content".into(), json!(format!("{prior}{reasoning}")));
         }
-        delta["content"] = json!(content);
+        delta.insert("content".into(), json!(content));
         return v.to_string();
     }
     data.to_string()
@@ -1490,7 +1749,7 @@ impl Drop for StreamCtx {
         {
             self.usage = kiro_usage;
         }
-        record_tokens(&self.app, &self.agent, &self.provider, &self.model, self.usage);
+        record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, self.usage);
     }
 }
 
@@ -1550,7 +1809,7 @@ impl StreamCtx {
                         }
                         // Held back while a search is queued: this ends the
                         // upstream call, not the client's turn.
-                        if search.as_ref().is_none_or(|s| s.pending().is_none()) {
+                        if search.as_ref().is_none_or(|s| s.pending().is_empty()) {
                             out.push_str("data: [DONE]\n\n");
                         }
                     } else {
@@ -1605,7 +1864,7 @@ impl StreamCtx {
                         // A search is queued: this [DONE] ends the upstream
                         // call, not the client's turn. Closing the message
                         // here would strand the answer the model still owes.
-                        if search.as_ref().is_none_or(|s| s.pending().is_none()) {
+                        if search.as_ref().is_none_or(|s| s.pending().is_empty()) {
                             out.push_str(&state.on_data(&ev.data));
                         }
                     } else {
@@ -1649,47 +1908,68 @@ impl StreamCtx {
     /// is reported to the model AND to the client rather than aborting: an
     /// error block is what the real API sends too.
     async fn continue_after_search(&mut self) -> Option<Bytes> {
-        let (call_id, args) = self.search.as_ref()?.pending()?;
-        let query = serde_json::from_str::<Value>(&args)
-            .ok()
-            .and_then(|a| a["query"].as_str().map(String::from))
-            .filter(|q| !q.is_empty())?;
-
+        let calls = self.search.as_ref()?.pending();
+        if calls.is_empty() {
+            return None;
+        }
         let search = self.search.as_mut()?;
-        search.uses_left -= 1;
+        search.uses_left -= calls.len() as u64;
         search.filter = SearchCallFilter::default();
 
-        let found = crate::media::search::run_search(&self.app, &query, 5, None).await;
-        let (block, tool_output) = match &found {
-            Ok((provider, results)) => {
-                info!(%query, %provider, hits = results.len(), "web_search served");
-                (
-                    web_search::result_block(&call_id, results),
-                    web_search::results_for_model(results),
-                )
-            }
-            Err(e) => {
-                warn!(%query, error = %e, "web_search failed");
-                (web_search::error_block(&call_id), format!("Search failed: {e}"))
-            }
-        };
+        // Run every well-formed call, accumulating its client-side block and
+        // model-side tool output. A malformed call (unparseable arguments) is
+        // skipped: the synthesized assistant message below carries only the
+        // calls that were actually served, so the protocol stays valid.
+        let mut client_blocks: Vec<(String, String, Value)> = Vec::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+        let mut tool_results: Vec<Value> = Vec::new();
+        for (call_id, args) in calls {
+            let Some(query) = serde_json::from_str::<Value>(&args)
+                .ok()
+                .and_then(|a| a["query"].as_str().map(String::from))
+                .filter(|q| !q.is_empty())
+            else {
+                continue;
+            };
+            let found = crate::media::search::run_search(&self.app, &query, 5, None).await;
+            let (block, tool_output) = match &found {
+                Ok((provider, results)) => {
+                    info!(%query, %provider, hits = results.len(), "web_search served");
+                    (
+                        web_search::result_block(&call_id, results),
+                        web_search::results_for_model(results),
+                    )
+                }
+                Err(e) => {
+                    warn!(%query, error = %e, "web_search failed");
+                    (web_search::error_block(&call_id), format!("Search failed: {e}"))
+                }
+            };
+            client_blocks.push((call_id.clone(), query, block));
+            tool_calls.push(json!({
+                "id": &call_id,
+                "type": "function",
+                "function": {"name": web_search::TOOL_NAME, "arguments": &args},
+            }));
+            tool_results.push(json!({
+                "role": "tool", "tool_call_id": &call_id, "content": tool_output,
+            }));
+        }
+        if tool_calls.is_empty() {
+            return None;
+        }
 
-        // The model's own view of the turn: it called the function, this is
-        // what it returned.
+        // The model's own view of the turn: it called the functions, these
+        // are what they returned — one assistant message carrying ALL calls,
+        // then one tool message per call (the shape parallel calls require).
         let search = self.search.as_mut()?;
         if let Some(messages) = search.body["messages"].as_array_mut() {
             messages.push(json!({
                 "role": "assistant",
                 "content": Value::Null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": web_search::TOOL_NAME, "arguments": args},
-                }],
+                "tool_calls": tool_calls,
             }));
-            messages.push(json!({
-                "role": "tool", "tool_call_id": call_id, "content": tool_output,
-            }));
+            messages.extend(tool_results);
         }
 
         let mut req = self
@@ -1713,21 +1993,24 @@ impl StreamCtx {
         };
         self.upstream = resp.bytes_stream().boxed();
         self.parser = SseParser::new();
-        record_request(&self.app, &self.agent, &self.provider, &self.model);
+        record_request(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model);
 
         let mut out = String::new();
         match &mut self.kind {
             StreamKind::ToAnthropic(state) => {
                 // Bank what the first call spent before the second overwrites it.
                 let spent = state.take_usage();
-                record_tokens(&self.app, &self.agent, &self.provider, &self.model, spent);
+                record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, spent);
                 // The call that asked for the search finished with `tool_calls`;
                 // the turn hasn't, and the continuation sets its own reason.
                 state.clear_finish_reason();
-                out.push_str(
-                    &state.emit_block(web_search::server_tool_use_block(&call_id, &query)),
-                );
-                out.push_str(&state.emit_block(block));
+                // One server_tool_use + result pair per search the model asked for.
+                for (call_id, query, block) in &client_blocks {
+                    out.push_str(
+                        &state.emit_block(web_search::server_tool_use_block(call_id, query)),
+                    );
+                    out.push_str(&state.emit_block(block.clone()));
+                }
             }
             // Passthrough — codex, through /v1/responses. Chat completions has
             // no event for "a search happened", so pxy sends its own marker
@@ -1739,15 +2022,17 @@ impl StreamCtx {
             // skip it the way it skips the usage chunk.
             _ => {
                 let spent = std::mem::take(&mut self.usage);
-                record_tokens(&self.app, &self.agent, &self.provider, &self.model, spent);
-                out.push_str(&format!(
-                    "data: {}\n\n",
-                    json!({
-                        "object": "chat.completion.chunk",
-                        "choices": [],
-                        "pxy_web_search": {"id": call_id, "query": query},
-                    })
-                ));
+                record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, spent);
+                for (call_id, query, _) in &client_blocks {
+                    out.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({
+                            "object": "chat.completion.chunk",
+                            "choices": [],
+                            "pxy_web_search": {"id": call_id, "query": query},
+                        })
+                    ));
+                }
             }
         }
         Some(Bytes::from(out))
@@ -1779,7 +2064,7 @@ impl StreamCtx {
                     _ => tail.clone(),
                 }
             };
-            record_tokens(&self.app, &self.agent, &self.provider, &self.model, self.usage);
+            record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, self.usage);
             return translated;
         }
         let out = match &mut self.kind {
@@ -1805,7 +2090,7 @@ impl StreamCtx {
                 None => Bytes::new(),
             },
         };
-        record_tokens(&self.app, &self.agent, &self.provider, &self.model, self.usage);
+        record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, self.usage);
         out
     }
 }
@@ -1917,6 +2202,13 @@ async fn stream_outcome(
         .map(|p| p.parse_think_tags)
         .unwrap_or(false)
         && upstream_format == WireFormat::Openai;
+    let stall = Duration::from_secs(
+        app.cfg
+            .providers
+            .get(&cand.provider)
+            .map(|p| p.timeout_secs)
+            .unwrap_or(600),
+    );
     let mut ctx = StreamCtx {
         parser: SseParser::new(),
         kiro: (upstream_format == WireFormat::Kiro).then(|| {
@@ -1932,10 +2224,12 @@ async fn stream_outcome(
         usage: TokenUsage::default(),
         agent: agent.to_string(),
         provider: cand.provider.clone(),
+        state_provider: cand.state_provider(),
         model: cand.model.id.clone(),
         app,
         upstream: resp.bytes_stream().boxed(),
         done: false,
+        stall,
         search,
     };
 
@@ -1985,18 +2279,28 @@ async fn stream_outcome(
         if ctx.done {
             return None;
         }
-        match ctx.upstream.next().await {
-            Some(Ok(bytes)) => {
+        // Stall deadline: streaming has no total timeout, so silence for
+        // `stall` (the provider's timeout_secs) is the death signal. Treated
+        // exactly like a transport error — usage already seen is recorded by
+        // finish(), and the client gets the truncated-but-terminated turn.
+        match tokio::time::timeout(ctx.stall, ctx.upstream.next()).await {
+            Err(_) => {
+                warn!(provider = %ctx.provider, stall_secs = ctx.stall.as_secs(), "upstream stream stalled");
+                ctx.done = true;
+                let tail = ctx.finish();
+                Some((Ok(tail), ctx))
+            }
+            Ok(Some(Ok(bytes))) => {
                 let out = ctx.process(&bytes);
                 Some((Ok::<Bytes, std::io::Error>(out), ctx))
             }
-            Some(Err(e)) => {
+            Ok(Some(Err(e))) => {
                 warn!(provider = %ctx.provider, error = %e, "upstream stream error");
                 ctx.done = true;
                 let tail = ctx.finish();
                 Some((Ok(tail), ctx))
             }
-            None => {
+            Ok(None) => {
                 // A queued web_search swaps in a fresh upstream response and
                 // keeps the same client stream going.
                 if let Some(blocks) = ctx.continue_after_search().await {
@@ -2047,26 +2351,45 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn record_request(app: &App, agent: &str, provider: &str, model: &str) {
-    record_usage_inner(app, agent, provider, model, TokenUsage::default(), true);
+/// `state_provider` scopes the usage windows (per account for multi-account
+/// providers); `provider` stays the bare wire name for model_usage — the
+/// desktop panel and usage-scan consumers group by it.
+fn record_request(app: &App, agent: &str, state_provider: &str, provider: &str, model: &str) {
+    record_usage_inner(app, agent, state_provider, provider, model, TokenUsage::default(), true);
 }
 
-fn record_tokens(app: &App, agent: &str, provider: &str, model: &str, usage: TokenUsage) {
+fn record_tokens(
+    app: &App,
+    agent: &str,
+    state_provider: &str,
+    provider: &str,
+    model: &str,
+    usage: TokenUsage,
+) {
     if usage.input == 0 && usage.output == 0 {
         return;
     }
-    record_usage_inner(app, agent, provider, model, usage, false);
+    record_usage_inner(app, agent, state_provider, provider, model, usage, false);
 }
 
 /// Embeddings count as one request + input tokens against the same windows.
 /// No model stats: the usage panel only reads chat traffic.
 pub fn record_embedding_usage(app: &App, provider: &str, tokens: u64) {
-    record_usage_inner(app, "", provider, "", TokenUsage { input: tokens, output: 0 }, true);
+    record_usage_inner(
+        app,
+        "",
+        provider,
+        provider,
+        "",
+        TokenUsage { input: tokens, output: 0 },
+        true,
+    );
 }
 
 fn record_usage_inner(
     app: &App,
     agent: &str,
+    state_provider: &str,
     provider: &str,
     model: &str,
     usage: TokenUsage,
@@ -2081,11 +2404,21 @@ fn record_usage_inner(
         .unwrap_or(&default_limits);
     if let Ok(w) = current_windows(limits, Timestamp::now()) {
         let res = if request {
-            app.state
-                .record_usage(provider, w.day_start, w.month_start, usage.input, usage.output)
+            app.state.record_usage(
+                state_provider,
+                w.day_start,
+                w.month_start,
+                usage.input,
+                usage.output,
+            )
         } else {
-            app.state
-                .add_tokens(provider, w.day_start, w.month_start, usage.input, usage.output)
+            app.state.add_tokens(
+                state_provider,
+                w.day_start,
+                w.month_start,
+                usage.input,
+                usage.output,
+            )
         };
         if let Err(e) = res {
             warn!(provider, error = %e, "usage recording failed");
@@ -2188,7 +2521,42 @@ mod tests {
             body: Value::Null,
             timeout: Duration::from_secs(1),
         };
-        assert!(loop_.pending().is_none());
+        assert!(loop_.pending().is_empty());
+    }
+
+    /// A turn may carry SEVERAL search calls (parallel tool calls): all of
+    /// them must be pending, lowest index first, capped by the budget — the
+    /// old single-arbitrary-pick silently dropped the model's other queries.
+    #[test]
+    fn parallel_search_calls_are_all_pending_lowest_index_first() {
+        let mut f = SearchCallFilter::default();
+        // Insert out of order on purpose.
+        f.ours.insert(1, ("call_2".into(), "{\"query\":\"b\"}".into()));
+        f.ours.insert(0, ("call_1".into(), "{\"query\":\"a\"}".into()));
+        f.ours.insert(2, ("call_3".into(), "{\"query\":\"c\"}".into()));
+        let mut loop_ = SearchLoop {
+            filter: f,
+            uses_left: 3,
+            url: String::new(),
+            headers: Vec::new(),
+            body: Value::Null,
+            timeout: Duration::from_secs(1),
+        };
+        let pending = loop_.pending();
+        assert_eq!(
+            pending,
+            vec![
+                ("call_1".to_string(), "{\"query\":\"a\"}".to_string()),
+                ("call_2".to_string(), "{\"query\":\"b\"}".to_string()),
+                ("call_3".to_string(), "{\"query\":\"c\"}".to_string()),
+            ]
+        );
+        // The budget caps how many run this turn.
+        loop_.uses_left = 2;
+        assert_eq!(loop_.pending().len(), 2);
+        // A client tool sharing the turn still suppresses every search.
+        loop_.filter.saw_other = true;
+        assert!(loop_.pending().is_empty());
     }
 
     /// The upstream closes a tool turn with a bare `finish_reason` chunk that
@@ -2243,9 +2611,9 @@ mod tests {
             body: Value::Null,
             timeout: Duration::from_secs(1),
         };
-        assert!(loop_.pending().is_some());
+        assert!(!loop_.pending().is_empty());
         loop_.uses_left = 0;
-        assert!(loop_.pending().is_none());
+        assert!(loop_.pending().is_empty());
     }
 
     /// A chunk with no tool calls at all comes back byte-identical.
@@ -2273,6 +2641,43 @@ mod tests {
             std::env::temp_dir().join(format!("pxy-router-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         State::open(&dir.join("s.sqlite")).unwrap()
+    }
+
+    /// litellm's failure-rate rule: >= half of >= 5 recent attempts failing
+    /// marks a model unhealthy even though no single error tripped the
+    /// per-error cooldown ladder; one success starts repairing the record.
+    #[test]
+    fn failure_rate_marks_a_flapping_model_unhealthy() {
+        let s = state("failure_rate");
+        for _ in 0..3 {
+            s.model_result("p", "m", false);
+        }
+        assert!(!s.model_unhealthy("p", "m"), "3 failures alone must not trip");
+        // Two more failures = 5 attempts, 100% fail rate.
+        s.model_result("p", "m", false);
+        s.model_result("p", "m", false);
+        assert!(s.model_unhealthy("p", "m"));
+        // Successes repair the record: 5/6, then 5/7 stay above half…
+        s.model_result("p", "m", true);
+        assert!(s.model_unhealthy("p", "m"));
+        s.model_result("p", "m", true);
+        assert!(s.model_unhealthy("p", "m"));
+        // …6 successes total = 5/11 = 45%, below the threshold.
+        for _ in 0..4 {
+            s.model_result("p", "m", true);
+        }
+        assert!(!s.model_unhealthy("p", "m"), "5/11 drops below half");
+        // Sibling models are unaffected.
+        assert!(!s.model_unhealthy("p", "other"));
+        // Threshold is inclusive at exactly half.
+        let s2 = state("failure_rate_edge");
+        for _ in 0..5 {
+            s2.model_result("p", "m", false);
+        }
+        s2.model_result("p", "m", true);
+        s2.model_result("p", "m", true);
+        s2.model_result("p", "m", true);
+        assert!(s2.model_unhealthy("p", "m"), "3/6 = exactly half trips");
     }
 
     #[test]
@@ -2365,6 +2770,30 @@ mod tests {
         assert_eq!(retry_wait(Some(Duration::from_secs(1)), true), Some(Duration::from_millis(1250)));
     }
 
+    /// Retry-After also arrives as IMF-fixdate ("Wed, 21 Oct 2026 07:28:00
+    /// GMT") — ignored before, which re-probed the provider every ≤2m.
+    #[test]
+    fn http_date_retry_after_parses() {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", "120".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(120)));
+
+        // One minute out: a wait inside the clamp.
+        let soon = (jiff::Timestamp::now() + jiff::Span::new().minutes(1))
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        let s = jiff::fmt::strtime::format("%a, %d %b %Y %H:%M:%S GMT", &soon).unwrap();
+        h.insert("retry-after", s.parse().unwrap());
+        let got = parse_retry_after(&h).unwrap();
+        assert!(got >= Duration::from_secs(30) && got <= Duration::from_secs(60), "{got:?}");
+
+        // A past date is not a wait: fall back to the ordinary ladder.
+        let past = (jiff::Timestamp::now() - jiff::Span::new().minutes(1))
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        let s = jiff::fmt::strtime::format("%a, %d %b %Y %H:%M:%S GMT", &past).unwrap();
+        h.insert("retry-after", s.parse().unwrap());
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
     #[test]
     fn stream_error_events_detected() {
         assert!(
@@ -2410,6 +2839,26 @@ mod tests {
         assert_eq!(error_event_status(r#"{"error":{"message":"boom"}}"#), None);
     }
 
+    /// serde_json's IndexMut panics on `["key"]` against a scalar (only Null
+    /// auto-vivifies). A corrupt or hostile upstream chunk shaped
+    /// `{"choices":[5]}` used to kill the client connection with no failover.
+    /// All three chunk rewrites must pass malformed shapes through untouched.
+    #[test]
+    fn malformed_chunks_never_panic_the_rewrites() {
+        let samples = [
+            r#"{"choices":[5]}"#,
+            r#"{"choices":[{"delta":5,"finish_reason":"stop"}]}"#,
+            r#"{"choices":[[]]}"#,
+            r#"{"choices":[{"delta":{"content":5}}]}"#,
+        ];
+        for data in samples {
+            assert_eq!(rewrite_chunk_search(data, &mut SearchCallFilter::default()), data);
+            let names = declared_tool_names(&json!({"tools": [{"function": {"name": "f"}}]})).unwrap();
+            assert_eq!(rewrite_chunk_tools(data, &mut ToolTextFilter::new(names)), data);
+            assert_eq!(rewrite_chunk_think(data, &mut ThinkFilter::new()), data);
+        }
+    }
+
     // ---- integration: failover ladder against a local mock upstream ----
 
     async fn mock_server(router: axum::Router) -> String {
@@ -2451,7 +2900,7 @@ mod tests {
         );
 
         // No pin: config order.
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
             .iter()
             .map(|c| c.full_id())
             .collect();
@@ -2459,14 +2908,14 @@ mod tests {
 
         // Pinned: the pin leads, the rest of the chain follows, no duplicate.
         app.state.kv_set(ROUTE_PIN_KEY, "b/m2").unwrap();
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
             .iter()
             .map(|c| c.full_id())
             .collect();
         assert_eq!(ids, ["b/m2", "a/m1"], "pin first, chain as fallback");
 
         // Explicit model requests ignore the pin entirely.
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "a/m1")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "a/m1", None)
             .iter()
             .map(|c| c.full_id())
             .collect();
@@ -2474,7 +2923,7 @@ mod tests {
 
         // A pin that stopped resolving degrades to the plain chain.
         app.state.kv_set(ROUTE_PIN_KEY, "gone/nope").unwrap();
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
             .iter()
             .map(|c| c.full_id())
             .collect();
@@ -2485,11 +2934,100 @@ mod tests {
         // gate that phantom would lead every group walk (and a 400 "unknown
         // model" is Fatal — no failover).
         app.state.kv_set(ROUTE_PIN_KEY, "a/ghost").unwrap();
-        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free")
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
             .iter()
             .map(|c| c.full_id())
             .collect();
         assert_eq!(ids, ["a/m1", "b/m2"], "phantom pin must not enter the walk");
+    }
+
+    /// Session affinity: the conversation's last winner walks first, a manual
+    /// pin outranks it, and a stale/unlisted binding degrades to the plain
+    /// chain (then rebinds to the actual winner).
+    #[test]
+    fn session_affinity_walks_the_last_winner_first() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.a]
+            base_url = "http://127.0.0.1:1/a"
+            models = ["m1"]
+            [providers.b]
+            base_url = "http://127.0.0.1:1/b"
+            models = ["m2"]
+            [groups.free]
+            models = ["a/m1", "b/m2"]
+            "#,
+            "session_affinity",
+        );
+
+        // A fresh binding leads the walk over the config-order head.
+        app.state.session_set("uid:u1", "b/m2");
+        let ids: Vec<String> =
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", Some("uid:u1"))
+                .iter()
+                .map(|c| c.full_id())
+                .collect();
+        assert_eq!(ids, ["b/m2", "a/m1"], "bound candidate walks first");
+        // Other conversations are unaffected.
+        let ids: Vec<String> =
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", Some("uid:other"))
+                .iter()
+                .map(|c| c.full_id())
+                .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"]);
+
+        // A manual pin outranks the affinity binding.
+        app.state.kv_set(ROUTE_PIN_KEY, "a/m1").unwrap();
+        let ids: Vec<String> =
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", Some("uid:u1"))
+                .iter()
+                .map(|c| c.full_id())
+                .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"], "pin first, affinity never leads");
+        app.state.kv_set(ROUTE_PIN_KEY, "").unwrap();
+
+        // An unlisted binding degrades (is_listed gate, like the pin).
+        app.state.session_set("uid:u2", "gone/nope");
+        let ids: Vec<String> =
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", Some("uid:u2"))
+                .iter()
+                .map(|c| c.full_id())
+                .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"]);
+
+        // An EXPIRED binding is ignored: rewrite the row with an old `seen`.
+        app.state
+            .kv_set("session:uid:u1", r#"{"candidate":"b/m2","seen":1}"#)
+            .unwrap();
+        let ids: Vec<String> =
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", Some("uid:u1"))
+                .iter()
+                .map(|c| c.full_id())
+                .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"], "TTL-expired binding must not lead");
+    }
+
+    /// The session key extraction ladder: metadata.user_id (Claude Code),
+    /// `user` (OpenAI shape), then a stable FNV hash of the first message.
+    #[test]
+    fn session_key_extraction_ladder() {
+        let uid = json!({"metadata": {"user_id": "abc123"}, "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(session_key(&uid).as_deref(), Some("uid:abc123"));
+        let user = json!({"user": "opencode-session-7", "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(session_key(&user).as_deref(), Some("user:opencode-session-7"));
+        // Hash form is stable across identical first messages…
+        let h1 = json!({"messages": [{"role": "user", "content": "opener"}]});
+        let h2 = json!({"messages": [{"role": "user", "content": "opener"}]});
+        assert_eq!(session_key(&h1), session_key(&h2));
+        // …and the hash is FNV-1a (fixed constant, stable across restarts).
+        let hash = session_key(&h1).unwrap();
+        assert!(hash.starts_with("hash:"));
+        // Blocks-shaped content and empty content degrade sanely.
+        let blocks = json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "opener"}]}]});
+        assert_eq!(session_key(&blocks), session_key(&h1));
+        assert_eq!(session_key(&json!({"messages": [{"role": "user", "content": ""}]})), None);
+        assert_eq!(session_key(&json!({})), None);
     }
 
     #[tokio::test]
@@ -2535,6 +3073,65 @@ mod tests {
         // The dead model cooled down model-scoped, not provider-wide.
         assert!(app.state.cooldown("a", "m").is_some());
         assert!(app.state.cooldown("a", "other").is_none());
+    }
+
+    /// A streamed turn must not die at timeout_secs: the old per-request
+    /// total timeout killed any stream longer than 1×timeout_secs mid-body,
+    /// truncating the answer with a clean-looking end-of-turn. Chunks here
+    /// keep arriving (each gap < stall = timeout_secs) past the total that
+    /// used to bound the whole body — every chunk must reach the client.
+    #[tokio::test]
+    async fn long_stream_survives_past_timeout_secs() {
+        use axum::routing::post;
+        fn chunk(c: &str) -> String {
+            format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{c}\"}}}}]}}\n\n")
+        }
+        let router = axum::Router::new().route("/slow", post(|| async {
+            let stream = futures_util::stream::unfold(0u8, |n| async move {
+                let (chunk, next, delay_ms) = match n {
+                    0 => (Bytes::from(chunk("one")), 1u8, 0),
+                    1 => (Bytes::from(chunk("-two")), 2, 550),
+                    2 => (Bytes::from(chunk("-three")), 3, 550),
+                    3 => (Bytes::from("data: [DONE]\n\n"), 4, 0),
+                    _ => return None,
+                };
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Some((Ok::<Bytes, std::io::Error>(chunk), next))
+            });
+            axum::http::Response::builder()
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap()
+        }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.slow]
+                base_url = "{base}/slow"
+                timeout_secs = 1
+                models = ["m"]
+                "#
+            ),
+            "long_stream",
+        );
+
+        let payload = json!({"model": "slow/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                for part in ["one", "-two", "-three", "[DONE]"] {
+                    assert!(text.contains(part), "missing {part:?}: {text}");
+                }
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
     }
 
     #[tokio::test]
@@ -2812,6 +3409,287 @@ mod tests {
     }
 
     #[tokio::test]
+    /// A 200 with an unparseable body must cool the model down: the request
+    /// was already counted and cooldowns cleared on the OK headers, so without
+    /// this a garbage-200 upstream gets re-attempted first on every walk.
+    async fn garbage_200_cools_the_model_down() {
+        use axum::routing::post;
+        let router = axum::Router::new()
+            .route("/a", post(|| async { "this is not json" }))
+            .route("/b", post(|| async {
+                axum::Json(json!({
+                    "id": "x",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }))
+            }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m"]
+                [providers.b]
+                base_url = "{base}/b"
+                models = ["m"]
+                [groups.free]
+                models = ["a/m", "b/m"]
+                "#
+            ),
+            "garbage_200",
+        );
+
+        let payload = json!({"model": "free",
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { body, provider, .. } => {
+                assert_eq!(body["choices"][0]["message"]["content"], "ok");
+                assert_eq!(provider.as_deref(), Some("b/m"));
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        // The garbage model sits out the next walk instead of being retried
+        // first for free.
+        assert!(app.state.cooldown("a", "m").is_some());
+    }
+
+    /// The walk must consult the failure-rate record BEFORE attempting: a
+    /// pre-seeded flapping head-of-chain candidate gets zero upstream hits
+    /// while the healthy sibling serves.
+    #[tokio::test]
+    async fn failure_rate_skips_a_model_before_attempting_it() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let seen = a_hits.clone();
+        let ok = || async {
+            axum::Json(json!({
+                "id": "x",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }))
+        };
+        let router = axum::Router::new()
+            .route(
+                "/a",
+                post(move || {
+                    let seen = seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        ok().await
+                    }
+                }),
+            )
+            .route("/b", post(ok));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m"]
+                [providers.b]
+                base_url = "{base}/b"
+                models = ["m"]
+                [groups.free]
+                models = ["a/m", "b/m"]
+                "#
+            ),
+            "failure_rate_walk",
+        );
+        // Pre-seed: a/m has failed 5 recent attempts (in-memory record).
+        for _ in 0..5 {
+            app.state.model_result("a", "m", false);
+        }
+
+        let payload = json!({"model": "free",
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { body, provider, .. } => {
+                assert_eq!(body["choices"][0]["message"]["content"], "ok");
+                assert_eq!(provider.as_deref(), Some("b/m"));
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert_eq!(
+            a_hits.load(Ordering::SeqCst),
+            0,
+            "unhealthy model must not be attempted"
+        );
+        // And the sibling's success was recorded — b is (still) healthy.
+        assert!(!app.state.model_unhealthy("b", "m"));
+    }
+
+    /// A body-matched error rule beats the status ladder: `skip` moves the
+    /// walk to the next candidate WITHOUT a cooldown, `passthrough-cooldown`
+    /// returns the raw body AND cools the candidate.
+    #[tokio::test]
+    async fn error_rules_override_the_status_ladder() {
+        use axum::routing::post;
+        let router = axum::Router::new()
+            .route("/a", post(|| async {
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                 r#"{"error":{"message":"无可用渠道 (no channel available)"}}"#)
+            }))
+            .route("/b", post(|| async {
+                axum::Json(json!({
+                    "id": "x",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }))
+            }));
+        let base = mock_server(router).await;
+        let cfg_toml = |action: &str| {
+            format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m"]
+                [[providers.a.errors]]
+                match = "no channel available"
+                action = "{action}"
+                [providers.b]
+                base_url = "{base}/b"
+                models = ["m"]
+                [groups.free]
+                models = ["a/m", "b/m"]
+                "#
+            )
+        };
+
+        // skip: the 503 is absorbed, b serves, a is NOT cooled (next walk
+        // re-probes it — that's what skip means).
+        let app = test_app(&cfg_toml("skip"), "error_rules_skip");
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { body, provider, .. } => {
+                assert_eq!(body["choices"][0]["message"]["content"], "ok");
+                assert_eq!(provider.as_deref(), Some("b/m"));
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert!(app.state.cooldown("a", "m").is_none(), "skip must not cool");
+
+        // passthrough-cooldown on a SINGLE-model request: raw body passes
+        // through unmodified AND the model cools.
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m"]
+                [[providers.a.errors]]
+                match = "no channel available"
+                action = "passthrough-cooldown"
+                "#
+            ),
+            "error_rules_passthrough",
+        );
+        let payload = json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 503);
+                assert_eq!(body["error"]["message"], "无可用渠道 (no channel available)");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+    }
+
+    /// Multi-account: the candidate walk IS the account walk. Account "gh"
+    /// 401s (auth = account-wide cooldown under `sub#gh`), so account "g"
+    /// serves; the bare provider name still reports `sub/m` for the panels.
+    #[tokio::test]
+    async fn multi_account_walks_accounts_fill_first() {
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let ok = axum::Json(json!({
+            "id": "x",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }));
+        let router = axum::Router::new().route(
+            "/m",
+            post(|headers: HeaderMap| async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+                if auth == "Bearer key-gh" {
+                    (axum::http::StatusCode::UNAUTHORIZED, r#"{"error":"bad key"}"#)
+                        .into_response()
+                } else {
+                    ok.into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.sub]
+                base_url = "{base}/m"
+                models = ["m"]
+                [[providers.sub.accounts]]
+                name = "gh"
+                api_key = "key-gh"
+                [[providers.sub.accounts]]
+                name = "g"
+                api_key = "key-g"
+                [groups.free]
+                models = ["sub/m"]
+                "#
+            ),
+            "multi_account",
+        );
+
+        // Expansion: the group resolves to BOTH accounts, in config order.
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
+            .iter()
+            .map(|c| format!("{}|{}", c.state_provider(), c.full_id()))
+            .collect();
+        assert_eq!(ids, ["sub#gh|sub/m", "sub#g|sub/m"]);
+
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { body, provider, .. } => {
+                assert_eq!(body["choices"][0]["message"]["content"], "ok");
+                // Bare provider name to the client — the panels never see #.
+                assert_eq!(provider.as_deref(), Some("sub/m"));
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        // The 401 cooled the GH ACCOUNT (account-wide), not the provider's
+        // other account and not any other key of the bare provider name.
+        assert!(app.state.cooldown("sub#gh", "m").is_some());
+        assert!(app.state.cooldown("sub#g", "m").is_none());
+        // Usage landed on the SERVING account only.
+        assert_eq!(app.state.usage_total("sub#g").unwrap_or_default().requests, 1);
+        assert_eq!(app.state.usage_total("sub#gh").unwrap_or_default().requests, 0);
+
+        // Second request: gh is still auth-cooled, g serves again — and a
+        // healthy gh would have been preferred (fill-first).
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        assert!(matches!(out, Outcome::Json { .. }));
+    }
+
     async fn context_window_400_fails_over_and_skips_smaller_peers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use axum::response::IntoResponse;

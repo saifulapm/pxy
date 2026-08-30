@@ -2,11 +2,24 @@ use std::collections::BTreeMap;
 
 use crate::config::{Config, ModelSpec, ProviderConfig, WireFormat};
 
-/// Suffix pxy appends to a Claude Code mirror id whose window is >= 1M. It
-/// exists purely to be read back by Claude Code, which resolves any id matching
-/// /\[1m\]/i to a 1,000,000-token window; it is never part of a provider's real
-/// id, so resolve() takes it off again before routing.
+/// The marker pxy appends to an advertised id whose window is >= 1M. It
+/// exists purely to be read back by Claude Code, which resolves any id
+/// matching /\[1m\]/i to a 1,000,000-token window; it is never part of a
+/// provider's real id, so resolve() takes it off again before routing.
 const CTX_1M_MARKER: &str = "[1m]";
+
+/// The marker for an id, given its window: appended only at >= 1M (rounding
+/// 1048576 down to the safe direction), and never doubled on an id that
+/// already carries one (which is what makes a trailing marker safe to strip).
+/// Public because the /v1/models listing needs it for the "[1m]" variants of
+/// claude-containing ids (see server::models).
+pub fn ctx_1m_marker(id: &str, context_length: u64) -> &'static str {
+    if context_length >= 1_000_000 && !id.to_ascii_lowercase().contains(CTX_1M_MARKER) {
+        CTX_1M_MARKER
+    } else {
+        ""
+    }
+}
 
 /// The id a Claude Code mirror is advertised under (server::models).
 ///
@@ -16,29 +29,40 @@ const CTX_1M_MARKER: &str = "[1m]";
 /// `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, stale the moment `/model` picks something
 /// else. A `[1m]` anywhere in the id is the one per-model signal it honours:
 /// getModelContextWindow tests `/\[1m\]/i` ahead of every env var, and
-/// re-resolves on each model switch. Rounds 1048576 down to 1000000 — the safe
-/// direction. An id that already carries the marker is left as is, which is
-/// what lets resolve() treat a trailing one as unambiguously pxy's.
+/// re-resolves on each model switch. An id that already carries the marker is
+/// left as is, which is what lets resolve() treat a trailing one as
+/// unambiguously pxy's.
 pub fn claude_mirror_id(id: &str, context_length: u64) -> String {
-    let marker = if context_length >= 1_000_000 && !id.to_ascii_lowercase().contains(CTX_1M_MARKER)
-    {
-        CTX_1M_MARKER
-    } else {
-        ""
-    };
-    format!("claude/{id}{marker}")
+    format!("claude/{id}{}", ctx_1m_marker(id, context_length))
 }
 
-/// A concrete (provider, model) pair a request can be routed to.
+/// A concrete (provider, model) pair a request can be routed to. For
+/// multi-account providers this is one ACCOUNT of the pair — resolve()
+/// expands a bare candidate into its accounts (config order = fill-first
+/// priority); single-credential providers yield themselves unchanged
+/// (`account: None`).
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub provider: String,
     pub model: ModelSpec,
+    pub account: Option<String>,
 }
 
 impl Candidate {
+    /// The bare wire id (`provider/model`): what x-pxy-provider reports, what
+    /// pins and session bindings store. Panels parse it — never scoped.
     pub fn full_id(&self) -> String {
         format!("{}/{}", self.provider, self.model.id)
+    }
+    /// The provider scope for STATE keys (cooldowns, usage windows, limits,
+    /// failure-rate record): per account, so each account of a subscription
+    /// gets its own quota buckets and its own cooldowns. `provider#account`,
+    /// same convention as the media keys `provider#media`.
+    pub fn state_provider(&self) -> String {
+        match &self.account {
+            Some(a) => format!("{}#{}", self.provider, a),
+            None => self.provider.clone(),
+        }
     }
     /// Wire format for this candidate (model override beats provider default).
     pub fn format(&self, provider: &ProviderConfig) -> WireFormat {
@@ -67,7 +91,7 @@ impl Catalog {
                 continue;
             }
             for entry in &p.models {
-                models.push(Candidate { provider: name.clone(), model: entry.spec() });
+                models.push(Candidate { provider: name.clone(), model: entry.spec(), account: None });
             }
         }
         let groups = cfg
@@ -95,7 +119,7 @@ impl Catalog {
                                 s.id = model_id.to_string();
                                 s
                             });
-                        Some(Candidate { provider: prov.to_string(), model: spec })
+                        Some(Candidate { provider: prov.to_string(), model: spec, account: None })
                     })
                     .collect();
                 (name.clone(), Group { label: g.label(name), chain })
@@ -160,17 +184,23 @@ impl Catalog {
         if let Some(g) = self.groups.get(requested) {
             return g.chain.clone();
         }
+        // A trailing "[1m]" is pxy's own window marker (see claude_mirror_id):
+        // the listing appends it to every >= 1M id — claude-containing ones
+        // INCLUDED, since the subscription's 1M models are exactly the ids the
+        // mirror filter skips. It must come off before routing on every path,
+        // so strip it once, up front. (A provider id that genuinely ends in
+        // "[1m]" was already broken by the mirror-path strip; this does not
+        // change that.)
+        let requested = requested.strip_suffix(CTX_1M_MARKER).unwrap_or(requested);
+        if let Some(g) = self.groups.get(requested) {
+            return g.chain.clone();
+        }
         // Mirrors are ALWAYS "claude/<provider>/<model>" or "claude/<group>" —
         // a slashless rest ("claude/claude-opus-5") is a REAL model on the
         // `claude` provider and must never be stripped: the bare-id fallback
         // would hand the subscription's model to whichever provider sorts
         // first (agentrouter hijack, caught in review).
         if let Some(rest) = requested.strip_prefix("claude/") {
-            // A trailing "[1m]" here is always pxy's own window marker: the
-            // mirror only appends it to ids that lack it, so a provider id that
-            // genuinely ends in "[1m]" is mirrored unchanged and never reaches
-            // this strip with a doubled suffix.
-            let rest = rest.strip_suffix(CTX_1M_MARKER).unwrap_or(rest);
             if let Some(g) = self.groups.get(rest) {
                 // An empty chain -> empty candidates -> clean local 404, same
                 // as the bare group name; never a literal group id upstream.
@@ -181,6 +211,11 @@ impl Catalog {
                 if !stripped.is_empty() {
                     return stripped;
                 }
+                // A slashed rest that resolves to nothing (stale mirror after
+                // a delisting, a whitelisted-away provider) must 404 cleanly:
+                // falling through would fabricate the whole slashed string as
+                // a model on the real `claude` subscription.
+                return Vec::new();
             }
         }
         self.resolve_concrete(cfg, requested)
@@ -201,7 +236,7 @@ impl Catalog {
                         .unwrap_or_else(|| {
                             crate::config::ModelEntry::Id(model_id.to_string()).spec()
                         });
-                    return vec![Candidate { provider: prov.to_string(), model: spec }];
+                    return vec![Candidate { provider: prov.to_string(), model: spec, account: None }];
                 }
                 return Vec::new();
             }
@@ -306,6 +341,54 @@ mod tests {
         // Groups carry it the same way, and stay recognisable as groups.
         assert!(cat.is_group("claude/free[1m]"));
         assert_eq!(cat.resolve(&c, "claude/free[1m]")[0].provider, "zai");
+    }
+
+    /// The subscription's 1M models are exactly the ids the mirror filter
+    /// skips (they contain "claude"), so their listing variant carries the
+    /// marker directly on the bare id — and resolve() must strip it on that
+    /// path too, or the literal "[1m]" would ride to the upstream.
+    #[test]
+    fn the_1m_marker_comes_off_claude_ids_too() {
+        let c = cfg();
+        let cat = Catalog::from_config(&c);
+        let r = cat.resolve(&c, "claude/claude-opus-5[1m]");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].provider, "claude");
+        assert_eq!(r[0].model.id, "claude-opus-5");
+        // The plain id still resolves to the same model.
+        let r = cat.resolve(&c, "claude/claude-opus-5");
+        assert_eq!(r[0].model.id, "claude-opus-5");
+        // And a genuine 1M claude id is not marker-doubled by ctx_1m_marker.
+        assert_eq!(ctx_1m_marker("claude/claude-opus-5[1m]", 1_000_000), "");
+        assert_eq!(ctx_1m_marker("claude/claude-opus-5", 1_000_000), "[1m]");
+        assert_eq!(ctx_1m_marker("claude/claude-haiku-4-5", 200_000), "");
+    }
+
+    /// A mirrored id whose stripped base contains a slash but resolves to
+    /// nothing (provider disabled or unknown) must 404 cleanly — falling
+    /// through would fabricate it as a model on the real `claude`
+    /// subscription and burn an upstream call on a guaranteed 404.
+    #[test]
+    fn an_unresolvable_slashed_mirror_is_a_clean_404() {
+        let c: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.claude]
+            kind = "claude-oauth"
+            format = "anthropic"
+            models = ["claude-opus-5"]
+            [providers.off]
+            base_url = "https://o.example/chat"
+            enabled = false
+            models = ["dead"]
+            "#,
+        )
+        .unwrap();
+        let cat = Catalog::from_config(&c);
+        assert!(cat.resolve(&c, "claude/off/dead").is_empty());
+        assert!(cat.resolve(&c, "claude/none-such/m").is_empty());
+        // Slashless rests keep their fallthrough: an explicit unlisted id on
+        // the claude provider stays routable (tested above).
     }
 
     #[test]
