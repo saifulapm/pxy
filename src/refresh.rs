@@ -210,7 +210,14 @@ pub async fn discover(
     };
 
     let mut req = http.get(&url).header("accept", "application/json");
-    if let Some(sref) = cfg.api_key.as_ref().or(cfg.credentials.as_ref()) {
+    // Discovery authenticates with the FIRST account of a multi-account
+    // provider; single-credential providers use their own fields.
+    let discovery_cred = cfg
+        .accounts
+        .first()
+        .and_then(|a| a.credential())
+        .or_else(|| cfg.api_key.as_ref().or(cfg.credentials.as_ref()));
+    if let Some(sref) = discovery_cred {
         match secrets.resolve_key(sref) {
             Ok(k) => req = req.header("authorization", format!("Bearer {k}")),
             Err(e) => return ProviderCatalog::Failed(format!("credential: {e:#}")),
@@ -230,7 +237,15 @@ pub async fn discover(
         Err(e) => return ProviderCatalog::Failed(format!("body: {e}")),
     };
     if !status.is_success() {
-        return ProviderCatalog::Failed(format!("HTTP {status}: {}", snippet(&body)));
+        // 401/402/403 are credential-shaped even though the key RESOLVED:
+        // a revoked-but-present key must abort --generate like a locked
+        // agent does, not silently shrink the generated catalog.
+        let kind = if matches!(status.as_u16(), 401 | 402 | 403) {
+            "credential:"
+        } else {
+            "HTTP"
+        };
+        return ProviderCatalog::Failed(format!("{kind} {status}: {}", snippet(&body)));
     }
     let root: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -578,7 +593,9 @@ fn generate(
     }
 
     let body = render_generated(&per_provider, &today);
-    std::fs::write(out_path, &body)
+    // Atomic: models.toml is parsed at every startup — a truncated write from
+    // an interrupt would fail (or worse, alter) the catalog on next boot.
+    crate::config::write_atomic(out_path, body.as_bytes())
         .with_context(|| format!("writing {}", out_path.display()))?;
 
     let rows = || per_provider.values().flat_map(|(_, v)| v.iter());
@@ -813,6 +830,18 @@ mod tests {
             expires: "".into(),
         };
         assert!(bad.is_expired("2026-08-25"));
+        // Strictly: a typo that STRING-sorts after today ("2026-9-6" > 
+        // "2026-08-30" lexicographically) is still unparseable -> expired.
+        let sloppy = crate::config::Promo {
+            models: vec!["m".into()],
+            expires: "2026-9-6".into(),
+        };
+        assert!(sloppy.is_expired("2026-08-25"));
+        let american = crate::config::Promo {
+            models: vec!["m".into()],
+            expires: "09/06/2026".into(),
+        };
+        assert!(american.is_expired("2026-08-25"));
     }
 
     #[test]

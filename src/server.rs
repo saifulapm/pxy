@@ -19,6 +19,11 @@ use crate::translate::estimate_tokens;
 use crate::usage::current_windows;
 
 pub async fn serve(cfg: Config) -> Result<()> {
+    // Everything this daemon writes is single-user and part of it is secret
+    // (the state db carries OAuth refresh tokens): create files 0600 from the
+    // start rather than trusting the ambient umask. State::open additionally
+    // chmods anything that already exists.
+    unsafe { libc::umask(0o077) };
     let state = PxyState::open(&crate::config::data_dir().join("state.sqlite"))?;
     let catalog = Catalog::from_config(&cfg);
     let http = reqwest::Client::builder()
@@ -208,7 +213,13 @@ async fn responses(
                                 (upstream, parser, state, false),
                             ))
                         }
-                        _ => {
+                        other => {
+                            // A mid-stream transport error is NOT a clean
+                            // end: finishing with "completed" would make
+                            // codex render a truncated turn as a success.
+                            if matches!(other, Some(Err(_))) {
+                                state.fail();
+                            }
                             let tail = bytes::Bytes::from(state.finish());
                             Some((Ok(tail), (upstream, parser, state, true)))
                         }
@@ -403,7 +414,19 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
     };
     let status = StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    // A 200 with an unparseable body is an upstream fault, not an empty
+    // embedding: shape it as a 502 like the network arm instead of handing
+    // the client a silent `{}` success with zero tokens recorded.
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"message": format!("bad upstream json: {e}"), "type": "api_error"}})),
+            )
+                .into_response();
+        }
+    };
 
     if status.is_success() {
         let tokens = body["usage"]["prompt_tokens"]
@@ -550,25 +573,34 @@ async fn models(State(app): State<SharedApp>, headers: HeaderMap) -> Json<Value>
     }
     // Claude Code's gateway model picker only lists ids CONTAINING
     // "claude"/"anthropic" (case-insensitive): mirror everything else under a
-    // "claude/" prefix (catalog.resolve strips it) so /model works across every
-    // provider. Ids that already carry the substring are left alone — mirroring
-    // them too would list each one twice.
+    // "claude/" prefix (catalog.resolve strips it) so /model works across
+    // every provider. Ids that already carry the substring are left alone —
+    // mirroring them too would list each one twice — but their 1M windows
+    // still need the "[1m]" variant: CC's discovery schema strips
+    // context_length, so the marker in the id is the only signal it honours
+    // (first-party CC offers `sonnet` and `sonnet[1m]` the same way).
     // display_name carries the real id so the picker stays readable.
-    let mirrors: Vec<Value> = data
-        .iter()
-        .filter_map(|m| {
-            let id = m["id"].as_str()?;
-            let lower = id.to_ascii_lowercase();
-            if lower.contains("claude") || lower.contains("anthropic") {
-                return None;
+    let mut extra: Vec<Value> = Vec::new();
+    for m in data.iter() {
+        let id = m["id"].as_str().unwrap_or_default();
+        let ctx = m["context_length"].as_u64().unwrap_or(0);
+        let lower = id.to_ascii_lowercase();
+        if lower.contains("claude") || lower.contains("anthropic") {
+            let marker = crate::catalog::ctx_1m_marker(id, ctx);
+            if !marker.is_empty() {
+                let mut v = m.clone();
+                v["id"] = json!(format!("{id}{marker}"));
+                v["display_name"] = json!(format!("{id} (1M)"));
+                extra.push(v);
             }
-            let mut v = m.clone();
-            v["id"] = json!(crate::catalog::claude_mirror_id(id, m["context_length"].as_u64().unwrap_or(0)));
-            v["display_name"] = json!(id);
-            Some(v)
-        })
-        .collect();
-    data.extend(mirrors);
+            continue;
+        }
+        let mut v = m.clone();
+        v["id"] = json!(crate::catalog::claude_mirror_id(id, ctx));
+        v["display_name"] = json!(id);
+        extra.push(v);
+    }
+    data.extend(extra);
     Json(json!({"object": "list", "data": data}))
 }
 
@@ -607,9 +639,27 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         let default_limits = crate::config::Limits::default();
         let limits = p.limits.as_ref().unwrap_or(&default_limits);
         let Ok(w) = current_windows(limits, now) else { continue };
-        let day = state.usage(name, "day", w.day_start).unwrap_or_default();
-        let month = state.usage(name, "month", w.month_start).unwrap_or_default();
-        let total = state.usage_total(name).unwrap_or_default();
+        // Multi-account providers track usage per account (`provider#account`
+        // keys); the table shows the provider TOTAL summed over accounts.
+        let state_keys: Vec<String> = if p.accounts.is_empty() {
+            vec![name.clone()]
+        } else {
+            p.accounts.iter().map(|a| format!("{name}#{}", a.name)).collect()
+        };
+        let mut day = crate::state::UsageRow::default();
+        let mut month = crate::state::UsageRow::default();
+        let mut total = crate::state::UsageRow::default();
+        for k in &state_keys {
+            let d = state.usage(k, "day", w.day_start).unwrap_or_default();
+            day.requests += d.requests;
+            day.tokens += d.tokens;
+            let m = state.usage(k, "month", w.month_start).unwrap_or_default();
+            month.requests += m.requests;
+            month.tokens += m.tokens;
+            let t = state.usage_total(k).unwrap_or_default();
+            total.requests += t.requests;
+            total.tokens += t.tokens;
+        }
         if json_out {
             json_providers.insert(
                 name.clone(),
@@ -861,7 +911,9 @@ fn free_quota_summary(snap: &Value, now: Timestamp) -> String {
     let mut line = format!("{plan} tier {pct}% of the rolling allowance used");
     let resets = snap["resetsAt"].as_str().unwrap_or("");
     if !resets.is_empty() {
-        let stamp = &resets[..resets.len().min(16)];
+        // chars().take, not byte-slicing: a non-ASCII upstream stamp would
+        // panic the CLI on a mid-character byte index.
+        let stamp: String = resets.chars().take(16).collect();
         line.push_str(&format!(" · resets {}", stamp.replace('T', " ")));
     }
     let age = snap["observedAt"]
@@ -945,7 +997,7 @@ async fn fetch_balance(
             req = req.header(k, v);
         }
     } else {
-        let prepared = match crate::providers::prepare(name, p, secrets, state, http).await {
+        let prepared = match crate::providers::prepare(name, p, secrets, state, http, None).await {
             Ok(pr) => pr,
             Err(e) => return (format!("credential error: {e:#}"), None),
         };
@@ -995,7 +1047,7 @@ async fn fetch_balance(
             win("rolling"),
             win("weekly"),
             win("monthly"),
-            &resets[..resets.len().min(10)],
+            &resets.chars().take(10).collect::<String>(),
         );
         return (line, Some(body));
     }
@@ -1074,6 +1126,53 @@ mod tests {
         assert_eq!(e["context_window"], 128_000);
         assert!(e["base_instructions"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(e["supported_reasoning_levels"].as_array().is_some_and(|a| !a.is_empty()));
+    }
+
+    /// Claude Code resolves the advertised id to a context window only via a
+    /// "[1m]" in the id (its discovery schema strips context_length), so the
+    /// subscription's 1M models — the ids the mirror filter skips — must get
+    /// an explicit "[1m]" variant entry, while sub-1M claude ids get none.
+    #[tokio::test]
+    async fn claude_1m_ids_get_marker_variants_in_the_listing() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.claude]
+            kind = "claude-oauth"
+            format = "anthropic"
+            models = [
+              { id = "claude-opus-5", context_length = 1000000 },
+              { id = "claude-haiku-4-5-20251001", context_length = 200000 },
+            ]
+            [providers.zai]
+            base_url = "https://z.example/chat"
+            models = [{ id = "glm-5.3-flash", context_length = 1048576 }]
+            "#,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("pxy-server-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app: SharedApp = Arc::new(App {
+            catalog: Catalog::from_config(&cfg),
+            secrets: Secrets::new(),
+            state: PxyState::open(&dir.join("s.sqlite")).unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        });
+
+        let out = models(State(app), HeaderMap::new()).await;
+        let data = out.0["data"].as_array().unwrap();
+        let find = |id: &str| data.iter().find(|m| m["id"] == json!(id));
+        assert!(find("claude/claude-opus-5").is_some(), "plain id stays listed");
+        let v = find("claude/claude-opus-5[1m]").expect("1M claude id needs a [1m] variant");
+        assert_eq!(v["display_name"], "claude/claude-opus-5 (1M)");
+        assert!(find("claude/claude-haiku-4-5-20251001").is_some());
+        assert!(
+            find("claude/claude-haiku-4-5-20251001[1m]").is_none(),
+            "sub-1M claude id must not get a marker variant"
+        );
+        // Non-claude ids keep the claude/-prefixed mirror with the marker.
+        assert!(find("claude/zai/glm-5.3-flash[1m]").is_some());
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

@@ -348,7 +348,7 @@ fn merge_pi_models(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(&root)?)
+    crate::config::write_atomic(path, serde_json::to_string_pretty(&root)?.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
