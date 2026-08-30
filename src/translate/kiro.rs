@@ -187,6 +187,11 @@ fn tool_result_text(content: &Value) -> String {
         Value::Array(a) => a
             .iter()
             .filter_map(|b| {
+                // The conversationState protocol carries tool output as text;
+                // an image a client tool returned must degrade visibly.
+                if b["type"].as_str() == Some("image") {
+                    return Some("[image omitted]".to_string());
+                }
                 b["text"]
                     .as_str()
                     .map(String::from)
@@ -810,6 +815,28 @@ mod tests {
         assert_eq!(results[0]["toolUseId"], "t1");
         assert_eq!(results[0]["status"], "success");
         assert_eq!(results[0]["content"][0]["text"], "(no output)");
+    }
+
+    /// A tool_result carrying an image block (client tool screenshot) must
+    /// degrade to a visible text marker — never silently disappear.
+    #[test]
+    fn tool_result_image_becomes_a_marker() {
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Shot", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                        {"type": "text", "text": "see attached"}
+                    ]}]},
+            ]});
+        let p = request(&body, "m", "arn", "T");
+        let results = &p["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["toolResults"];
+        let text = results[0]["content"].as_array().unwrap()
+            .iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("[image omitted]"), "{text}");
+        assert!(text.contains("see attached"), "{text}");
     }
 
     #[test]

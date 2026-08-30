@@ -38,26 +38,40 @@ impl TokenUsage {
     }
 }
 
-/// Rough token estimate: chars/4 over EVERY content block type.
-/// (Counting only text blocks broke Claude Code auto-compaction in OmniRoute.)
+/// Rough token estimate over EVERY content block type. (Counting only text
+/// blocks broke Claude Code auto-compaction in OmniRoute.) ASCII runs count
+/// chars/4; every non-ASCII codepoint counts ~1 token — CJK is the big
+/// chars/4 under-count (400 CJK chars ≈ 400 tokens, not 300), and
+/// over-estimating the tail scripts slightly is the safe direction: the
+/// reactive SkipContextWindow absorbs under-counts with a burned call, but
+/// an over-count only skips a model a re-measured request could still fit.
 pub fn estimate_tokens(value: &serde_json::Value) -> u64 {
-    let mut chars = 0usize;
-    count_chars(value, &mut chars);
-    (chars / 4) as u64
+    let mut ascii = 0usize;
+    let mut wide = 0usize;
+    count_chars(value, &mut ascii, &mut wide);
+    (ascii / 4 + wide) as u64
 }
 
-fn count_chars(v: &serde_json::Value, chars: &mut usize) {
+fn count_chars(v: &serde_json::Value, ascii: &mut usize, wide: &mut usize) {
     match v {
-        serde_json::Value::String(s) => *chars += s.len(),
-        serde_json::Value::Array(a) => a.iter().for_each(|x| count_chars(x, chars)),
-        serde_json::Value::Object(o) => o.values().for_each(|x| count_chars(x, chars)),
-        _ => *chars += 4,
+        serde_json::Value::String(s) => {
+            for c in s.chars() {
+                if c.is_ascii() {
+                    *ascii += 1;
+                } else {
+                    *wide += 1;
+                }
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| count_chars(x, ascii, wide)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| count_chars(x, ascii, wide)),
+        _ => *ascii += 4,
     }
 }
 
 #[cfg(test)]
 mod usage_tests {
-    use super::TokenUsage;
+    use super::{estimate_tokens, TokenUsage};
     use serde_json::json;
 
     #[test]
@@ -73,5 +87,19 @@ mod usage_tests {
         // Absent cache fields (non-caching upstreams) change nothing.
         let plain = TokenUsage::from_anthropic(&json!({"input_tokens": 7, "output_tokens": 3}));
         assert_eq!(plain.input, 7);
+    }
+
+    /// CJK was the big chars/4 under-count: 400 CJK chars are ~400 tokens,
+    /// not 1200 bytes/4 = 300. Pure ASCII keeps the chars/4 behavior.
+    #[test]
+    fn cjk_estimates_higher_than_ascii_quarters() {
+        let cjk: String = std::iter::repeat('你').take(400).collect();
+        let est = estimate_tokens(&json!({"content": cjk}));
+        assert!(est >= 400, "400 CJK chars must estimate >= 400, got {est}");
+        let ascii: String = std::iter::repeat('a').take(400).collect();
+        assert_eq!(estimate_tokens(&json!({"content": ascii})), 100);
+        // Mixed content combines both halves.
+        let mixed = estimate_tokens(&json!({"content": format!("{}{}", "a".repeat(400), cjk)}));
+        assert!(mixed >= 500, "mixed must be >= 100 + 400, got {mixed}");
     }
 }

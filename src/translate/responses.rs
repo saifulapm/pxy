@@ -58,6 +58,12 @@ pub fn request(payload: &Value) -> Value {
     // Consecutive function_call items merge into one assistant message.
     let mut pending_assistant: Option<Value> = None;
     let empty = Vec::new();
+    // The documented string form of `input` ("input": "hello") is one user
+    // message; treating it as missing made the model answer a fabricated
+    // empty prompt.
+    if let Some(text) = payload["input"].as_str() {
+        messages.push(json!({"role": "user", "content": text}));
+    }
     for item in payload["input"].as_array().unwrap_or(&empty) {
         // A bare string is a user message.
         if let Some(text) = item.as_str() {
@@ -421,6 +427,9 @@ pub struct StreamState {
     pub usage: TokenUsage,
     awaiting_usage: bool,
     completed_sent: bool,
+    /// The upstream transport died mid-turn: finish() must emit
+    /// `response.failed`, not render the truncated turn as a completion.
+    failed: bool,
 }
 
 impl StreamState {
@@ -439,6 +448,7 @@ impl StreamState {
             usage: TokenUsage::default(),
             awaiting_usage: false,
             completed_sent: false,
+            failed: false,
         }
     }
 
@@ -553,10 +563,20 @@ impl StreamState {
     pub fn finish(&mut self) -> String {
         let mut out = self.close_all();
         if !self.completed_sent {
-            out.push_str(&self.send_completed());
+            if self.failed {
+                out.push_str(&self.send_failed());
+            } else {
+                out.push_str(&self.send_completed());
+            }
         }
         out.push_str("data: [DONE]\n\n");
         out
+    }
+
+    /// Mark the turn as transport-failed: finish() emits `response.failed`
+    /// instead of a clean completion. Idempotent like aisdk's fail().
+    pub fn fail(&mut self) {
+        self.failed = true;
     }
 
     fn reasoning_delta(&mut self, text: &str) -> String {
@@ -815,11 +835,33 @@ impl StreamState {
         }
         self.emit("response.completed", json!({"response": response}))
     }
+
+    fn send_failed(&mut self) -> String {
+        self.completed_sent = true;
+        let mut response = self.response_skeleton("failed");
+        response["output"] = json!(self.completed_items);
+        response["error"] = json!({
+            "code": "upstream_stream_error",
+            "message": "The upstream stream ended before the response completed.",
+        });
+        self.emit("response.failed", json!({"response": response}))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The documented string form of `input` must become one user message;
+    /// treating it as missing made the model answer a fabricated empty prompt.
+    #[test]
+    fn string_input_becomes_a_user_message() {
+        let out = request(&json!({"model": "m", "input": "hello"}));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "{out}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "hello");
+    }
 
     #[test]
     fn request_converts_instructions_input_and_tools() {
@@ -933,6 +975,35 @@ mod tests {
         assert!(d.contains("[DONE]"));
         assert!(!d.contains("response.completed")); // not duplicated
         assert_eq!(st.usage.input, 2);
+    }
+
+    /// A mid-stream transport failure must terminate as `response.failed` —
+    /// "completed" would make codex render a truncated turn as a success.
+    #[test]
+    fn a_failed_stream_finishes_as_response_failed() {
+        let mut st = StreamState::new(1);
+        st.on_data(r#"{"id":"x1","choices":[{"index":0,"delta":{"role":"assistant","content":"par"}}]}"#);
+        st.fail();
+        let out = st.finish();
+        assert!(out.contains("event: response.failed"), "{out}");
+        assert!(!out.contains("response.completed"), "{out}");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("data: ") && l.contains("response.failed"))
+            .unwrap();
+        let data: Value = serde_json::from_str(line.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(data["response"]["status"], "failed");
+        assert!(data["response"]["error"]["code"].is_string());
+        // The partial output produced before the failure is preserved.
+        assert_eq!(data["response"]["output"][0]["type"], "message");
+        // finish() stays idempotent after the failure path too.
+        let again = st.finish();
+        assert!(!again.contains("response.failed"));
+        // And a stream without fail() still completes normally.
+        let mut ok = StreamState::new(2);
+        ok.on_data(r#"{"id":"x2","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#);
+        ok.finish();
+        assert!(ok.finish().contains("[DONE]"));
     }
 
     #[test]

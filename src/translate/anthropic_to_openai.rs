@@ -151,7 +151,15 @@ fn flatten_text(content: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|b| b["text"].as_str())
+            .filter_map(|b| {
+                // Tool messages on OpenAI upstreams are text-only, but a
+                // client tool may return screenshots: the image must degrade
+                // to a visible marker, or the model never knows it got one.
+                if b["type"].as_str() == Some("image") {
+                    return Some("[image omitted]".to_string());
+                }
+                b["text"].as_str().map(String::from)
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
@@ -763,6 +771,33 @@ mod tests {
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "t1");
         assert_eq!(out["tools"][0]["function"]["parameters"]["properties"], json!({}));
+    }
+
+    /// An image inside a tool_result (a screenshot a client tool returned)
+    /// must degrade to a visible marker for text-only tool messages, not
+    /// vanish — the model would otherwise answer without its screenshot.
+    #[test]
+    fn tool_result_images_degrade_to_a_marker() {
+        let req = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Shot", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                        {"type": "text", "text": "the chart"}
+                    ]}
+                ]}
+            ]
+        });
+        let out = request(&req);
+        let msgs = out["messages"].as_array().unwrap();
+        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        let content = tool["content"].as_str().unwrap();
+        assert!(content.contains("[image omitted]"), "{content}");
+        assert!(content.contains("the chart"), "{content}");
     }
 
     #[test]

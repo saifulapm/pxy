@@ -390,25 +390,36 @@ impl StreamState {
         }
         self.finished = true;
         let mut out = String::new();
-        let mut emitted_calls = false;
-        for (idx, id, name, args) in std::mem::take(&mut self.tools) {
-            if name.is_empty() {
-                continue;
+        // A transport failure after partial tool calls must NOT report
+        // success: the buffered arguments are truncated (often unparseable,
+        // replaced with {}), and executing them would run tools on garbage.
+        // fx also rejects an error finish combined with tool calls, so the
+        // calls are dropped, not emitted — the turn ends as the error it was.
+        let emitted_calls = if self.failed {
+            std::mem::take(&mut self.tools);
+            false
+        } else {
+            let mut emitted = false;
+            for (idx, id, name, args) in std::mem::take(&mut self.tools) {
+                if name.is_empty() {
+                    continue;
+                }
+                emitted = true;
+                // fx accepts `input` as raw JSON or as a JSON string; send parsed
+                // when possible so a malformed fragment can't break the turn.
+                let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
+                out.push_str(&format_data(&json!({
+                    "type": "tool-call",
+                    // The index keeps parallel calls to the SAME tool distinct:
+                    // duplicate ids make fx reject the next turn's history.
+                    "toolCallId": if id.is_empty() { format!("call_{idx}_{name}") } else { id },
+                    "toolName": name,
+                    "input": input,
+                })));
             }
-            emitted_calls = true;
-            // fx accepts `input` as raw JSON or as a JSON string; send parsed
-            // when possible so a malformed fragment can't break the turn.
-            let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
-            out.push_str(&format_data(&json!({
-                "type": "tool-call",
-                // The index keeps parallel calls to the SAME tool distinct:
-                // duplicate ids make fx reject the next turn's history.
-                "toolCallId": if id.is_empty() { format!("call_{idx}_{name}") } else { id },
-                "toolName": name,
-                "input": input,
-            })));
-        }
-        let unified = if self.failed && !emitted_calls {
+            emitted
+        };
+        let unified = if self.failed {
             "error"
         } else {
             unified_finish(self.finish_reason.as_deref(), emitted_calls)
@@ -429,6 +440,21 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport failure must win over buffered tool calls: the turn ends
+    /// as `error` with NO tool-call events (fx rejects error+tool-calls, and
+    /// truncated arguments would execute tools on garbage).
+    #[test]
+    fn failed_stream_drops_partial_tool_calls_and_ends_as_error() {
+        let mut st = StreamState::new("m");
+        st.on_data(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Bash","arguments":"{\"cm"}}]}}]}"#);
+        st.fail();
+        let out = st.finish();
+        assert!(out.contains(r#""unified":"error""#), "{out}");
+        assert!(!out.contains("tool-call"), "{out}");
+        // finish() stays idempotent.
+        assert_eq!(st.finish(), "");
+    }
 
     #[test]
     fn request_maps_prompt_tools_and_choice() {

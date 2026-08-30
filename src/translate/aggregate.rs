@@ -160,7 +160,11 @@ pub fn anthropic(events: &[SseEvent]) -> Value {
             Some("content_block_delta") => {
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
                 let delta = &v["delta"];
-                let Some(block) = message["content"].get_mut(idx) else { continue };
+                // A scalar block (pathological content_block_start) would
+                // panic the mutable field indexes below — skip it whole.
+                let Some(block) = message["content"].get_mut(idx).filter(|b| b.is_object()) else {
+                    continue;
+                };
                 match delta["type"].as_str() {
                     Some("text_delta") => append_str(block, "text", delta["text"].as_str()),
                     Some("thinking_delta") => {
@@ -182,7 +186,7 @@ pub fn anthropic(events: &[SseEvent]) -> Value {
             Some("content_block_stop") => {
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
                 if let Some(partial) = partials.remove(&idx) {
-                    if let Some(block) = message["content"].get_mut(idx) {
+                    if let Some(block) = message["content"].get_mut(idx).filter(|b| b.is_object()) {
                         block["input"] = serde_json::from_str(&partial).unwrap_or(json!({}));
                     }
                 }
@@ -190,18 +194,30 @@ pub fn anthropic(events: &[SseEvent]) -> Value {
             Some("message_delta") => {
                 if let Some(delta) = v["delta"].as_object() {
                     for (k, val) in delta {
+                        // Anthropic's usage rides message_delta's TOP level
+                        // (handled below), never inside delta — copying a
+                        // scalar delta `usage` here would poison the object.
+                        if k == "usage" {
+                            continue;
+                        }
                         message[k] = val.clone();
                     }
                 }
                 if let Some(o) = v["usage"]["output_tokens"].as_u64() {
-                    message["usage"]["output_tokens"] = json!(o);
+                    // `usage` must be an object (or absent) for the mut index;
+                    // a scalar would have arrived via the delta loop above.
+                    if message.get("usage").map_or(true, |u| u.is_object() || u.is_null()) {
+                        message["usage"]["output_tokens"] = json!(o);
+                    }
                 }
             }
             _ => {}
         }
     }
     if let Some(content) = message["content"].as_array_mut() {
-        content.retain(|b| !b.is_null());
+        // Null placeholders and scalar garbage (pathological content_block
+        // values) must not reach the client: every real block is an object.
+        content.retain(|b| b.is_object());
     }
     message
 }
@@ -274,6 +290,25 @@ mod tests {
         assert_eq!(v["content"][1]["input"]["a"], 1);
         assert_eq!(v["stop_reason"], "tool_use");
         assert_eq!(v["usage"]["input_tokens"], 7);
+        assert_eq!(v["usage"]["output_tokens"], 9);
+    }
+
+    /// Scalar blocks and a scalar `usage` (pathological upstream events) must
+    /// degrade to skips, not panic the mutable field indexes.
+    #[test]
+    fn pathological_blocks_never_panic() {
+        let evs = events(concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":5}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"usage\":5},\"usage\":{\"output_tokens\":9}}\n\n",
+        ));
+        let v = anthropic(&evs);
+        // The scalar block was dropped by the object retain, and the scalar
+        // delta `usage` must not have blocked the real usage update.
+        assert!(v["content"].as_array().unwrap().is_empty());
         assert_eq!(v["usage"]["output_tokens"], 9);
     }
 }
