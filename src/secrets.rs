@@ -21,7 +21,7 @@ impl Secrets {
     /// (API keys are single-line; OAuth entries are JSON blobs).
     pub fn resolve(&self, sref: &SecretRef) -> Result<String> {
         let key = cache_key(sref);
-        if let Some(v) = self.cache.lock().unwrap().get(&key) {
+        if let Some(v) = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
             return Ok(v.clone());
         }
         let value = match sref {
@@ -59,7 +59,7 @@ impl Secrets {
         };
         // API-key style: first line is the secret; but OAuth JSON blobs span
         // lines. Callers that want just the key use `first_line()`.
-        self.cache.lock().unwrap().insert(key, value.clone());
+        self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, value.clone());
         Ok(value)
     }
 

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use jiff::{Timestamp, Zoned};
 use rusqlite::Connection;
+use std::os::unix::fs::PermissionsExt;
 
 /// Persistent + in-memory runtime state.
 ///
@@ -19,6 +20,11 @@ pub struct State {
     db: Mutex<Connection>,
     cooldowns: Mutex<HashMap<String, Cooldown>>,
     rpm: Mutex<HashMap<String, RpmWindow>>,
+    /// Per-model request/failure windows (litellm's failure-rate rule): a
+    /// model that fails HALF its recent requests cools down even though no
+    /// single error ever crossed the per-error cooldown ladder. In-memory
+    /// only — persistent cooldowns already cover the decisive failures.
+    model_health: Mutex<HashMap<String, ModelHealth>>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +50,11 @@ struct RpmWindow {
 
 const RPM_WINDOW_MS: u64 = 60_000;
 
+/// How long a session-affinity binding stays live. Anthropic prompt caches
+/// expire in minutes; an hour is generous and bounds staleness after a
+/// long-idle conversation returns.
+const SESSION_TTL_SECS: u64 = 3600;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UsageRow {
     pub requests: u64,
@@ -67,6 +78,17 @@ impl State {
             std::fs::create_dir_all(dir)?;
         }
         let db = Connection::open(path).context("opening state db")?;
+        // The kv table holds OAuth refresh tokens (kimi/kiro/copilot) — the
+        // same secret class as the 0600 credential files in providers/. sqlite
+        // creates db/-wal/-shm with the ambient umask, which left them 0644 on
+        // disk; tighten all three at every open (idempotent, covers files the
+        // umask fix postdates).
+        for suffix in ["", "-wal", "-shm"] {
+            let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            if p.exists() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
         // The CLI (explain/doctor/status) opens the daemon's live db; without
         // a busy timeout a concurrent daemon write turns into an instant
         // "database is locked" abort instead of a few-ms wait.
@@ -141,6 +163,7 @@ impl State {
             db: Mutex::new(db),
             cooldowns: Mutex::new(cooldowns),
             rpm: Mutex::new(HashMap::new()),
+            model_health: Mutex::new(HashMap::new()),
         })
     }
 
@@ -154,7 +177,7 @@ impl State {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (window, start) in windows_for(day_start, month_start) {
             db.execute(
                 "INSERT INTO usage (provider, window, window_start, requests, input_tokens, output_tokens)
@@ -181,7 +204,7 @@ impl State {
         if input_tokens == 0 && output_tokens == 0 {
             return Ok(());
         }
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (window, start) in windows_for(day_start, month_start) {
             db.execute(
                 "INSERT INTO usage (provider, window, window_start, requests, input_tokens, output_tokens)
@@ -210,7 +233,7 @@ impl State {
         output_tokens: u64,
     ) -> Result<()> {
         let day = Zoned::now().date().to_string();
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         db.execute(
             "INSERT INTO model_usage (day, agent, provider, model, requests, input_tokens, output_tokens)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -233,7 +256,7 @@ impl State {
 
     /// Every model_usage row, oldest day first (for `pxy status --json`).
     pub fn model_usage_rows(&self) -> Result<Vec<ModelUsageRow>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = db.prepare(
             "SELECT day, agent, provider, model, requests, input_tokens, output_tokens
              FROM model_usage ORDER BY day, agent, provider, model",
@@ -262,7 +285,7 @@ impl State {
     }
 
     fn usage_keyed(&self, provider: &str, window: &str, start: &str) -> Result<UsageRow> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let row = db
             .query_row(
                 "SELECT requests, input_tokens + output_tokens FROM usage
@@ -282,7 +305,7 @@ impl State {
     // ---- kv ----
 
     pub fn kv_get(&self, k: &str) -> Result<Option<String>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match db.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)) {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -291,7 +314,7 @@ impl State {
     }
 
     pub fn kv_set(&self, k: &str, v: &str) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         db.execute(
             "INSERT INTO kv (k, v) VALUES (?1, ?2)
              ON CONFLICT(k) DO UPDATE SET v = excluded.v",
@@ -300,8 +323,30 @@ impl State {
         Ok(())
     }
 
+    // ---- session affinity bindings ----
+
+    /// The candidate this conversation last won on, when the binding is still
+    /// fresh. TTL is enforced on READ (no prune job — a single user generates
+    /// a handful of stale rows per hour, and each read is one indexed SELECT).
+    pub fn session_get(&self, key: &str) -> Option<String> {
+        let k = format!("session:{key}");
+        let v = self.kv_get(&k).ok().flatten()?;
+        let v: serde_json::Value = serde_json::from_str(&v).ok()?;
+        let candidate = v["candidate"].as_str()?.to_string();
+        let seen = v["seen"].as_u64()?;
+        let age_ms = epoch_ms().saturating_sub(seen);
+        (age_ms / 1000 <= SESSION_TTL_SECS).then_some(candidate)
+    }
+
+    /// Record the winning candidate for a conversation (called on Done).
+    pub fn session_set(&self, key: &str, candidate: &str) {
+        let k = format!("session:{key}");
+        let v = serde_json::json!({"candidate": candidate, "seen": epoch_ms()});
+        let _ = self.kv_set(&k, &v.to_string());
+    }
+
     pub fn kv_delete(&self, k: &str) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         db.execute("DELETE FROM kv WHERE k = ?1", [k])?;
         Ok(())
     }
@@ -323,7 +368,7 @@ impl State {
 
     /// Blocked if the provider is cooled down, or this specific model is.
     pub fn cooldown(&self, provider: &str, model: &str) -> Option<Cooldown> {
-        let map = self.cooldowns.lock().unwrap();
+        let map = self.cooldowns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         for key in [provider.to_string(), Self::cooldown_key(provider, Some(model))] {
             if let Some(cd) = map.get(&key) {
@@ -348,7 +393,7 @@ impl State {
         reason: &str,
     ) {
         let key = Self::cooldown_key(provider, model);
-        let mut map = self.cooldowns.lock().unwrap();
+        let mut map = self.cooldowns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev_level = map.get(&key).map(|c| c.level).unwrap_or(0);
         let (dur, level) = match retry_after {
             Some(d) => (d.min(Duration::from_secs(30 * 24 * 3600)), 0),
@@ -368,7 +413,7 @@ impl State {
         // Mirror to sqlite so restarts don't forget it. Best-effort: a write
         // failure must never block routing.
         let until_ms = epoch_ms() + dur.as_millis() as u64;
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Err(e) = db.execute(
             "INSERT INTO cooldowns (key, until_ms, level, retryable, reason)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -389,7 +434,7 @@ impl State {
     /// when a non-retryable cooldown blocks the pair, because no amount of
     /// waiting fixes a revoked key or exhausted credits.
     pub fn recovery_wait(&self, provider: &str, model: &str) -> Option<Duration> {
-        let map = self.cooldowns.lock().unwrap();
+        let map = self.cooldowns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let mut wait: Option<Duration> = None;
         for key in [provider.to_string(), Self::cooldown_key(provider, Some(model))] {
@@ -408,7 +453,7 @@ impl State {
 
     /// Everything currently cooling down (for the @@usage report).
     pub fn active_cooldowns(&self) -> Vec<(String, Cooldown)> {
-        let map = self.cooldowns.lock().unwrap();
+        let map = self.cooldowns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let mut list: Vec<(String, Cooldown)> = map
             .iter()
@@ -422,11 +467,11 @@ impl State {
     /// Success clears both scopes for this model.
     pub fn clear_cooldown(&self, provider: &str, model: &str) {
         let model_key = Self::cooldown_key(provider, Some(model));
-        let mut map = self.cooldowns.lock().unwrap();
+        let mut map = self.cooldowns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.remove(provider);
         map.remove(&model_key);
         drop(map);
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Err(e) = db.execute(
             "DELETE FROM cooldowns WHERE key IN (?1, ?2)",
             rusqlite::params![provider, model_key],
@@ -441,7 +486,7 @@ impl State {
         let now_ms = epoch_ms();
         let idx = now_ms / RPM_WINDOW_MS;
         let elapsed = (now_ms % RPM_WINDOW_MS) as f64 / RPM_WINDOW_MS as f64;
-        let mut map = self.rpm.lock().unwrap();
+        let mut map = self.rpm.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let w = map.entry(provider.to_string()).or_default();
         roll(w, idx);
         w.prev * (1.0 - elapsed) + w.curr
@@ -450,11 +495,65 @@ impl State {
     pub fn rpm_increment(&self, provider: &str) {
         let now_ms = epoch_ms();
         let idx = now_ms / RPM_WINDOW_MS;
-        let mut map = self.rpm.lock().unwrap();
+        let mut map = self.rpm.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let w = map.entry(provider.to_string()).or_default();
         roll(w, idx);
         w.curr += 1.0;
     }
+
+    // ---- per-model failure-rate window (litellm rule) ----
+
+    /// Record one model attempt outcome for the failure-rate rule. Only real
+    /// attempts are counted: pre-filters and context-window skips never reach
+    /// here (the caller decides).
+    pub fn model_result(&self, provider: &str, model: &str, ok: bool) {
+        let now_ms = epoch_ms();
+        let idx = now_ms / RPM_WINDOW_MS;
+        let mut map = self
+            .model_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let h = map
+            .entry(Self::cooldown_key(provider, Some(model)))
+            .or_default();
+        roll(&mut h.req, idx);
+        roll(&mut h.fail, idx);
+        h.req.curr += 1.0;
+        if !ok {
+            h.fail.curr += 1.0;
+        }
+    }
+
+    /// True when the model failed at least half of its recent attempts
+    /// (>= MIN_FAILURE_RATE_REQUESTS in the sliding 60s window). The blended
+    /// two-bucket read gives the same slop as the rpm estimate.
+    pub fn model_unhealthy(&self, provider: &str, model: &str) -> bool {
+        let now_ms = epoch_ms();
+        let elapsed = (now_ms % RPM_WINDOW_MS) as f64 / RPM_WINDOW_MS as f64;
+        let map = self
+            .model_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(h) = map.get(&Self::cooldown_key(provider, Some(model))) else {
+            return false;
+        };
+        // Blend both buckets the way rpm_effective does.
+        let reqs = h.req.prev * (1.0 - elapsed) + h.req.curr;
+        let fails = h.fail.prev * (1.0 - elapsed) + h.fail.curr;
+        reqs >= MIN_FAILURE_RATE_REQUESTS as f64 && fails / reqs >= FAILURE_RATE_THRESHOLD
+    }
+}
+
+/// Minimum attempts in the window before the failure rate means anything.
+const MIN_FAILURE_RATE_REQUESTS: u32 = 5;
+/// litellm's default: half the recent attempts failing = unhealthy.
+const FAILURE_RATE_THRESHOLD: f64 = 0.5;
+
+/// Request/failure pair of two-bucket windows for one model.
+#[derive(Debug, Default)]
+struct ModelHealth {
+    req: RpmWindow,
+    fail: RpmWindow,
 }
 
 /// Fixed key for the all-time window.

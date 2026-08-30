@@ -11,6 +11,26 @@ pub fn default_config_path() -> PathBuf {
     base.join("pxy").join("config.toml")
 }
 
+/// Write a file atomically: tmp + rename, so an interrupt mid-write can never
+/// leave a truncated file that a later startup (or another tool) parses as
+/// truth. Used for every file pxy regenerates.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("pxy-tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(bytes)?;
+        f.sync_all().ok();
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
+
 /// `models.toml` lives beside the config it augments.
 pub fn models_path(config_path: &Path) -> PathBuf {
     config_path
@@ -292,6 +312,69 @@ impl Config {
                     "provider '{name}': base_url (or embeddings_url / media) is required"
                 );
             }
+            // Numeric sanity: these fail SILENTLY downstream — a zero window
+            // disables agent auto-compaction (the advertised min goes to 0),
+            // rpm 0 skips every candidate of the provider, and a duplicate id
+            // lists and walks twice.
+            if p.limits.as_ref().and_then(|l| l.rpm).is_some_and(|r| r == 0) {
+                anyhow::bail!("provider '{name}': rpm = 0 would skip every candidate");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for entry in &p.models {
+                let spec = entry.spec();
+                if spec.context_length == 0 {
+                    anyhow::bail!(
+                        "provider '{name}': model '{}' has context_length = 0 (omit it for \
+                         the default, or set the real window)",
+                        spec.id
+                    );
+                }
+                if !seen.insert(spec.id.clone()) {
+                    anyhow::bail!("provider '{name}': duplicate model id '{}'", spec.id);
+                }
+            }
+            // Accounts: a separate credential dimension, exclusive with the
+            // top-level credential fields. claude-oauth reads a SHARED
+            // credentials FILE (not a per-account secret ref), so it has no
+            // account dimension yet.
+            if !p.accounts.is_empty() {
+                if p.kind == ProviderKind::ClaudeOauth {
+                    anyhow::bail!(
+                        "provider '{name}': accounts are not supported for claude-oauth \
+                         (it reads the Claude Code credentials file, not per-account secrets)"
+                    );
+                }
+                if p.api_key.is_some() || p.credentials.is_some() {
+                    anyhow::bail!(
+                        "provider '{name}': top-level api_key/credentials are mutually \
+                         exclusive with accounts (each account carries its own)"
+                    );
+                }
+                let mut names = std::collections::BTreeSet::new();
+                for a in &p.accounts {
+                    if a.name.is_empty()
+                        || !a
+                            .name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                    {
+                        anyhow::bail!(
+                            "provider '{name}': account name '{}' must be non-empty and use \
+                             only [a-z0-9-] (it is part of the state key)",
+                            a.name
+                        );
+                    }
+                    if !names.insert(a.name.clone()) {
+                        anyhow::bail!("provider '{name}': duplicate account name '{}'", a.name);
+                    }
+                    if a.credential().is_none() {
+                        anyhow::bail!(
+                            "provider '{name}': account '{}' needs api_key or credentials",
+                            a.name
+                        );
+                    }
+                }
+            }
         }
         for (group, g) in &self.groups {
             // A group name IS a model id on the wire, so it must not collide
@@ -359,7 +442,10 @@ pub struct GeneratedProvider {
 pub struct ServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Key clients must send. Loopback-only bind, so this is a soft gate.
+    /// Informational only — pxy is deliberately loopback-only and NO endpoint
+    /// checks this today (single-user design, HANDOFF "no multi-tenant"). It
+    /// rides `pxy launch` / media CLI auth headers and is what `@@usage`
+    /// agent-tagging parses; it does not gate anything.
     #[serde(default = "default_api_key")]
     pub api_key: String,
 }
@@ -449,6 +535,12 @@ pub struct ProviderConfig {
     /// translation, just before the wire. Per-model `drop_params` adds to it.
     #[serde(default)]
     pub drop_params: Vec<String>,
+    /// Body-matched error overrides (CLIProxyAPI's request-scoped errors):
+    /// absorb aggregator/WAF error text without code changes. FIRST matching
+    /// rule (case-insensitive substring on the error body) wins over the
+    /// status ladder; the context-window carve-out still runs before rules.
+    #[serde(default)]
+    pub errors: Vec<ErrorRule>,
 
     // ---- `pxy refresh` (discovery) ----
     /// Include this provider in catalog discovery. Default ON: an opt-in
@@ -480,8 +572,62 @@ pub struct ProviderConfig {
     /// behind a separate console-issued key — aihubmix calls it a Manage Key —
     /// and answer 401 to the `sk-` inference key.
     pub balance_key: Option<SecretRef>,
+    /// Separate subscription accounts behind ONE provider entry (CLIProxyAPI's
+    /// multi-credential model): the walk tries them in config order
+    /// (fill-first), and cooldowns/usage/limits are tracked per account under
+    /// the `provider#account` state key. Mutually exclusive with top-level
+    /// `api_key`/`credentials`. `balance_url` stays provider-level.
+    #[serde(default)]
+    pub accounts: Vec<Account>,
     /// Phase 2 media capabilities (images, audio, rerank, video).
     pub media: Option<MediaConfig>,
+}
+
+/// One credential of a multi-account provider. `name` is the state-key suffix
+/// (`provider#name`) — lowercase letters, digits and dashes only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Account {
+    pub name: String,
+    pub api_key: Option<SecretRef>,
+    /// OAuth credential blob (JSON in pass) for kinds that need it.
+    pub credentials: Option<SecretRef>,
+    /// Extra headers this account sends (device identity, org id), overriding
+    /// the provider's same-named headers.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl Account {
+    /// The credential this account authenticates with.
+    pub fn credential(&self) -> Option<&SecretRef> {
+        self.credentials.as_ref().or(self.api_key.as_ref())
+    }
+}
+
+/// One body-matched error override for a provider. Actions mirror
+/// CLIProxyAPI's request-scoped errors, in pxy's vocabulary: `skip*` moves
+/// the walk to the next candidate, `passthrough*` returns the raw upstream
+/// error to the client (Claude Code's auto-retry depends on unmodified
+/// bodies). The `-cooldown` variants additionally set a model-scoped
+/// retryable cooldown.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorRule {
+    /// Case-insensitive substring matched against the upstream error body.
+    /// TOML key is `match` (`matches` would read as a verb here).
+    #[serde(rename = "match")]
+    pub matches: String,
+    pub action: ErrorAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ErrorAction {
+    Skip,
+    SkipCooldown,
+    Passthrough,
+    PassthroughCooldown,
 }
 
 /// Non-chat capabilities of a provider. URLs may contain `{model}` (and, for
@@ -553,9 +699,18 @@ pub struct Promo {
 
 impl Promo {
     /// True once `today` is past `expires`. An unparseable date is treated as
-    /// expired: failing closed drops a model, failing open spends money.
+    /// expired: failing closed drops a model, failing open spends money. The
+    /// parse must be STRICT — a bare string compare let "2026-9-6" (or any
+    /// typo sorting after today) keep a paid model in the free chains forever.
     pub fn is_expired(&self, today: &str) -> bool {
-        self.expires.as_str() < today
+        use std::str::FromStr;
+        match (
+            jiff::civil::Date::from_str(&self.expires),
+            jiff::civil::Date::from_str(today),
+        ) {
+            (Ok(expires), Ok(today)) => today > expires,
+            _ => true,
+        }
     }
 }
 
@@ -580,6 +735,8 @@ impl ProviderConfig {
             timeout_secs: default_timeout(),
             parse_think_tags: false,
             drop_params: Vec::new(),
+            errors: Vec::new(),
+            accounts: Vec::new(),
             discover: true,
             models_url: None,
             id_field: None,
@@ -595,6 +752,176 @@ impl ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These fail SILENTLY downstream (zero window disables agent compaction,
+    /// rpm 0 skips every candidate, duplicates walk twice) — so they must be
+    /// hard errors at load, not runtime surprises.
+    #[test]
+    fn numeric_sanity_is_validated() {
+        let cases = [
+            (
+                "rpm zero",
+                r#"
+                [server]
+                [providers.p]
+                base_url = "https://p.example/chat"
+                models = ["m"]
+                [providers.p.limits]
+                rpm = 0
+                "#,
+                "rpm = 0",
+            ),
+            (
+                "zero context",
+                r#"
+                [server]
+                [providers.p]
+                base_url = "https://p.example/chat"
+                models = [{ id = "m", context_length = 0 }]
+                "#,
+                "context_length = 0",
+            ),
+            (
+                "duplicate id",
+                r#"
+                [server]
+                [providers.p]
+                base_url = "https://p.example/chat"
+                models = ["m", "m"]
+                "#,
+                "duplicate model id 'm'",
+            ),
+        ];
+        for (name, toml_src, expect) in cases {
+            let err = toml::from_str::<Config>(toml_src)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map_err(|e| e.to_string()))
+                .unwrap_err();
+            assert!(err.contains(expect), "{name}: {err}");
+        }
+        // And a sane config still validates.
+        toml::from_str::<Config>(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://p.example/chat"
+            models = [{ id = "m", context_length = 128000 }]
+            [providers.p.limits]
+            rpm = 5
+            "#,
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|c| c.validate().map_err(|e| e.to_string()))
+        .unwrap();
+    }
+
+    /// Accounts: exclusive with top-level credentials, unique [a-z0-9-] names,
+    /// each carrying a credential; claude-oauth has no account dimension.
+    #[test]
+    fn account_configs_are_validated() {
+        let cases = [
+            (
+                "top-level credential conflict",
+                r#"
+                [server]
+                [providers.p]
+                base_url = "https://p.example/chat"
+                models = ["m"]
+                api_key = "k"
+                [[providers.p.accounts]]
+                name = "a"
+                api_key = "k1"
+                "#,
+                "mutually exclusive",
+            ),
+            (
+                "duplicate account name",
+                r#"
+                [server]
+                [providers.p]
+                base_url = "https://p.example/chat"
+                models = ["m"]
+                [[providers.p.accounts]]
+                name = "a"
+                api_key = "k1"
+                [[providers.p.accounts]]
+                name = "a"
+                api_key = "k2"
+                "#,
+                "duplicate account name 'a'",
+            ),
+            (
+                "bad account charset",
+                r#"
+                [server]
+                [providers.p]
+                base_url = "https://p.example/chat"
+                models = ["m"]
+                [[providers.p.accounts]]
+                name = "Main Account"
+                api_key = "k1"
+                "#,
+                "must be non-empty and use",
+            ),
+            (
+                "account without credential",
+                r#"
+                [server]
+                [providers.p]
+                base_url = "https://p.example/chat"
+                models = ["m"]
+                [[providers.p.accounts]]
+                name = "a"
+                "#,
+                "needs api_key or credentials",
+            ),
+            (
+                "claude-oauth accounts",
+                r#"
+                [server]
+                [providers.p]
+                kind = "claude-oauth"
+                format = "anthropic"
+                models = ["m"]
+                [[providers.p.accounts]]
+                name = "a"
+                api_key = "k1"
+                "#,
+                "not supported for claude-oauth",
+            ),
+        ];
+        for (name, toml_src, expect) in cases {
+            let err = toml::from_str::<Config>(toml_src)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map_err(|e| e.to_string()))
+                .unwrap_err();
+            assert!(err.contains(expect), "{name}: {err}");
+        }
+        // And a valid accounts config parses + validates, each account
+        // carrying its own credential.
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://p.example/chat"
+            models = ["m"]
+            [[providers.p.accounts]]
+            name = "gh"
+            api_key = "k1"
+            [providers.p.accounts.headers]
+            x-org = "org-1"
+            [[providers.p.accounts]]
+            name = "g"
+            credentials = { pass = "AI/sub/g" }
+            "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let accounts = &cfg.providers["p"].accounts;
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts[0].credential().is_some());
+        assert!(accounts[1].credential().is_some());
+    }
 
     #[test]
     fn overlay_preserves_curated_model_specs() {
