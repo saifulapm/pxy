@@ -69,30 +69,6 @@ impl Secrets {
         Ok(full.lines().next().unwrap_or_default().trim().to_string())
     }
 
-    /// Write back an updated pass entry (used for rotated OAuth tokens).
-    pub fn write_pass(&self, entry: &str, content: &str) -> Result<()> {
-        use std::io::Write;
-        let mut child = Command::new("pass")
-            .args(["insert", "-m", "-f", entry])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .context("running pass insert")?;
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(content.as_bytes())?;
-        let status = child.wait()?;
-        if !status.success() {
-            anyhow::bail!("pass insert {entry} failed");
-        }
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(format!("pass:{entry}"), content.trim_end().to_string());
-        Ok(())
-    }
 }
 
 fn cache_key(sref: &SecretRef) -> String {

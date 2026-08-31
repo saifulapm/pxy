@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-# flock() for the shared claude-oauth credential file (approved 2026-08-26)
+# umask(): daemon-written files (state db, wal) start 0600, not ambient
 libc = "0.2"
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.22"

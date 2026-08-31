@@ -276,7 +276,7 @@ mod tests {
             base_url = "https://a.example/chat"
             models = ["claude-opus-5"]
             [providers.claude]
-            kind = "claude-oauth"
+            base_url = "https://api.anthropic.com/v1/messages"
             format = "anthropic"
             models = ["claude-opus-5"]
             [providers.zai]
@@ -374,7 +374,7 @@ mod tests {
             r#"
             [server]
             [providers.claude]
-            kind = "claude-oauth"
+            base_url = "https://api.anthropic.com/v1/messages"
             format = "anthropic"
             models = ["claude-opus-5"]
             [providers.off]

@@ -13,7 +13,8 @@ agents to it. Repo: `github.com/saifulapm/pxy` (private).
 
 - **Installed**: `~/.local/bin/pxy`, systemd user unit `pxy.service` (enabled, running).
 - **Config**: `~/.config/pxy/config.toml` (not in git; `config.example.toml` mirrors it).
-- **Secrets**: `pass` under `AI/<provider>/<name>`. API keys = first line; OAuth = pure JSON.
+- **Secrets**: `pass` under `AI/<provider>/<name>`, API key on the first line.
+  Read-only since 2026-08-31 — pxy never writes a credential back.
 - **State**: `~/.local/share/pxy/state.sqlite` (usage counters survive restarts).
 - **Verified end-to-end**: Claude Code ran a real session through pxy on the `auto` chain.
 
@@ -109,11 +110,7 @@ balances included), daemon health + restart.
 | `catalog.rs` | model resolution (`provider/model`, first-slash split, `auto`) |
 | `router.rs` | the engine: filter → attempt → classify → failover; streaming tap |
 | `server.rs` | axum routes |
-| `providers/copilot.rs` | GitHub Copilot two-stage token mint + header profile |
-| `providers/kimi.rs` | Kimi coding: rotating-refresh OAuth, X-Msh-* identity |
-| `providers/kiro.rs` | Kiro/CodeWhisperer: social refresh, ARN->region, profileArn body patch |
-| `translate/eventstream.rs` | AWS vnd.amazon.eventstream binary frame decoder |
-| `translate/kiro.rs` | anthropic<->conversationState; frames -> OpenAI SSE; sha1/uuidv5 |
+| `providers.rs` | URL + auth headers per provider/account (API keys only; sync) |
 | `translate/` | anthropic↔openai (request + streaming response), SSE parser, `<think>` filter |
 | `translate/responses.rs` | OpenAI Responses API (codex) ↔ chat completions, streaming incl. |
 | `translate/aggregate.rs` | SSE stream → complete JSON body (the `force_stream` re-assembly) |
@@ -133,8 +130,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   exceeds 10s — agents have their own retry logic, fail fast for them. Switching candidates
   still never sleeps (litellm rule).
 - **Pre-first-event stream commit (added 2026-08-25)**: a 200 on a streaming request is not
-  a commitment. The response is held until the first complete SSE event (kiro: first decoded
-  frame output); EOF/transport error/bare `[DONE]` before that → model-scoped cooldown +
+  a commitment. The response is held until the first complete SSE event;
+  EOF/transport error/bare `[DONE]` before that → model-scoped cooldown +
   failover, invisible to the client (held bytes are prepended on commit). An error-shaped
   first event is classified by its embedded status via the normal ladder, so a 400-class
   error still passes through raw. Deadline 10s: past it pxy commits and streams as-is
@@ -157,8 +154,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 140 tests: `cargo test` (incl. real-capture kiro eventstream fixtures and integration
-  tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
+- 171 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
@@ -187,18 +183,14 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   is a REAL claude-provider model and stripping it would hand the subscription's ids
   to whichever provider sorts first). `pxy launch claude` sets
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 → in-session /model switching across
-  all providers. claude-oauth refresh now also takes an flock on a sibling .lock file
-  (libc dep, approved); sqlite opens carry a 5s busy_timeout so CLI reads never abort
+  all providers. sqlite opens carry a 5s busy_timeout so CLI reads never abort
   on a busy daemon. From inside any agent: "@@usage" for quota.
 - **Feature round from docs/09 audit (2026-08-26)**:
-  - **`claude` provider** (`kind = "claude-oauth"`, providers/claude.rs): real Anthropic
-    subscription inference via the Claude Code CLI's own OAuth credential at
-    `~/.claude/.credentials.json` — no login flow in pxy. Rotating refresh tokens:
-    5-min lead, process mutex + staleness re-read, atomic write-back (0600, .bak,
-    foreign keys preserved). Real money per token — NEVER in an auto-routed chain
-    (Saiful's rule), manual selection only. Non-CC clients get the CC system sentinel auto-prepended.
-    Known residual: process-local mutex can't stop a same-second CLI+pxy double
-    refresh (worst case: `claude` re-login; flock would need a libc dep).
+  - ~~**`claude` provider** (`kind = "claude-oauth"`)~~ — **REMOVED 2026-08-31**
+    (see NEXT STEPS §0). It borrowed the Claude Code CLI's own OAuth credential;
+    the subscription is now spent by running `claude` natively, beside pxy. A
+    provider *named* `claude` is still legal as an ordinary Anthropic **Console**
+    API key, and `catalog.resolve` still special-cases the `claude/<id>` mirror.
   - **429 body classification**: window-naming quota text gets a window-sized
     non-retryable cooldown (daily→until provider reset, weekly 4h, monthly 6h,
     credits 1h); header always wins; Gemini transient boilerplate deliberately
@@ -238,8 +230,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - **`drop_params` (added 2026-08-25)**: per-provider and/or per-model list of top-level
   request-body keys the upstream 400s on (`reasoning_effort`, `top_k`, …), removed after
   translation just before the wire — a picky new free provider needs config, not code.
-  `model`/`stream` are pxy's own keys and are ignored if listed; kiro's body_patch
-  merges later and can't be stripped. Like every model fact (tool_call,
+  `model`/`stream` are pxy's own keys and are ignored if listed. Like every model fact (tool_call,
   force_stream, pinned contexts) it lives in config.toml and nothing overwrites it.
 
 **Routing feature round (added 2026-08-30):**
@@ -267,8 +258,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - **Multi-account providers**: `[[providers.X.accounts]]` — each entry has
   `name` ([a-z0-9-], part of the state key), `api_key` or `credentials`, and
   optional per-account `headers` that override the provider's same-named
-  ones. Mutually exclusive with top-level api_key/credentials; claude-oauth
-  has no account dimension (it reads the shared CC credentials file).
+  ones. Mutually exclusive with top-level api_key/credentials.
   `resolve_candidates` expands a bare candidate into per-account candidates
   (config order = fill-first: one account burns before the next starts), so
   the ordinary walk/cooldown machinery works per account unchanged. State
@@ -286,18 +276,14 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   chars ≈ 400 tokens, not 300). The `/v1/messages/count_tokens` endpoint
   inherits the accuracy.
 
-## Provider catalog (31 active)
+## Provider catalog (27 active; 4 OAuth entries removed 2026-08-31)
 
 **Paid subscriptions (already yours):**
-- `github` — Copilot Pro, 300 premium req/month (resets 1st, UTC). `github-free/gpt-5-mini` is
-  the 0x-multiplier model: unlimited, never consumes premium requests.
-  Live quota in `pxy status --remote` via `GET api.github.com/copilot_internal/user`
-  (needs the LONG-LIVED GitHub token, `token <gh>` — not the minted Copilot bearer).
-  ⚠️ pxy's local 300-counter only sees pxy traffic — GitHub's number is authoritative
-  (2026-08-25: GitHub said 89 used vs pxy's 14, the rest was VS Code / pre-pxy).
-  ⚠️ `overage_permitted: true` on the account — premium requests past 300 BILL
-  ($0.04 each); the status line flags it. Disable in github.com → Settings → Copilot
-  if surprise billing is unwanted.
+- ~~`github`~~ / ~~`github-free`~~ — **REMOVED 2026-08-31** (docs/10 §0.2: GitHub
+  ToS-blocked the copilot-gpt4-service proxy and its suspension emails name "use of
+  unsupported clients"; pxy impersonated VS Code). Sanctioned path if ever wanted:
+  Copilot SDK behind your own registered OAuth App. Cost of removal: 300 premium
+  req/month + the unlimited 0x `gpt-5-mini`.
 - `opencode-go` — $10/mo Go plan per account; usage-dollar
   limits $12/5h (rolling), $30/wk, $60/mo, enforced upstream (429 → pxy cooldown +
   account rotation; pxy does no dollar accounting itself). Live utilization:
@@ -319,31 +305,15 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
     (Retested 2026-08-25 evening and 2026-08-26: still 500.)
 
 **Free, renewable:**
-- `kiro` — AWS CodeWhisperer via Kiro (added 2026-08-25, **Phase 3 #3**, the big one:
-  `providers/kiro.rs` + `translate/kiro.rs` + `translate/eventstream.rs`). **KIRO FREE
-  plan: 50 credits/month, resets the 1st**; overage DISABLED + OVERAGE_INCAPABLE, so it
-  cannot bill. Credits scale by `rateMultiplier`, so cheap models go far: qwen3-coder-next
-  0.05x, minimax-m2.1 0.15x, deepseek-3.2/minimax-m2.5 0.25x, haiku-4.5 0.4x, glm-5 0.5x,
-  sonnet-4.5 1.3x (a small haiku call metered 0.005 credits). Tool calling verified
-  streaming + non-streaming. Model ids MUST match ListAvailableModels or Kiro 400s —
-  the account has NO claude-sonnet-5/gpt-5.6 despite OmniRoute's registry listing them.
-  Not in `auto` (scarcest free pool). Usage is ESTIMATED (kiro sends no token counts,
-  only contextUsagePercentage + a credit figure).
-  - **`amazon-q` deliberately NOT added** (checked 2026-08-25): its archived credential is
-    byte-identical to kiro's — same refresh token, same `profileArn`, so the same AWS
-    account and the SAME 50-credit pool. A second provider entry would add zero quota and
-    would actively break accounting by splitting one pool across two counters. Only worth
-    adding if a genuinely separate AWS account is connected.
-  - Kiro's SOCIAL refresh tokens do **not** rotate (verified: the endpoint returns the
-    presented token unchanged, and the pre-existing one still worked after a refresh).
-    The one-time-use warning in docs/06 applies to the AWS SSO-OIDC builder-id path, not
-    this one — so this credential is durable and shouldn't need re-login.
-- `kimi-coding` — Moonshot Kimi coding tier (added 2026-08-25, **Phase 3 #2**, real Rust:
-  `providers/kimi.rs`). Rotating refresh tokens (serialized, persisted to kv BEFORE use —
-  losing one kills the session), 900s access tokens, X-Msh-* device identity, Anthropic
-  native. ⚠️ credits exhausted at activation (masked as bare 500s); NOT in `auto` — retest
-  after quota reset (retested 2026-08-25 evening and 2026-08-26: still 500s, no reset yet).
-  Re-login = curl device flow (see config.example comment).
+- ~~`kiro`~~ — **REMOVED 2026-08-31**: kiro.dev's FAQ prohibits third-party
+  harnesses verbatim (docs/10 §0.2). Cost: the free 50 credits/month.
+  `amazon-q` was already ruled out — same AWS account, same credit pool.
+- ~~`kimi-coding`~~ — **REMOVED 2026-08-31**, but NOT for legality: Moonshot
+  explicitly permits third-party clients via forward proxy. Removed because its
+  credits were dead (bare 500s since activation) and it carried the last of the
+  rotating-refresh machinery. If re-added, it must send an honest `pxy/<version>`
+  UA — the old code forged `kimi-code-cli/0.26.0`, breaking the one rule Moonshot
+  actively screens for.
 - `kilocode` — Kilo Code gateway (added 2026-08-25, **Phase 3 #1 — zero Rust needed**):
   the archived device-flow token is a long-lived JWT (exp ~2031, no refresh), so it's a
   plain bearer + `X-KILOCODE-EDITORNAME` header, with a `cmd` secret extracting the token
@@ -477,6 +447,48 @@ groq + mistral (STT), agnes (images/video).
 
 ## Where we left off — NEXT STEPS
 
+0. **API-KEY-ONLY — OAuth removal DONE 2026-08-31 (branch `remove-oauth-providers`).**
+   Saiful's call: subscriptions are used natively, *beside* pxy, so pxy keeps API-key
+   providers only. `docs/11-api-key-only-roadmap.md` is the queue this opened; it
+   supersedes docs/10's sequencing and CANCELS its Tier 1 (no codex/ChatGPT OAuth path
+   will be built). docs/10 §0.1/§0.2 remain the compliance record for WHY.
+   Removed: `ProviderKind` entirely (claude-oauth / github-copilot / kimi-coding /
+   kiro), `WireFormat::Kiro`, `providers/{claude,copilot,kimi,kiro}.rs`,
+   `translate/{kiro,eventstream}.rs` + its binary fixture, `RefreshLock`,
+   `Secrets::write_pass`, the `credentials_file` config key, and the `x-initiator`
+   plumbing (Copilot billing only). **~2,940 lines net deleted**; `src/providers/`
+   collapsed to a flat `src/providers.rs` (58 lines, sync — it no longer mints
+   anything). Consequences worth knowing:
+   - **pxy holds no rotating credential any more.** Secrets are read-only: nothing is
+     written back to `pass`, no flock, no refresh mutexes, no token kv rows. `libc`
+     stays only for `server.rs` umask.
+   - `WireFormat` is a 2-variant enum, so every `!= Kiro` guard and `unreachable!`
+     arm in router.rs is gone; the non-streaming eventstream branch and
+     `StreamCtx.kiro` with it.
+   - `kind = "..."` is **no longer a provider config key** — a leftover line fails
+     startup (`unknown field kind`), same precedent as the `tier`/`promo` removals.
+     A provider named `claude` is still legal and still special-cased in
+     `catalog.resolve` (the `claude/<id>` discovery mirror): it just has to be an
+     ordinary API-key provider now, which is what an Anthropic **Console** key is.
+   - Cost: Copilot's 300 premium req/month and kiro's 50 free credits/month. Both
+     configs had all four blocks commented out already, so nothing live changed.
+     `pxy doctor` on the real config: 9 providers, 7 credentials, 134 models.
+   - Verified: `cargo test` 171/171, clippy 58 warnings (was 79, none added), real
+     streaming + non-streaming requests in BOTH dialects through a test daemon on
+     :4199 against the live config. Review also caught a PRE-EXISTING dead test:
+     `context_window_400_fails_over_and_skips_smaller_peers` had no `#[tokio::test]`
+     attribute and had never run — attribute added, it passes, hence 171 not 170.
+     (It is not vacuous: `small` and `tiny` deliberately share one mock route so the
+     call counter proves the smaller-window peer was skipped, not merely that the
+     walk reached `big`.)
+   **Next up in docs/11 §8**: the §2 bugs — the live `pxy_web_search` injection guard
+   (offered whenever `stream: true` even with no search provider configured, so the
+   client gets a `tool_use` for a tool it never declared), non-streaming search
+   silently dropped, other server tools silently dropped, `<think>` parsing off by
+   default on most providers, and the `is_object()` panic guard. Then docs/11 §3
+   plumbing (raw single-candidate errors, response headers, `count_tokens`
+   forwarding) and §4.1 `cache_control` injection on the paid Anthropic reserves.
+
 1. **Add more free providers** — research is DONE: see `docs/08-free-provider-candidates.md`.
    Ready-to-use config blocks are already staged (commented) at the bottom of
    `config.example.toml` / `~/.config/pxy/config.toml`. Each needs a signup + a pass entry,
@@ -519,31 +531,15 @@ groq + mistral (STT), agnes (images/video).
      is literally 0); aihubmix `gpt-image-2-free` allows 10 lifetime calls and answers in
      chat shape. Not wired: tencent `hy-3d-*`/tripo 3D (niche — revisit on demand),
      groq has no TTS models on this key.
-3. **Phase 3 — OAuth providers**, one at a time, easiest first (research in docs/06):
-   ~~kilocode~~ (DONE 2026-08-25 — token turned out long-lived, plain config, no Rust) →
-   ~~kiro/amazon-q~~ (kiro DONE 2026-08-25 — see catalog; amazon-q is the same
-   protocol under a different connection, add when wanted) →
-   ~~kimi-coding~~ (DONE 2026-08-25 — `kind = "kimi-coding"` in providers/kimi.rs: serialized
-   rotation-safe refresh persisted to kv, X-Msh-* identity profile, Anthropic endpoint.
-   The archived refresh token was dead; re-logged-in via curl device flow. ⚠️ Account
-   credits currently EXHAUSTED — Kimi masks this as bare 500s on chat/models; auth verified,
-   retest for quota reset before adding k3 to [auto]) → ~~antigravity/agy~~
-   (**DEAD — verified 2026-08-25, do not build**). **Phase 3 is COMPLETE.**
+3. ~~**Phase 3 — OAuth providers**~~ — **ALL REVERSED 2026-08-31.** kilocode, kiro
+   and kimi-coding were built here; kiro and kimi were deleted in the API-key-only
+   round (§0), and kilocode survives because its "OAuth" token is really a
+   long-lived JWT used as a plain bearer. `antigravity/agy` was already **DEAD**
+   (verified 2026-08-25, no code written): its OAuth client lost free-tier access —
+   `loadCodeAssist` returns `UNSUPPORTED_CLIENT` and `streamGenerateContent` 403s
+   `SUBSCRIPTION_REQUIRED`. Free Gemini is covered by the `google` (AI Studio)
+   provider instead. **Do not reopen this phase** — new providers get API keys.
 
-   **antigravity/agy — dead, no code written.** Both archived credentials
-   (`AI/antigravity/saifulapm@gmail.com`, `AI/agy/…`, same project `avid-rex-p83hx`, both
-   labelled "Antigravity Starter Quota" / free-tier) still REFRESH fine — Google refresh
-   tokens don't rotate, so auth was never the problem. The account has simply lost access:
-   - `POST cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` now lists `free-tier`
-     under **ineligibleTiers** with `UNSUPPORTED_CLIENT`: *"This client is no longer
-     supported for Gemini Code Assist for individuals. To continue using Gemini, please
-     migrate to the Antigravity suite of products."* Only paid `standard-tier` is allowed.
-   - `POST …:streamGenerateContent?alt=sse` → **403 SUBSCRIPTION_REQUIRED** ("You do not
-     have a valid license of this product") on BOTH the `ide` and `cli` profiles.
-   Google retired this OAuth client's free path, so the Cloud Code envelope translator
-   (the last hard piece of work in Phase 3) would buy nothing. Re-verify with those two
-   calls BEFORE writing any code if Antigravity ships a new client/API. Free Gemini is
-   already covered by the `google` (AI Studio) provider in `auto`.
 4. **Catalog automation (`pxy refresh`) — REWRITTEN 2026-08-29 (commit e75a49c).**
    `pxy refresh` = dry-run report; `pxy refresh --generate` = write
    `~/.config/pxy/models.toml`.
@@ -626,6 +622,10 @@ groq + mistral (STT), agnes (images/video).
 
 ## Decisions already made (don't relitigate)
 
+- **API keys only (2026-08-31).** No OAuth provider kinds, no borrowed
+  subscription credentials, no token refresh. Subscriptions (Claude, ChatGPT)
+  are used natively, beside pxy. See NEXT STEPS §0 and docs/11; the compliance
+  reasoning is docs/10 §0.1-§0.2. A new provider that needs OAuth is out of scope.
 - Free-first routing: paid subscriptions and balances are reserves, not defaults.
 - No web-cookie/browser providers, ever (that's the Playwright weight pxy exists to shed).
 - No MCP/A2A servers, no dashboard, no multi-tenant quota pools.

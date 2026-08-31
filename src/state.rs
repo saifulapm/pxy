@@ -9,8 +9,9 @@ use std::os::unix::fs::PermissionsExt;
 
 /// Persistent + in-memory runtime state.
 ///
-/// sqlite holds usage counters (surviving restarts), small KV (minted
-/// copilot tokens), and a mirror of the cooldown map — a restart must not
+/// sqlite holds usage counters (surviving restarts), small KV (the route pin,
+/// session affinity, free-quota snapshots), and a mirror of the cooldown map —
+/// a restart must not
 /// forget a six-hour "monthly quota exhausted" cooldown and re-probe every
 /// dead provider (deploys happen mid-day). The map stays authoritative at
 /// runtime (lazy expiry on read, no background timers); sqlite is only read
@@ -78,11 +79,11 @@ impl State {
             std::fs::create_dir_all(dir)?;
         }
         let db = Connection::open(path).context("opening state db")?;
-        // The kv table holds OAuth refresh tokens (kimi/kiro/copilot) — the
-        // same secret class as the 0600 credential files in providers/. sqlite
-        // creates db/-wal/-shm with the ambient umask, which left them 0644 on
-        // disk; tighten all three at every open (idempotent, covers files the
-        // umask fix postdates).
+        // The db records what was asked of which provider and when — traffic
+        // metadata, not for other users on the box. sqlite creates
+        // db/-wal/-shm with the ambient umask, which left them 0644 on disk;
+        // tighten all three at every open (idempotent, covers files the umask
+        // fix postdates).
         for suffix in ["", "-wal", "-shm"] {
             let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
             if p.exists() {

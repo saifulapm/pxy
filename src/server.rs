@@ -19,8 +19,7 @@ use crate::translate::estimate_tokens;
 use crate::usage::current_windows;
 
 pub async fn serve(cfg: Config) -> Result<()> {
-    // Everything this daemon writes is single-user and part of it is secret
-    // (the state db carries OAuth refresh tokens): create files 0600 from the
+    // Everything this daemon writes is single-user: create files 0600 from the
     // start rather than trusting the ambient umask. State::open additionally
     // chmods anything that already exists.
     unsafe { libc::umask(0o077) };
@@ -81,10 +80,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
 fn client_ctx(headers: &HeaderMap) -> ClientContext {
     ClientContext {
-        initiator: headers
-            .get("x-initiator")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from),
         anthropic_beta: headers
             .get("anthropic-beta")
             .and_then(|v| v.to_str().ok())
@@ -792,10 +787,8 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         let fetches = targets.iter().map(|(name, p, url, acct)| {
             let http = &http;
             let secrets = &secrets;
-            let state = &state;
             async move {
-                let (line, body) =
-                    fetch_balance(name, p, url, *acct, secrets, state, http).await;
+                let (line, body) = fetch_balance(name, p, url, *acct, secrets, http).await;
                 (name.clone(), line, body)
             }
         });
@@ -1003,39 +996,8 @@ async fn fetch_balance(
     url: &str,
     acct: Option<&crate::config::Account>,
     secrets: &Secrets,
-    state: &PxyState,
     http: &reqwest::Client,
 ) -> (String, Option<Value>) {
-    // Copilot's quota endpoint wants the long-lived GitHub token, not the
-    // minted Copilot bearer the generic prepare() path would send.
-    if p.kind == crate::config::ProviderKind::GithubCopilot {
-        return match crate::providers::copilot::fetch_quota(name, p, secrets, http).await {
-            Ok(v) => {
-                let prem = &v["quota_snapshots"]["premium_interactions"];
-                if !prem.is_object() {
-                    let line = format!(
-                        "no premium quota (plan: {})",
-                        v["copilot_plan"].as_str().unwrap_or("?")
-                    );
-                    return (line, Some(v));
-                }
-                let line = format!(
-                    "premium {:.1}/{} left ({:.0}%) · resets {}{}",
-                    prem["quota_remaining"].as_f64().unwrap_or(0.0),
-                    prem["entitlement"].as_u64().unwrap_or(0),
-                    prem["percent_remaining"].as_f64().unwrap_or(0.0),
-                    v["quota_reset_date"].as_str().unwrap_or("?"),
-                    if prem["overage_permitted"].as_bool().unwrap_or(false) {
-                        " · ⚠ overage billing ON"
-                    } else {
-                        ""
-                    },
-                );
-                (line, Some(v))
-            }
-            Err(e) => (format!("{e:#}"), None),
-        };
-    }
     // A dedicated billing credential bypasses the chat auth entirely: new-api
     // consoles (aihubmix) answer 401 to the inference key no matter how it is
     // framed, and want their Manage Key raw — no `Bearer`.
@@ -1049,8 +1011,7 @@ async fn fetch_balance(
             req = req.header(k, v);
         }
     } else {
-        let prepared =
-            match crate::providers::prepare(name, p, secrets, state, http, acct).await {
+        let prepared = match crate::providers::prepare(name, p, secrets, acct) {
             Ok(pr) => pr,
             Err(e) => return (format!("credential error: {e:#}"), None),
         };
@@ -1232,7 +1193,7 @@ mod tests {
             r#"
             [server]
             [providers.claude]
-            kind = "claude-oauth"
+            base_url = "https://api.anthropic.com/v1/messages"
             format = "anthropic"
             models = [
               { id = "claude-opus-5", context_length = 1000000 },

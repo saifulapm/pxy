@@ -88,10 +88,6 @@ models = [
   "opencode-go-github/deepseek-v4-flash", # 7,600 / 5h
   "opencode-go-google/mimo-v2.5",         # 30,100 / 5h
   "commandcode/deepseek/deepseek-v4-flash",
-  "github-free/gpt-5-mini",            # 0x multiplier, unlimited floor
-  "claude/claude-sonnet-5",            # Anthropic Pro/Max, 5h window
-  "claude/claude-opus-5",
-  "github/claude-sonnet-4.6",          # 300 premium requests/month — scarcest, so last
 ]
 
 # Real money per token, prepaid balances, and finite grants that do not renew.
@@ -103,8 +99,6 @@ models = [
   "inception/mercury-2",            # 100M-token signup grant, >1000 tok/s diffusion
   "tencent/glm-5.3",
   "alibaba/qwen3.8-max",
-  "kiro/claude-sonnet-4.5",         # Amazon Q free-tier grant
-  "kimi-coding/k3",
   "agentrouter/claude-opus-5",      # prepaid balance that drains
   "gorouter/claude-opus-5",
   "tabitoken/claude-opus-5",
@@ -112,101 +106,7 @@ models = [
 
 [launch]
 model = "free"
-small_model = "github-free/gpt-5-mini"
-
-# ---------------------------------------------------------------------------
-# OAuth providers
-# ---------------------------------------------------------------------------
-
-# Anthropic Claude subscription (Pro/Max) via the local Claude Code CLI's
-# OAuth credential (~/.claude/.credentials.json). pxy reads the file fresh
-# per request and writes refreshed tokens back (rotating refresh tokens, so
-# the write-back is what keeps pxy and the CLI from fighting).
-# RESERVE tier: in [groups.subscription] only — manual selection otherwise
-# ("claude/<model>"). Non-Claude-Code clients get the CC system sentinel
-# prepended automatically (the OAuth endpoint requires it).
-[providers.claude]
-kind = "claude-oauth"
-format = "anthropic"
-discover = false
-headers = { user-agent = "claude-cli/2.1.220 (external, cli)" }
-models = [
-  # Fable/Opus/Sonnet 5 reject non-default temperature/top_p/top_k (400) —
-  # sampling is fixed, reasoning is steered by effort. drop_params handles it.
-  { id = "claude-fable-5", context_length = 1000000, max_output_tokens = 128000, tool_call = true, drop_params = ["temperature", "top_p", "top_k"] },
-  { id = "claude-opus-5", context_length = 1000000, max_output_tokens = 128000, tool_call = true, drop_params = ["temperature", "top_p", "top_k"] },
-  { id = "claude-sonnet-5", context_length = 1000000, max_output_tokens = 128000, tool_call = true, drop_params = ["temperature", "top_p", "top_k"] },
-  { id = "claude-sonnet-4-6", context_length = 1000000, max_output_tokens = 64000, tool_call = true },
-  { id = "claude-haiku-4-5-20251001", context_length = 200000, max_output_tokens = 64000, tool_call = true },
-]
-
-# Copilot Pro (yearly): 300 premium requests/month, resets 1st 00:00 UTC, no
-# rollover. Multipliers: sonnet 1x, haiku 0.33x, gpt-5-mini 0x (see
-# github-free below). pxy counts plain requests, so 300 = sonnet-equivalents
-# (haiku slightly overcounted). Context lengths from the live /models API
-# (max_prompt_tokens governs what fits).
-[providers.github]
-kind = "github-copilot"
-format = "openai"
-# Premium-request quota for `pxy status --remote` (github-free shares the
-# account, so it is declared once here). The fetcher uses the long-lived
-# GitHub token, not the minted Copilot one — the URL is fixed in code.
-balance_url = "https://api.github.com/copilot_internal/user"
-credentials = { pass = "AI/github/main" }
-models = [
-  { id = "claude-sonnet-4.6", context_length = 200000, max_output_tokens = 64000 },
-  { id = "claude-haiku-4.5", context_length = 128000, max_output_tokens = 32000 },
-  { id = "gpt-5.4", context_length = 272000, max_output_tokens = 128000 },
-  { id = "kimi-k2.7-code", context_length = 256000, max_output_tokens = 32000 },
-]
-[providers.github.limits]
-monthly_requests = 300        # premium request allowance (Pro)
-reset = "00:00"
-reset_tz = "UTC"
-
-# ---------------------------------------------------------------------------
-# MULTI-ACCOUNT providers: several subscription accounts behind ONE entry.
-# The walk tries them in config order (fill-first: one account burns before
-# the next starts, which staggers rolling subscription windows). Cooldowns,
-# usage windows and limit enforcement are tracked PER ACCOUNT under the
-# `provider#account` state key — each account gets its own quota buckets,
-# which is what you want for subscriptions. `accounts` is mutually exclusive
-# with top-level api_key/credentials; claude-oauth has no account dimension.
-# x-pxy-provider and the model_usage table keep the BARE provider name.
-#
-# [[providers.opencode-go.accounts]]
-# name = "github"                      # [a-z0-9-], part of the state key
-# api_key = { pass = "AI/oc/go-gh" }
-# [providers.opencode-go.accounts.headers]
-# x-org = "org-123"                    # overrides the provider's same-named header
-# [[providers.opencode-go.accounts]]
-# name = "google"
-# api_key = { pass = "AI/oc/go-g" }
-#
-# REQUEST-SCOPED ERROR RULES: per-provider body overrides that beat the
-# status ladder. FIRST matching rule wins (case-insensitive substring on the
-# upstream error body). Actions:
-#   skip                 — try the next candidate, no cooldown
-#   skip-cooldown        — next candidate + model-scoped retryable cooldown
-#   passthrough          — return the raw error to the client
-#   passthrough-cooldown — raw error to the client AND cool the candidate
-# (The context-window failover carve-out still runs before the rules.)
-#
-# [[providers.agentrouter.errors]]
-# match = "无可用渠道"
-# action = "skip-cooldown"
-# ---------------------------------------------------------------------------
-
-# 0x-multiplier Copilot models: unlimited on paid plans, keep working even
-# after the 300 premium requests are spent. Separate provider so their heavy
-# background use never eats the premium budget in pxy's accounting.
-[providers.github-free]
-kind = "github-copilot"
-format = "openai"
-credentials = { pass = "AI/github/main" }
-models = [
-  { id = "gpt-5-mini", context_length = 128000, max_output_tokens = 64000 },
-]
+small_model = "zai/glm-4.5-flash"
 
 # ---------------------------------------------------------------------------
 # API-key providers (base URLs from OmniRoute registry, docs/06)
@@ -973,59 +873,6 @@ rpm = 40
 #    = 250 req/day, 70K TPM, built-in web search/code-exec; REJECTS external
 #    tools ("tool calling is not supported"), so ask it questions directly.
 #    ~3000 tok/s. No card on the account = hard 429 stop, no billing risk.
-# Kiro (AWS CodeWhisperer) — Phase 3 #3, ACTIVE 2026-08-25. kind = kiro
-# (providers/kiro.rs + translate/kiro.rs): social-login refresh at
-# prod.us-east-1.auth.desktop.kiro.dev, conversationState request bodies, and
-# vnd.amazon.eventstream binary responses decoded back to SSE. base_url and
-# profileArn are derived at runtime from the ARN in the credential, so the
-# region follows the profile automatically.
-# FREE plan: 50 credits/month, resets the 1st (verified via GetUsageLimits).
-# Overage is DISABLED + OVERAGE_INCAPABLE on this account => cannot bill.
-# Model ids MUST match the account's live catalog or Kiro 400s; these came
-# from ListAvailableModels. Credit cost scales with rateMultiplier, so the
-# cheap models go a very long way (qwen3-coder-next 0.05x, minimax-m2.1 0.15x,
-# deepseek-3.2/minimax-m2.5 0.25x, haiku 0.4x, glm-5 0.5x, sonnet-4.5 1.3x).
-# NOT in a group: 50 credits/month is scarcer than every free pool above.
-[providers.kiro]
-kind = "kiro"
-format = "kiro"
-credentials = { pass = "AI/kiro/main" }
-models = [
-  { id = "claude-sonnet-4.5", context_length = 200000, max_output_tokens = 64000 },
-  { id = "claude-haiku-4.5", context_length = 200000, max_output_tokens = 64000 },
-  { id = "qwen3-coder-next", context_length = 256000 },
-  { id = "glm-5", context_length = 200000 },
-  { id = "deepseek-3.2", context_length = 164000 },
-  { id = "minimax-m2.5", context_length = 196000 },
-]
-[providers.kiro.limits]
-monthly_requests = 400        # ~50 credits at the cheap models' multipliers
-reset = "00:00"
-reset_tz = "UTC"
-
-# Kimi coding tier — Phase 3 #2, ACTIVE 2026-08-25 (kind = kimi-coding in
-# providers/kimi.rs). ROTATING refresh tokens: the live credential lives in
-# state.sqlite kv (kimi_token:kimi-coding) after the first refresh; pass holds
-# only the login-time bootstrap + device identity. If state.sqlite is lost, a
-# fresh device-flow login is needed (pxy has no login flow yet — device flow
-# via curl works: POST auth.kimi.com/api/oauth/device_authorization with
-# client_id + X-Msh-* headers, then poll the token endpoint). Speaks Anthropic
-# natively (x-api-key, ?beta=true). Free coding tier: weekly + rolling-window
-# quotas (403s can be EITHER — see docs/06 quota note).
-# STATUS 2026-08-25: account credits EXHAUSTED ("Credits used up" from
-# /coding/v1/usages) — chat + /models return bare 500s while in this state
-# (Kimi's error hygiene is poor). Auth/refresh verified working end-to-end.
-# Keep OUT of the groups until a quota reset makes calls succeed.
-[providers.kimi-coding]
-kind = "kimi-coding"
-format = "anthropic"
-credentials = { pass = "AI/kimi-coding/main" }
-models = [
-  { id = "k3", context_length = 1048576 },
-  { id = "kimi-for-coding", context_length = 262144 },
-  { id = "kimi-for-coding-highspeed", context_length = 262144 },
-]
-
 # Kilo Code gateway — Phase 3 #1, ACTIVE 2026-08-25, and it needed ZERO Rust:
 # the device-flow token archived in pass is a long-lived JWT (exp ~2031, no
 # refresh), so runtime is a plain bearer + the mandatory X-KILOCODE-EDITORNAME

@@ -10,7 +10,7 @@ use anyhow::Result;
 use jiff::Timestamp;
 
 use crate::catalog::Catalog;
-use crate::config::{Config, ProviderKind};
+use crate::config::Config;
 use crate::secrets::Secrets;
 use crate::state::State;
 
@@ -260,32 +260,6 @@ pub async fn doctor(cfg_path: &std::path::Path) -> Result<()> {
         let secrets = Secrets::new();
         let mut resolved = 0u32;
         for (name, p) in cfg.providers.iter().filter(|(_, p)| p.enabled) {
-            if p.kind == ProviderKind::ClaudeOauth {
-                // Same expansion the daemon uses (leading "~/" only): doctor
-                // must probe the exact path the runtime will read.
-                let raw = p
-                    .credentials_file
-                    .clone()
-                    .unwrap_or_else(|| "~/.claude/.credentials.json".into());
-                let path = match raw.strip_prefix("~/") {
-                    Some(rest) => format!(
-                        "{}/{rest}",
-                        std::env::var("HOME").unwrap_or_else(|_| "/".into())
-                    ),
-                    None => raw,
-                };
-                match std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                {
-                    Some(v) if v["claudeAiOauth"]["refreshToken"].is_string() => resolved += 1,
-                    _ => r.fail(
-                        format!("cred {name}").as_str(),
-                        format!("{path} unreadable or not logged in (run `claude`)"),
-                    ),
-                }
-                continue;
-            }
             let sref = p.credentials.as_ref().or(p.api_key.as_ref());
             match sref {
                 None => {} // keyless providers exist (opencode-zen)

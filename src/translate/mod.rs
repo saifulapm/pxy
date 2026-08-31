@@ -2,8 +2,6 @@ pub mod aggregate;
 pub mod anthropic_sanitize;
 pub mod aisdk;
 pub mod anthropic_to_openai;
-pub mod eventstream;
-pub mod kiro;
 pub mod openai_to_anthropic;
 pub mod responses;
 pub mod sse;

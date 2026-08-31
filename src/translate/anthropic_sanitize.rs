@@ -1,6 +1,5 @@
 //! Sanitize an Anthropic-format request body before it reaches an
-//! Anthropic-format upstream (or the kiro conversationState builder, which
-//! consumes the same shape). Every fix here corresponds to a hard 400 from
+//! Anthropic-format upstream. Every fix here corresponds to a hard 400 from
 //! Anthropic's validator, and every one has been produced by a real client:
 //!
 //! - Thinking blocks with an empty/missing signature: Anthropic verifies

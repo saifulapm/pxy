@@ -231,11 +231,7 @@ impl Config {
             }
         }
         for (name, p) in &self.providers {
-            if p.kind == ProviderKind::OpenaiCompat
-                && p.base_url.is_none()
-                && p.embeddings_url.is_none()
-                && p.media.is_none()
-            {
+            if p.base_url.is_none() && p.embeddings_url.is_none() && p.media.is_none() {
                 anyhow::bail!(
                     "provider '{name}': base_url (or embeddings_url / media) is required"
                 );
@@ -262,16 +258,8 @@ impl Config {
                 }
             }
             // Accounts: a separate credential dimension, exclusive with the
-            // top-level credential fields. claude-oauth reads a SHARED
-            // credentials FILE (not a per-account secret ref), so it has no
-            // account dimension yet.
+            // top-level credential fields.
             if !p.accounts.is_empty() {
-                if p.kind == ProviderKind::ClaudeOauth {
-                    anyhow::bail!(
-                        "provider '{name}': accounts are not supported for claude-oauth \
-                         (it reads the Claude Code credentials file, not per-account secrets)"
-                    );
-                }
                 if p.api_key.is_some() || p.credentials.is_some() {
                     anyhow::bail!(
                         "provider '{name}': top-level api_key/credentials are mutually \
@@ -371,8 +359,6 @@ pub enum WireFormat {
     Openai,
     /// Anthropic messages
     Anthropic,
-    /// AWS CodeWhisperer conversationState + vnd.amazon.eventstream
-    Kiro,
 }
 
 impl Default for WireFormat {
@@ -381,28 +367,9 @@ impl Default for WireFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderKind {
-    /// Plain HTTP endpoint with a static credential
-    #[default]
-    OpenaiCompat,
-    /// GitHub Copilot: 2-stage token mint + header profile
-    GithubCopilot,
-    /// Kimi coding tier: rotating refresh tokens + device-id header profile
-    KimiCoding,
-    /// Kiro / Amazon Q: CodeWhisperer conversationState + eventstream
-    Kiro,
-    /// Anthropic Claude subscription via the Claude Code CLI's OAuth
-    /// credential file (rotating refresh tokens, written back to the file)
-    ClaudeOauth,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
-    #[serde(default)]
-    pub kind: ProviderKind,
     /// Wire format of `base_url` (what the upstream speaks)
     #[serde(default)]
     pub format: WireFormat,
@@ -414,12 +381,8 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub embedding_models: Vec<String>,
     pub api_key: Option<SecretRef>,
-    /// OAuth credential blob (JSON in pass) for kinds that need it
+    /// Alternative spelling of `api_key` (a credential blob in pass)
     pub credentials: Option<SecretRef>,
-    /// Path to a credential FILE shared with a local CLI (claude-oauth kind;
-    /// default ~/.claude/.credentials.json). pxy reads it fresh per request
-    /// and writes refreshed tokens back.
-    pub credentials_file: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Header used for the credential. Default: authorization bearer.
@@ -592,14 +555,12 @@ impl ProviderConfig {
     /// Minimal instance for unit tests.
     pub fn test_default() -> Self {
         Self {
-            kind: ProviderKind::default(),
             format: WireFormat::default(),
             base_url: None,
             embeddings_url: None,
             embedding_models: Vec::new(),
             api_key: None,
             credentials: None,
-            credentials_file: None,
             headers: BTreeMap::new(),
             auth_header: AuthHeader::default(),
             models: Vec::new(),
@@ -687,7 +648,7 @@ mod tests {
     }
 
     /// Accounts: exclusive with top-level credentials, unique [a-z0-9-] names,
-    /// each carrying a credential; claude-oauth has no account dimension.
+    /// each carrying a credential.
     #[test]
     fn account_configs_are_validated() {
         let cases = [
@@ -745,20 +706,6 @@ mod tests {
                 name = "a"
                 "#,
                 "needs api_key or credentials",
-            ),
-            (
-                "claude-oauth accounts",
-                r#"
-                [server]
-                [providers.p]
-                kind = "claude-oauth"
-                format = "anthropic"
-                models = ["m"]
-                [[providers.p.accounts]]
-                name = "a"
-                api_key = "k1"
-                "#,
-                "not supported for claude-oauth",
             ),
         ];
         for (name, toml_src, expect) in cases {
@@ -877,7 +824,7 @@ pub struct ModelSpec {
     pub context_length: u64,
     #[serde(default = "default_max_output")]
     pub max_output_tokens: u64,
-    /// Override wire format for this model (e.g. copilot claude models)
+    /// Override wire format for this model (a provider serving both dialects)
     pub format: Option<WireFormat>,
     /// Asserted tool-calling support, skipping discovery. Set this only from a
     /// real verified call.
