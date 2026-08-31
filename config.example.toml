@@ -112,6 +112,12 @@ small_model = "zai/glm-4.5-flash"
 # API-key providers (base URLs from OmniRoute registry, docs/06)
 # ---------------------------------------------------------------------------
 
+# Note: `parse_think_tags` is ON by default (OpenAI-format upstreams only) —
+# most free reasoning models inline chain-of-thought as literal <think> tags,
+# and left unparsed those reach the client as ordinary assistant text and get
+# replayed as history every turn. Set `parse_think_tags = false` to opt a
+# provider out.
+
 # Tencent Cloud TokenHub (international, Singapore node) — OpenAI-compatible
 # gateway. Key from the TokenHub console API Key page; each model must be
 # ACTIVATED in the console Model Gallery first (else 402 "endpoint is
@@ -124,7 +130,6 @@ small_model = "zai/glm-4.5-flash"
 base_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions"
 embeddings_url = "https://tokenhub-intl.tencentcloudmaas.com/v1/embeddings"
 api_key = { pass = "AI/tencent/main" }
-parse_think_tags = true
 models = [
   "hy3",
   "glm-5.3",
@@ -316,7 +321,6 @@ daily_requests = 30
 [providers.opencode-zen]
 base_url = "https://opencode.ai/zen/v1/chat/completions"
 api_key = { pass = "AI/opencode-go/github" }
-parse_think_tags = true
 models = [
   "big-pickle",
   "hy3-free",
@@ -333,7 +337,6 @@ models = [
 # upstream — $12 per 5h window, $30/week, $60/month. Two accounts; pxy's
 # 429+Retry-After cooldown rotates between them automatically.
 [providers.opencode-go-github]
-parse_think_tags = true   # same reasoning models as opencode-zen above
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 # Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
 balance_url = "https://opencode.ai/zen/go/v1/usage"
@@ -356,7 +359,6 @@ models = [
 ]
 
 [providers.opencode-go-google]
-parse_think_tags = true   # same reasoning models as opencode-zen above
 base_url = "https://opencode.ai/zen/go/v1/chat/completions"
 # Dollar-window utilization (5h/weekly/monthly percent) straight from opencode.
 balance_url = "https://opencode.ai/zen/go/v1/usage"
@@ -386,7 +388,6 @@ models = [
 # list below is what GOAT actually serves. Monthly request allowances (plan
 # page) are in the comments; tool calling verified on every id 2026-08-28.
 [providers.commandcode]
-parse_think_tags = true # same reasoning families as opencode above; no-op otherwise
 base_url = "https://api.commandcode.ai/provider/v1/chat/completions"
 # Dollar windows + credits left — the endpoint Command Code's own CLI reads
 # for `/usage`. Undocumented; the provider key authorizes it.
@@ -822,7 +823,6 @@ total_tokens = 100000000
 base_url = "https://integrate.api.nvidia.com/v1/chat/completions"
 embeddings_url = "https://integrate.api.nvidia.com/v1/embeddings"
 api_key = { pass = "AI/nvidia/main" }
-parse_think_tags = true
 drop_params = ["prompt_cache_key"]
 discover = false
 models = [

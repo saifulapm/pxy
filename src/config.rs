@@ -397,8 +397,15 @@ pub struct ProviderConfig {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     /// Extract literal <think>...</think> tags from responses into proper
-    /// reasoning (for models like MiniMax/Qwen that inline CoT as text)
-    #[serde(default)]
+    /// reasoning (for models like MiniMax/Qwen that inline CoT as text).
+    ///
+    /// ON by default, and only ever applied to OpenAI-format upstreams. The
+    /// failure modes are asymmetric: a false negative leaks raw `<think>` tags
+    /// into the client as ordinary assistant text — which is what an agent
+    /// then replays as history, burning context every turn — while a false
+    /// positive merely reclassifies text as reasoning, where clients still
+    /// show it. Opt a provider out with `parse_think_tags = false`.
+    #[serde(default = "default_true")]
     pub parse_think_tags: bool,
     /// Top-level request-body keys this upstream 400s on (e.g.
     /// `reasoning_effort`, `top_k`, `stream_options`); removed after
@@ -567,7 +574,7 @@ impl ProviderConfig {
             limits: None,
             enabled: true,
             timeout_secs: default_timeout(),
-            parse_think_tags: false,
+            parse_think_tags: default_true(),
             drop_params: Vec::new(),
             errors: Vec::new(),
             accounts: Vec::new(),
@@ -645,6 +652,28 @@ mod tests {
         .map_err(|e| e.to_string())
         .and_then(|c| c.validate().map_err(|e| e.to_string()))
         .unwrap();
+    }
+
+    /// `<think>` parsing is ON unless a provider opts out. Most free reasoning
+    /// models inline CoT as literal tags, and leaving it off leaked them into
+    /// the client as assistant text (only 3 of the live providers set it).
+    #[test]
+    fn think_tag_parsing_defaults_on_and_can_be_opted_out() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.silent]
+            base_url = "https://a.example/chat"
+            models = ["m"]
+            [providers.optout]
+            base_url = "https://b.example/chat"
+            models = ["m"]
+            parse_think_tags = false
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.providers["silent"].parse_think_tags, "default must be on");
+        assert!(!cfg.providers["optout"].parse_think_tags, "explicit false must win");
     }
 
     /// Accounts: exclusive with top-level credentials, unique [a-z0-9-] names,

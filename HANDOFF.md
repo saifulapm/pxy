@@ -154,7 +154,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 173 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
+- 174 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
@@ -499,9 +499,16 @@ groq + mistral (STT), agnes (images/video).
      because `responses::request` manufactures a valid object before `handle_chat`
      ever sees the body — so that handler needed its own edge check. All 12
      malformed chat requests now 400 with zero upstream calls.
-   Both have regression tests verified to fail without the fix (173 tests total).
+   - **`<think>` parsing now defaults ON** (OpenAI-format upstreams only, opt out
+     with `parse_think_tags = false`). Only 3 live providers set it, so google,
+     zai, aihubmix, openrouter, kilocode, tokenharbor and inception were leaking
+     literal `<think>` tags into Claude Code as assistant text — which the agent
+     then replays as history, burning context every turn. The failure modes are
+     asymmetric: a false positive only reclassifies text as reasoning, where
+     clients still show it. Redundant `= true` lines dropped from both configs.
+   All three carry regression tests verified to fail without the fix (174 total).
    **Still open in §2**: non-streaming search silently dropped, other server tools
-   silently dropped, `<think>` parsing off by default on most providers. Then
+   silently dropped. Then
    docs/11 §3 plumbing (raw single-candidate errors, response headers,
    `count_tokens` forwarding) and §4.1 `cache_control` injection on the paid
    Anthropic reserves.

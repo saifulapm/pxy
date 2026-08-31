@@ -183,7 +183,7 @@ upstream should **skip that candidate on a multi-candidate walk** (same shape as
 the existing `tool_call = false` rule), and return a real 400 on a
 single-candidate one. Never a silent drop.
 
-### 2.4 `<think>` tags leak into Claude Code as visible text
+### 2.4 `<think>` tags leak into Claude Code as visible text — **FIXED 2026-08-31**
 
 `translate/think.rs` is correct and streaming-safe, but it is opt-in per provider
 (`parse_think_tags`, default `false` at `config.rs:609`) and in the live config
@@ -198,8 +198,13 @@ strictly safer as a default: the filter only fires on a well-formed tag pair, an
 a false positive costs formatting, while a false negative costs the harness's
 whole reasoning display.
 
-Recommendation: **flip the default to on for OpenAI-format upstreams**, keep the
-flag as an escape hatch.
+**Fixed**: the default is now on, still gated to OpenAI-format upstreams, with
+`parse_think_tags = false` as the per-provider opt-out. The failure modes are
+asymmetric, which is what settles it — a false negative leaks raw tags as
+assistant text that the agent then replays as history, burning context every
+turn, while a false positive only reclassifies text as reasoning, where clients
+still display it. The redundant `= true` lines were removed from both configs
+(they implied the others were off) and replaced with one note at the top.
 
 ### 2.5 Kiro's unfiltered tool schema — moot after §0
 
@@ -553,9 +558,9 @@ anything. Fine.
 
 1. ~~**§0 removal.**~~ **DONE 2026-08-31** — four provider kinds deleted,
    `WireFormat` collapsed, `RefreshLock` / `write_pass` / `ProviderKind` gone.
-2. **§2 bugs.** ~~Web-search injection guard (live)~~ DONE, ~~`is_object()`
-   guard~~ DONE (plus the `/v1/responses` edge it exposed). Remaining:
-   non-streaming search, server-tool skip/error, `<think>` default.
+2. **§2 bugs.** ~~Web-search injection guard~~, ~~`is_object()` guard~~ (plus
+   the `/v1/responses` edge it exposed) and ~~`<think>` default~~ all DONE.
+   Remaining: non-streaming search, server-tool skip/error.
 3. **§3 plumbing.** Raw single-candidate errors → response headers →
    `count_tokens` forwarding → `/v1/models` negotiation → structured cooldown
    429 → keepalive.
