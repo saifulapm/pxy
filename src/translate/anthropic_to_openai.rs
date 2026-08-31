@@ -94,12 +94,13 @@ pub fn request(anthropic: &Value) -> Value {
             })
             .collect();
         // web_search is the one server tool pxy can run itself: it comes back
-        // as a real function, and the router intercepts the calls. Only on the
-        // streaming path — that's where the interception lives, and offering a
-        // function nobody will intercept would hand the client a tool_use it
-        // can't execute, which is the bug this whole thing exists to fix.
-        if anthropic["stream"].as_bool().unwrap_or(false)
-            && web_search::plan(anthropic).is_some()
+        // as a real function, and the router intercepts the calls — for a
+        // non-streaming client too, by running the request through the stream
+        // machinery and re-assembling its JSON. Whether pxy can actually
+        // serve it (search provider configured, upstream format) is the
+        // router's call: attempt() strips the function whenever nothing would
+        // intercept it, so injecting on the dialect evidence alone is safe.
+        if web_search::plan(anthropic).is_some()
             && !mapped.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)
         {
             mapped.insert(0, web_search::tool_def());
@@ -713,15 +714,19 @@ mod tests {
         );
     }
 
-    /// Non-streaming requests don't get the function: the interception that
-    /// makes it work lives on the streaming path only.
+    /// Non-streaming requests get the function too: the router runs them
+    /// through the stream machinery and re-assembles the JSON, so search
+    /// works either way. (It also strips the tool when it can't serve it.)
     #[test]
-    fn web_search_is_not_offered_without_streaming() {
+    fn web_search_is_offered_without_streaming() {
         let req = json!({
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
         });
-        assert!(request(&req)["tools"].is_null());
+        assert_eq!(
+            request(&req)["tools"][0]["function"]["name"],
+            web_search::TOOL_NAME
+        );
     }
 
     /// A replayed turn carries pxy's own search blocks back. The upstream has

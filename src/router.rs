@@ -316,17 +316,47 @@ pub async fn handle_chat(
         + estimate_tokens(&payload["system"])
         + estimate_tokens(&payload["tools"]);
     let wants_tools = payload["tools"].as_array().is_some_and(|a| !a.is_empty());
+    let server_tools = openai_unservable_server_tools(&payload);
 
     let mut skipped: Vec<String> = Vec::new();
     let multi = candidates.len() > 1;
+
+    // A single-candidate request bound for an OpenAI upstream with server
+    // tools pxy can't translate gets an honest 400 up front: the translator
+    // would drop the tools silently, and the upstream can't answer for what
+    // it never saw. Multi-candidate walks skip such candidates instead
+    // (check_candidate) — an Anthropic-format peer can serve them natively.
+    if !multi && !server_tools.is_empty() {
+        let cand = &candidates[0];
+        let openai_bound = app
+            .cfg
+            .providers
+            .get(&cand.provider)
+            .is_some_and(|p| cand.format(p) == WireFormat::Openai);
+        if openai_bound {
+            return error_outcome(
+                client_format,
+                400,
+                "invalid_request_error",
+                &format!(
+                    "server tool(s) {} cannot be served: '{}' speaks the OpenAI protocol and \
+                     pxy cannot run them",
+                    server_tools.join(", "),
+                    cand.full_id()
+                ),
+            );
+        }
+    }
     // Set when an upstream 400s with a context-window error: our chars/4
     // estimate under-counted, so every candidate at that context size or
     // below would fail identically — skip them instead of burning calls.
     let mut ctx_too_small: Option<u64> = None;
-    // Sticky across walks: ANY non-context obstacle (cooldown, rpm, limits,
-    // a 429/5xx attempt…) means the terminal error must stay retryable —
-    // only when context was the sole problem is a 400 the honest answer.
+    // Sticky across walks: ANY non-deterministic obstacle (cooldown, rpm,
+    // limits, a 429/5xx attempt…) means the terminal error must stay
+    // retryable — only when context size or unservable server tools were the
+    // sole problem is a 400 the honest answer.
     let mut other_failures = false;
+    let mut server_tool_skips = false;
     // Newest real upstream error of the walk (status, body, candidate).
     let mut last_raw: Option<RawError> = None;
 
@@ -338,12 +368,22 @@ pub async fn handle_chat(
                 skipped.push(format!("{}: context window too small", cand.full_id()));
                 continue;
             }
-            if let Err(reason) = check_candidate(&app, cand, input_estimate, wants_tools, multi) {
+            if let Err(reason) = check_candidate(
+                &app,
+                cand,
+                input_estimate,
+                wants_tools,
+                !server_tools.is_empty(),
+                multi,
+            ) {
                 saw_rpm_limit |= reason == "rpm limit";
-                // Filter reasons for context start with "context"; everything
-                // else (cooldown/rpm/limits/disabled) is a non-context
+                // Filter reasons for context start with "context", the
+                // server-tool skip with "server tools" — both deterministic.
+                // Everything else (cooldown/rpm/limits/disabled) is an
                 // obstacle a later retry might clear.
-                other_failures |= !reason.starts_with("context");
+                server_tool_skips |= reason.starts_with("server tools");
+                other_failures |=
+                    !(reason.starts_with("context") || reason.starts_with("server tools"));
                 skipped.push(format!("{}: {reason}", cand.full_id()));
                 continue;
             }
@@ -417,6 +457,22 @@ pub async fn handle_chat(
             &format!(
                 "input exceeds the context window of every available candidate for '{requested}' \
                  (tried/skipped: {})",
+                skipped.join("; ")
+            ),
+        );
+    }
+    // Same honesty rule for server tools: when every candidate was skipped
+    // because none can serve the declared server tools, retrying can't fix
+    // the request — a 429 would just make the client back off pointlessly.
+    if server_tool_skips && !other_failures {
+        return error_outcome(
+            client_format,
+            400,
+            "invalid_request_error",
+            &format!(
+                "request declares server tool(s) {} that no available candidate for '{requested}' \
+                 can serve (tried/skipped: {})",
+                server_tools.join(", "),
                 skipped.join("; ")
             ),
         );
@@ -646,6 +702,7 @@ fn check_candidate(
     cand: &Candidate,
     input_estimate: u64,
     wants_tools: bool,
+    unservable_server_tools: bool,
     multi_candidate: bool,
 ) -> Result<(), String> {
     let provider = match app.cfg.providers.get(&cand.provider) {
@@ -660,6 +717,17 @@ fn check_candidate(
     // rather than synthesizing a retryable 429 for a deterministic no.
     if multi_candidate && wants_tools && cand.model.tool_call == Some(false) {
         return Err("model cannot tool-call".into());
+    }
+
+    // Declared server tools pxy cannot fulfil on an OpenAI upstream are a
+    // deterministic no there too (docs/11 §2.3): the translator would drop
+    // them SILENTLY, which is worse than skipping the candidate — the model
+    // would answer without capabilities the harness is built around. Unlike
+    // the tool_call rule, single-candidate is NOT exempt (handle_chat 400s it
+    // before the walk): the drop happens in pxy's own translation, so the
+    // upstream never gets to answer for itself.
+    if multi_candidate && unservable_server_tools && cand.format(provider) == WireFormat::Openai {
+        return Err("server tools unsupported on this upstream".into());
     }
 
     // Single-candidate requests skip the cooldown filter (litellm's
@@ -783,10 +851,30 @@ async fn try_candidate(
         crate::translate::anthropic_sanitize::sanitize(&mut body);
     }
     body["model"] = json!(cand.model.id);
+
+    // The hosted web_search tool: pxy runs it for OpenAI upstreams, which have
+    // no hosted tools of their own. Whoever built the body decided that —
+    // anthropic_to_openai for Claude Code's server tool, responses for
+    // `codex --search` — so the marker is the injected function itself.
+    //
+    // Those translators inject on their own dialect's evidence; only here is
+    // it known whether pxy can actually SERVE the call: the interception
+    // lives entirely in StreamCtx, so it needs an OpenAI upstream and a
+    // configured search provider. A non-streaming client is served by
+    // streaming upstream anyway (force_stream below) and re-assembling its
+    // JSON from the translated stream — docs/11 §2.2, a non-streaming turn
+    // must not silently lose the search it asked for.
+    let has_search_tool = body["tools"]
+        .as_array()
+        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME));
+    let search_served = has_search_tool
+        && upstream_format == WireFormat::Openai
+        && !app.cfg.search.providers.is_empty();
+
     // force_stream: the upstream misbehaves without `stream: true` on this
-    // model, so stream upstream regardless and re-assemble JSON for a
-    // non-streaming client.
-    let force_stream = !stream && cand.model.force_stream;
+    // model — or a served web_search needs the stream machinery — so stream
+    // upstream regardless and re-assemble JSON for a non-streaming client.
+    let force_stream = !stream && (cand.model.force_stream || search_served);
     if force_stream {
         body["stream"] = json!(true);
     }
@@ -855,28 +943,11 @@ async fn try_candidate(
         }
     }
 
-    // The hosted web_search tool: pxy runs it for OpenAI upstreams, which have
-    // no hosted tools of their own. Whoever built the body decided that —
-    // anthropic_to_openai for Claude Code's server tool, responses for
-    // `codex --search` — so the marker is the injected function itself.
-    // Built before the send so the follow-up call replays this exact request
-    // with the results appended.
-    //
-    // Those translators inject on their own dialect's evidence; only here is
-    // it known whether pxy can actually SERVE the call — the interception
-    // lives entirely in StreamCtx, so it needs an OpenAI upstream, a
-    // configured search provider, and a genuinely streaming turn (force_stream
-    // re-assembles the body instead and never runs the loop). This is the one
-    // place that sees all three, so it is also the place that must enforce the
-    // invariant: the tool reaches the wire only if pxy will intercept it.
-    let has_search_tool = body["tools"]
-        .as_array()
-        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME));
-    let search = (has_search_tool
-        && stream
-        && upstream_format == WireFormat::Openai
-        && !app.cfg.search.providers.is_empty())
-    .then(|| SearchLoop {
+    // The search loop's replay request: built before the send so the
+    // follow-up call replays this exact request with the results appended.
+    // The tool reaches the wire only if pxy will intercept it — that is the
+    // invariant this site enforces (the strip below is its other half).
+    let search = search_served.then(|| SearchLoop {
         filter: SearchCallFilter::default(),
         uses_left: web_search::plan(payload).map_or(web_search::DEFAULT_MAX_USES, |p| p.max_uses),
         url: prepared.url.clone(),
@@ -981,11 +1052,11 @@ async fn try_candidate(
     // last of your quota" headers, and that cooldown must survive it.
     check_quota_exhaustion(&app.state, &cand.state_provider(), resp.headers());
     record_free_allowance(&app.state, &cand.state_provider(), resp.headers());
-    if !stream {
+    if !stream && search.is_none() {
         info!(candidate = %cand.full_id(), stream, "routed");
     }
 
-    if stream {
+    if stream || search.is_some() {
         // A 200 status is not a commitment yet: hold the response until the
         // upstream produces a real first event, so a stream that dies before
         // saying anything fails over instead of reaching the client truncated.
@@ -1005,7 +1076,11 @@ async fn try_candidate(
         )
         .await
         {
-            Ok(outcome) => AttemptResult::Done(outcome),
+            Ok(outcome) if stream => AttemptResult::Done(outcome),
+            // Non-streaming client whose web_search pxy is serving: the loop
+            // ran inside the stream machinery; re-assemble the client
+            // dialect's JSON from the translated stream.
+            Ok(outcome) => AttemptResult::Done(collect_stream_json(outcome, client_format).await),
             Err(StreamFailure::ErrorEvent(data)) => {
                 // The stream's first event was the real error: classify it
                 // exactly like an HTTP error status would have been, so a
@@ -1715,6 +1790,34 @@ fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
     v.to_string()
 }
 
+/// Anthropic server / Anthropic-defined tools pxy cannot represent on an
+/// OpenAI upstream: entries with a dated `type` and no `input_schema` (their
+/// schemas live server-side, so the translator's function mapping has nothing
+/// to send — code_execution_*, bash_*, text_editor_*, computer_*).
+/// web_search is excluded: pxy substitutes a real function and serves it.
+/// Anthropic-format upstreams are unaffected — the tools pass through and the
+/// upstream answers for itself.
+fn openai_unservable_server_tools(payload: &Value) -> Vec<String> {
+    payload["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| !t["input_schema"].is_object())
+        .filter(|t| {
+            t["type"]
+                .as_str()
+                .is_some_and(|ty| ty != "function" && ty != "custom" && !ty.starts_with("web_search"))
+        })
+        .map(|t| {
+            t["name"]
+                .as_str()
+                .or_else(|| t["type"].as_str())
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect()
+}
+
 /// Tool names the request declared, in either dialect's shape. None when the
 /// request has no tools (extraction must not run — `<tool_call>` in a
 /// toolless chat is content, not protocol).
@@ -2347,6 +2450,33 @@ async fn stream_outcome(
         body: axum::body::Body::from_stream(head.chain(rest)),
         headers: fwd_headers,
     })
+}
+
+/// Drain a translated client stream into the equivalent non-streaming JSON
+/// body. Used when a non-streaming request had to run through the streaming
+/// machinery anyway — a served web_search, whose interception and
+/// continuation live in StreamCtx. The stream is already in the CLIENT
+/// dialect, so the aggregation is too (unlike force_stream's, which
+/// re-assembles the raw upstream dialect).
+async fn collect_stream_json(outcome: Outcome, client_format: ClientFormat) -> Outcome {
+    let Outcome::Stream { provider, body, headers } = outcome else { return outcome };
+    let mut parser = SseParser::new();
+    let mut events = Vec::new();
+    let mut data = body.into_data_stream();
+    while let Some(chunk) = data.next().await {
+        match chunk {
+            Ok(b) => events.extend(parser.feed(&b)),
+            // The stream layer already terminated the turn as cleanly as it
+            // could (stall deadline, finish()); aggregate what arrived.
+            Err(_) => break,
+        }
+    }
+    events.extend(parser.feed(b"\n\n"));
+    let body = match client_format {
+        ClientFormat::Openai => crate::translate::aggregate::openai(&events),
+        ClientFormat::Anthropic => crate::translate::aggregate::anthropic(&events),
+    };
+    Outcome::Json { status: 200, body, provider: Some(provider), headers }
 }
 
 /// Non-streaming: move `<think>` spans in every choice's message.content
@@ -3941,6 +4071,294 @@ mod tests {
             "pxy_web_search must be offered when a search provider IS configured: {:?}",
             last["tools"]
         );
+    }
+
+    /// docs/11 §2.2: a NON-streaming turn that asks for web search must not
+    /// silently lose it. With a search provider configured, pxy streams
+    /// upstream anyway (the interception lives in the stream machinery) and
+    /// re-assembles the client dialect's JSON — so the upstream must see
+    /// `stream: true` plus the injected function, and the client must get an
+    /// ordinary JSON message back.
+    #[tokio::test]
+    async fn non_streaming_web_search_is_served_via_the_stream_machinery() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    let sse = concat!(
+                        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,",
+                        "\"delta\":{\"content\":\"sunny\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},",
+                        "\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,",
+                        "\"completion_tokens\":2}}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                [[search.providers]]
+                name = "brave"
+                kind = "brave"
+                api_key = "k"
+                "#
+            ),
+            "nonstream_search",
+        );
+        let payload = json!({
+            "model": "free",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, body, .. } = out else {
+            panic!("non-streaming client must get JSON back");
+        };
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], "message", "{body}");
+        assert_eq!(body["content"][0]["text"], "sunny", "{body}");
+        assert_eq!(body["stop_reason"], "end_turn", "{body}");
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["stream"], true, "must stream upstream to run the loop");
+        assert!(
+            bodies[0]["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)),
+            "the search function must be offered on a non-streaming turn too: {:?}",
+            bodies[0]["tools"]
+        );
+    }
+
+    /// The §2.1 guard, non-streaming edition: with NO search provider the
+    /// tool is stripped and the request stays an ordinary JSON round-trip —
+    /// it must not be forced through the stream machinery for a tool pxy
+    /// isn't going to serve.
+    #[tokio::test]
+    async fn non_streaming_web_search_without_provider_stays_plain_json() {
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({
+                        "id": "x",
+                        "choices": [{"index": 0, "message": {"role": "assistant",
+                                    "content": "dry"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+                    }))
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                "#
+            ),
+            "nonstream_search_off",
+        );
+        let payload = json!({
+            "model": "free",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "Read", "input_schema": {"type": "object", "properties": {}}},
+            ],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
+        assert_eq!(status, 200);
+        assert_eq!(body["content"][0]["text"], "dry", "{body}");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0]["stream"].is_null(), "must not stream upstream: {}", bodies[0]);
+        let tools = bodies[0]["tools"].as_array().unwrap();
+        assert!(!tools.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME));
+        assert!(tools.iter().any(|t| t["function"]["name"] == "Read"));
+    }
+
+    /// docs/11 §2.3: declared server tools pxy can't translate (code_execution
+    /// et al) must never be silently dropped. On a multi-candidate walk the
+    /// OpenAI-format candidate is skipped WITHOUT an upstream call, and the
+    /// Anthropic-format peer receives the tools intact.
+    #[tokio::test]
+    async fn server_tools_skip_openai_candidates_and_pass_through_to_anthropic() {
+        use axum::routing::post;
+        let oa_calls = Arc::new(std::sync::Mutex::new(0u32));
+        let oa = oa_calls.clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new()
+            .route(
+                "/oa",
+                post(move |_body: axum::Json<Value>| {
+                    let oa = oa.clone();
+                    async move {
+                        *oa.lock().unwrap() += 1;
+                        axum::Json(json!({"choices": []}))
+                    }
+                }),
+            )
+            .route(
+                "/anthropic",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({
+                            "id": "m1", "type": "message", "role": "assistant",
+                            "model": "big", "content": [{"type": "text", "text": "ran it"}],
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 5, "output_tokens": 2},
+                        }))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.free]
+                base_url = "{base}/oa"
+                models = ["small"]
+                [providers.paid]
+                base_url = "{base}/anthropic"
+                format = "anthropic"
+                models = ["big"]
+                [groups.auto]
+                models = ["free/small", "paid/big"]
+                "#
+            ),
+            "server_tool_walk",
+        );
+        let payload = json!({
+            "model": "auto",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "run this"}],
+            "tools": [
+                {"type": "code_execution_20250522", "name": "code_execution"},
+                {"name": "Read", "input_schema": {"type": "object", "properties": {}}},
+            ],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, body, provider, .. } = out else { panic!("expected JSON") };
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(provider.as_deref(), Some("paid/big"));
+        assert_eq!(*oa_calls.lock().unwrap(), 0, "the OpenAI candidate must be pre-filtered");
+        let bodies = seen.lock().unwrap();
+        assert!(
+            bodies[0]["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "code_execution_20250522")),
+            "the server tool must reach the Anthropic upstream intact: {:?}",
+            bodies[0]["tools"]
+        );
+    }
+
+    /// §2.3's other half: a single-candidate request bound for an OpenAI
+    /// upstream gets an honest 400 (no upstream call), and a walk where NO
+    /// candidate can serve the tools ends 400, not a retryable 429.
+    #[tokio::test]
+    async fn server_tools_unservable_everywhere_return_400() {
+        use axum::routing::post;
+        let calls = Arc::new(std::sync::Mutex::new(0u32));
+        let c = calls.clone();
+        let router = axum::Router::new().route(
+            "/oa",
+            post(move |_body: axum::Json<Value>| {
+                let c = c.clone();
+                async move {
+                    *c.lock().unwrap() += 1;
+                    axum::Json(json!({"choices": []}))
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/oa"
+                models = ["m1"]
+                [providers.b]
+                base_url = "{base}/oa"
+                models = ["m2"]
+                [groups.auto]
+                models = ["a/m1", "b/m2"]
+                "#
+            ),
+            "server_tool_400",
+        );
+        let tools = json!([
+            {"type": "computer_20250124", "name": "computer",
+             "display_width_px": 1024, "display_height_px": 768},
+        ]);
+        // Single candidate: explicit model.
+        let payload = json!({
+            "model": "a/m1", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "click"}],
+            "tools": tools,
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
+        assert_eq!(status, 400, "{body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains("computer"), "{body}");
+
+        // Whole walk unservable: still a 400, not a back-off-and-retry 429.
+        let payload = json!({
+            "model": "auto", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "click"}],
+            "tools": tools,
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
+        assert_eq!(status, 400, "a deterministic no must not read as rate limiting: {body}");
+        assert_eq!(*calls.lock().unwrap(), 0, "no upstream call may be spent on it");
     }
 
     #[tokio::test]
