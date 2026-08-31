@@ -490,13 +490,81 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
     resp
 }
 
-/// Local estimate over EVERY block type (docs/04: counting only text broke
-/// Claude Code auto-compaction).
-async fn count_tokens(Json(payload): Json<Value>) -> Json<Value> {
+/// Claude Code drives auto-compaction off this number, so it is answered by
+/// the real tokenizer whenever the routed upstream has one: when the first
+/// viable candidate speaks the Anthropic protocol, the request is forwarded
+/// to its `…/count_tokens` endpoint (docs/11 §3.4). OpenAI-format upstreams
+/// have no such endpoint, so they keep the local estimate over EVERY block
+/// type (docs/04: counting only text broke Claude Code auto-compaction).
+async fn count_tokens(
+    State(app): State<SharedApp>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Some(resp) = forward_count_tokens(&app, &headers, &payload).await {
+        return resp;
+    }
     let tokens = estimate_tokens(&payload["messages"])
         + estimate_tokens(&payload["system"])
         + estimate_tokens(&payload["tools"]);
-    Json(json!({"input_tokens": tokens.max(1)}))
+    Json(json!({"input_tokens": tokens.max(1)})).into_response()
+}
+
+/// The forwarded path. None falls back to the local estimate — an OpenAI
+/// target, a bad model id, a network or upstream failure: a count must never
+/// fail a request the real call might still serve.
+async fn forward_count_tokens(
+    app: &SharedApp,
+    headers: &HeaderMap,
+    payload: &Value,
+) -> Option<Response> {
+    if !payload.is_object() {
+        return None;
+    }
+    let requested = payload["model"]
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| app.cfg.default_route());
+    // Same resolution a real request gets (pin included): the number should
+    // predict what the routed call will meter, so ask the walk's head.
+    let candidates =
+        router::resolve_candidates(&app.catalog, &app.cfg, &app.state, &requested, None);
+    let cand = candidates.first()?;
+    let pc = app.cfg.providers.get(&cand.provider).filter(|p| p.enabled)?;
+    if cand.format(pc) != crate::config::WireFormat::Anthropic {
+        return None;
+    }
+    let account = cand.account.as_ref().and_then(|n| pc.accounts.iter().find(|a| &a.name == n));
+    let prepared = crate::providers::prepare(&cand.provider, pc, &app.secrets, account).ok()?;
+    let url = format!("{}/count_tokens", prepared.url.trim_end_matches('/'));
+    let mut body = payload.clone();
+    body["model"] = json!(cand.model.id);
+    // Same choke-point repair as a real send: count_tokens validates history
+    // exactly like messages does.
+    crate::translate::anthropic_sanitize::sanitize(&mut body);
+    let mut req = app
+        .http
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .header("content-type", "application/json");
+    for (k, v) in &prepared.headers {
+        req = req.header(k, v);
+    }
+    if !prepared.headers.iter().any(|(k, _)| k == "anthropic-version") {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+    if let Some(beta) = headers.get("anthropic-beta") {
+        req = req.header("anthropic-beta", beta);
+    }
+    let resp = req.json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    // Only relay the shape the client can read; anything else falls back.
+    v["input_tokens"].as_u64()?;
+    Some(Json(v).into_response())
 }
 
 /// codex identifies itself with an `originator` header — `codex_cli_rs` in the
@@ -584,6 +652,17 @@ fn codex_models(app: &SharedApp) -> Json<Value> {
     Json(json!({"models": models}))
 }
 
+/// An Anthropic-dialect client (docs/11 §3.4): Claude Code sends its
+/// `anthropic-version` header on discovery, and its UA names the CLI. Both
+/// references negotiate on exactly these two signals.
+fn is_anthropic_client(headers: &HeaderMap) -> bool {
+    headers.contains_key("anthropic-version")
+        || headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ua| ua.starts_with("claude-cli"))
+}
+
 /// Must answer fast: Claude Code's gateway discovery times out at 3s.
 async fn models(State(app): State<SharedApp>, headers: HeaderMap) -> Json<Value> {
     if is_codex(&headers) {
@@ -649,6 +728,36 @@ async fn models(State(app): State<SharedApp>, headers: HeaderMap) -> Json<Value>
         extra.push(v);
     }
     data.extend(extra);
+    // Anthropic-dialect clients get the Anthropic list shape — the one the
+    // real /v1/models answers with, and the one their SDKs parse natively.
+    // (It worked OpenAI-shaped only because Claude Code's discovery schema is
+    // loose.) Same ids, same order; `context_length`/`max_output_tokens` ride
+    // along as extra fields for readers that want them.
+    if is_anthropic_client(&headers) {
+        let data: Vec<Value> = data
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "type": "model",
+                    "id": m["id"],
+                    "display_name": m["display_name"],
+                    "created_at": Timestamp::from_second(m["created"].as_i64().unwrap_or(0))
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                    "context_length": m["context_length"],
+                    "max_output_tokens": m["max_output_tokens"],
+                })
+            })
+            .collect();
+        let first_id = data.first().map(|m| m["id"].clone()).unwrap_or(Value::Null);
+        let last_id = data.last().map(|m| m["id"].clone()).unwrap_or(Value::Null);
+        return Json(json!({
+            "data": data,
+            "has_more": false,
+            "first_id": first_id,
+            "last_id": last_id,
+        }));
+    }
     Json(json!({"object": "list", "data": data}))
 }
 
@@ -1292,6 +1401,105 @@ mod tests {
             );
         }
         h
+    }
+
+    fn test_app(cfg_toml: &str, name: &str) -> SharedApp {
+        let cfg: Config = toml::from_str(cfg_toml).unwrap();
+        let catalog = Catalog::from_config(&cfg);
+        let dir = std::env::temp_dir().join(format!("pxy-server-it-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(App {
+            catalog,
+            secrets: Secrets::new(),
+            state: PxyState::open(&dir.join("s.sqlite")).unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        })
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// docs/11 §3.4: count_tokens forwards to an Anthropic-format upstream's
+    /// real tokenizer (Claude Code drives auto-compaction off this number) and
+    /// keeps the local estimate for OpenAI-format targets and on any failure.
+    #[tokio::test]
+    async fn count_tokens_forwards_to_anthropic_upstreams_only() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/v1/messages/count_tokens",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                assert_eq!(body["model"], "big", "model must be the resolved upstream id");
+                Json(json!({"input_tokens": 4242}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.paid]
+                base_url = "http://{addr}/v1/messages"
+                format = "anthropic"
+                api_key = "k"
+                models = ["big"]
+                [providers.free]
+                base_url = "http://{addr}/chat"
+                models = ["small"]
+                "#
+            ),
+            "count_tokens",
+        );
+        let payload = json!({
+            "model": "paid/big",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let out = count_tokens(State(app.clone()), HeaderMap::new(), Json(payload)).await;
+        assert_eq!(body_json(out).await["input_tokens"], 4242);
+
+        // OpenAI-format target: the local estimate answers.
+        let payload = json!({
+            "model": "free/small",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let out = count_tokens(State(app.clone()), HeaderMap::new(), Json(payload)).await;
+        let v = body_json(out).await;
+        assert!(v["input_tokens"].as_u64().is_some_and(|n| n > 0 && n < 100), "{v}");
+    }
+
+    /// docs/11 §3.4: /v1/models negotiates on the caller's dialect. An
+    /// Anthropic client (anthropic-version header or claude-cli UA) gets the
+    /// Anthropic list shape; everyone else keeps the OpenAI list.
+    #[tokio::test]
+    async fn models_listing_negotiates_the_anthropic_shape() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.zai]
+            base_url = "https://z.example/chat"
+            models = [{ id = "glm", context_length = 128000 }]
+            "#,
+            "models_negotiation",
+        );
+        let out = models(State(app.clone()), headers(&[("anthropic-version", "2023-06-01")])).await;
+        assert!(out.0["object"].is_null(), "anthropic shape has no object field: {}", out.0);
+        assert_eq!(out.0["has_more"], false);
+        let entry = &out.0["data"][0];
+        assert_eq!(entry["type"], "model");
+        assert!(entry["display_name"].is_string());
+        assert!(entry["created_at"].is_string());
+        assert_eq!(out.0["first_id"], out.0["data"][0]["id"]);
+
+        let out = models(State(app.clone()), headers(&[("user-agent", "claude-cli/2.0.1 (external, cli)")])).await;
+        assert_eq!(out.0["data"][0]["type"], "model", "claude-cli UA negotiates too");
+
+        let out = models(State(app), HeaderMap::new()).await;
+        assert_eq!(out.0["object"], "list", "other clients keep the OpenAI shape");
+        assert_eq!(out.0["data"][0]["object"], "model");
     }
 
     #[test]

@@ -486,15 +486,30 @@ pub async fn handle_chat(
     if !multi && let Some(e) = last_raw {
         return passthrough_json(client_format, e.status, &e.body, &e.candidate, e.headers);
     }
-    error_outcome(
+    // Structured, not just prose (docs/11 §3.5): when the earliest recovery
+    // is known — a cooldown that will expire — the client gets `Retry-After`
+    // plus machine-readable reset fields, so its own backoff can wait exactly
+    // that long instead of guessing. A harness can act on a number; it cannot
+    // act on a sentence.
+    let mut body = error_body(
         client_format,
-        429,
         "overloaded_error",
         &format!(
             "no provider available for '{requested}' (tried/skipped: {})",
             skipped.join("; ")
         ),
-    )
+    );
+    let mut headers: Headers = Vec::new();
+    if let Some(wait) = soonest_cooldown_end(&app, &candidates) {
+        let secs = wait.as_secs().max(1);
+        headers.push(("retry-after".into(), secs.to_string()));
+        body["error"]["code"] = json!("model_cooldown");
+        body["error"]["reset_seconds"] = json!(secs);
+        if let Ok(at) = Timestamp::from_second(Timestamp::now().as_second() + secs as i64) {
+            body["error"]["reset_time"] = json!(at.to_string());
+        }
+    }
+    Outcome::Json { status: 429, body, provider: None, headers }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +691,19 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 fn soonest_recovery(app: &App, candidates: &[Candidate]) -> Option<Duration> {
     candidates
         .iter()
-        .filter_map(|c| app.state.recovery_wait(&c.provider, &c.model.id))
+        // state_provider, not provider: multi-account cooldowns live under
+        // `provider#account` keys, and reading the bare name missed them.
+        .filter_map(|c| app.state.recovery_wait(&c.state_provider(), &c.model.id))
+        .min()
+}
+
+/// The Retry-After hint for the terminal 429: soonest moment ANY candidate's
+/// cooldowns (retryable or not) will have expired. None when nothing is
+/// cooling — then the walk failed for reasons no wait fixes.
+fn soonest_cooldown_end(app: &App, candidates: &[Candidate]) -> Option<Duration> {
+    candidates
+        .iter()
+        .filter_map(|c| app.state.cooldown_remaining(&c.state_provider(), &c.model.id))
         .min()
 }
 
@@ -4359,6 +4386,48 @@ mod tests {
         let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
         assert_eq!(status, 400, "a deterministic no must not read as rate limiting: {body}");
         assert_eq!(*calls.lock().unwrap(), 0, "no upstream call may be spent on it");
+    }
+
+    /// docs/11 §3.5: when every candidate is cooling, the terminal 429 must
+    /// carry machine-readable recovery info — Retry-After plus reset fields —
+    /// not just prose. A harness can act on a number, not on a sentence.
+    /// Non-retryable cooldowns count too: a drained daily tier expires at
+    /// reset, and that is exactly what the client should be told to wait for.
+    #[tokio::test]
+    async fn exhausted_walk_answers_a_structured_cooldown_429() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.a]
+            base_url = "http://127.0.0.1:1/a"
+            models = ["m1"]
+            [providers.b]
+            base_url = "http://127.0.0.1:1/b"
+            models = ["m2"]
+            [groups.free]
+            models = ["a/m1", "b/m2"]
+            "#,
+            "structured_429",
+        );
+        // A drained daily tier (non-retryable) and a long model cooldown:
+        // neither is recoverable inside the request, both expire eventually.
+        app.state.set_cooldown("a", None, Some(Duration::from_secs(300)), false, "daily quota");
+        app.state.set_cooldown("b", Some("m2"), Some(Duration::from_secs(600)), true, "429");
+        let payload = json!({
+            "model": "free",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, body, headers, .. } = out else { panic!("expected JSON") };
+        assert_eq!(status, 429, "{body}");
+        assert_eq!(body["error"]["code"], "model_cooldown", "{body}");
+        let secs = body["error"]["reset_seconds"].as_u64().expect("reset_seconds");
+        assert!((290..=300).contains(&secs), "soonest recovery is a's 300s, got {secs}");
+        assert!(body["error"]["reset_time"].as_str().is_some_and(|t| t.contains('T')), "{body}");
+        let ra = headers.iter().find(|(k, _)| k == "retry-after").expect("retry-after header");
+        assert_eq!(ra.1, secs.to_string());
     }
 
     #[tokio::test]

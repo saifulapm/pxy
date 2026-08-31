@@ -452,6 +452,27 @@ impl State {
         wait
     }
 
+    /// Remaining wait until this pair's cooldowns (either scope) expire,
+    /// INCLUDING non-retryable ones. Unlike `recovery_wait` this is a report,
+    /// not an eligibility promise: it feeds the terminal 429's Retry-After,
+    /// and a drained daily tier (non-retryable, expires at reset) is exactly
+    /// what the client should be told to wait for. Even a dead key's ladder
+    /// cooldown is honest here — it is when pxy itself would re-attempt.
+    pub fn cooldown_remaining(&self, provider: &str, model: &str) -> Option<Duration> {
+        let map = self.cooldowns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let mut wait: Option<Duration> = None;
+        for key in [provider.to_string(), Self::cooldown_key(provider, Some(model))] {
+            let Some(cd) = map.get(&key) else { continue };
+            if cd.until <= now {
+                continue;
+            }
+            let rem = cd.until.saturating_duration_since(now);
+            wait = Some(wait.map_or(rem, |w| w.max(rem)));
+        }
+        wait
+    }
+
     /// Everything currently cooling down (for the @@usage report).
     pub fn active_cooldowns(&self) -> Vec<(String, Cooldown)> {
         let map = self.cooldowns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
