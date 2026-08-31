@@ -119,14 +119,30 @@ fn client_agent(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Relay the upstream's headers, then pxy's own on top. Order matters: pxy's
+/// values describe the response pxy is actually writing, so they must win any
+/// name collision. `forwardable_headers` has already dropped the ones that
+/// would misdescribe this connection.
+fn apply_upstream_headers(resp: &mut Response, headers: Vec<(String, String)>) {
+    use axum::http::header::{HeaderName, HeaderValue};
+    for (k, v) in headers {
+        if let (Ok(name), Ok(value)) =
+            (k.parse::<HeaderName>(), HeaderValue::from_str(&v))
+        {
+            resp.headers_mut().insert(name, value);
+        }
+    }
+}
+
 fn outcome_response(outcome: Outcome, client_format: ClientFormat) -> Response {
     match outcome {
-        Outcome::Json { status, body, provider } => {
+        Outcome::Json { status, body, provider, headers } => {
             let mut resp = (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 Json(body),
             )
                 .into_response();
+            apply_upstream_headers(&mut resp, headers);
             if let Some(p) = provider {
                 if let Ok(v) = p.parse() {
                     resp.headers_mut().insert("x-pxy-provider", v);
@@ -134,19 +150,26 @@ fn outcome_response(outcome: Outcome, client_format: ClientFormat) -> Response {
             }
             resp
         }
-        Outcome::Stream { provider, body } => {
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/event-stream")
-                .header("cache-control", "no-cache")
-                .header("connection", "keep-alive");
-            if let Ok(v) = provider.parse::<axum::http::HeaderValue>() {
-                builder = builder.header("x-pxy-provider", v);
-            }
+        Outcome::Stream { provider, body, headers } => {
+            let builder = Response::builder().status(StatusCode::OK);
             let _ = client_format;
-            builder.body(body).unwrap_or_else(|_| {
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })
+            let mut resp = match builder.body(body) {
+                Ok(r) => r,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            apply_upstream_headers(&mut resp, headers);
+            // pxy owns the framing of the stream it is writing.
+            for (k, v) in [
+                ("content-type", "text/event-stream"),
+                ("cache-control", "no-cache"),
+                ("connection", "keep-alive"),
+            ] {
+                resp.headers_mut().insert(k, axum::http::HeaderValue::from_static(v));
+            }
+            if let Ok(v) = provider.parse::<axum::http::HeaderValue>() {
+                resp.headers_mut().insert("x-pxy-provider", v);
+            }
+            resp
         }
     }
 }
@@ -195,15 +218,18 @@ async fn responses(
     let chat_payload = crate::translate::responses::request(&payload);
     let outcome = router::handle_chat(app, ClientFormat::Openai, chat_payload, ctx).await;
     match outcome {
-        Outcome::Json { status, body, provider } => {
+        Outcome::Json { status, body, provider, headers } => {
             let body = if status == 200 {
                 crate::translate::responses::response(&body, provider.as_deref().unwrap_or(&model))
             } else {
                 body
             };
-            outcome_response(Outcome::Json { status, body, provider }, ClientFormat::Openai)
+            outcome_response(
+                Outcome::Json { status, body, provider, headers },
+                ClientFormat::Openai,
+            )
         }
-        Outcome::Stream { provider, body } => {
+        Outcome::Stream { provider, body, headers } => {
             let state = crate::translate::responses::StreamState::new(Timestamp::now().as_second());
             let parser = crate::translate::sse::SseParser::new();
             let upstream = body.into_data_stream();
@@ -238,7 +264,11 @@ async fn responses(
                 },
             );
             outcome_response(
-                Outcome::Stream { provider, body: axum::body::Body::from_stream(stream) },
+                Outcome::Stream {
+                    provider,
+                    body: axum::body::Body::from_stream(stream),
+                    headers,
+                },
                 ClientFormat::Openai,
             )
         }
@@ -264,11 +294,14 @@ async fn ai_language_model(
     let chat_payload = crate::translate::aisdk::request(&payload, &model, stream);
     let outcome = router::handle_chat(app, ClientFormat::Openai, chat_payload, ctx).await;
     match outcome {
-        Outcome::Json { status, body, provider } => {
+        Outcome::Json { status, body, provider, headers } => {
             let body = if status == 200 { crate::translate::aisdk::response(&body) } else { body };
-            outcome_response(Outcome::Json { status, body, provider }, ClientFormat::Openai)
+            outcome_response(
+                Outcome::Json { status, body, provider, headers },
+                ClientFormat::Openai,
+            )
         }
-        Outcome::Stream { provider, body } => {
+        Outcome::Stream { provider, body, headers } => {
             let state = crate::translate::aisdk::StreamState::new(&model);
             let parser = crate::translate::sse::SseParser::new();
             let upstream = body.into_data_stream();
@@ -303,7 +336,11 @@ async fn ai_language_model(
                 },
             );
             outcome_response(
-                Outcome::Stream { provider, body: axum::body::Body::from_stream(stream) },
+                Outcome::Stream {
+                    provider,
+                    body: axum::body::Body::from_stream(stream),
+                    headers,
+                },
                 ClientFormat::Openai,
             )
         }

@@ -154,7 +154,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 175 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
+- 176 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
@@ -527,7 +527,21 @@ groq + mistral (STT), agnes (images/video).
      don't reduce to one). Verified live: an explicit model with a dead key
      answers `401 Unauthorized` where it used to answer a synthetic 429.
      `auth_failure_never_retried` updated exactly as docs/10 predicted.
-   All four carry regression tests verified to fail without the fix (175 total).
+   - **docs/11 §3.2: upstream response headers are now relayed.** `Outcome` had
+     no header field, so it was structurally impossible for one to reach the
+     client — `retry-after` and the `x-ratelimit-*`/`anthropic-ratelimit-*`
+     families included, which is exactly what a harness's own backoff reads.
+     Captured once in `attempt()` before the body is consumed, relayed on all
+     three real-upstream paths (non-streaming, streaming, error passthrough —
+     including §3.1's terminal error, so a single-candidate 429 now carries its
+     `retry-after`). pxy's own headers apply last and win collisions.
+     Dropped: the hop-by-hop/entity set (litellm's list), the gateway-telemetry
+     prefixes `x-litellm-`/`helicone-`/`x-portkey-`/`cf-aig-`/`x-kong-`/`x-bt-`
+     (CLIProxyAPI strips these because Claude Code's telemetry reads them to
+     detect a gateway), and — found by live testing, not in either reference —
+     `set-cookie`/`alt-svc`/`strict-transport-security`, which describe pxy's
+     connection to the UPSTREAM rather than the loopback response pxy writes.
+   All five carry regression tests verified to fail without the fix (176 total).
    **Still open in §2**: non-streaming search silently dropped, other server tools
    silently dropped. Then the rest of docs/11 §3 (response headers,
    `count_tokens` forwarding, `/v1/models` negotiation) and §4.1 `cache_control`

@@ -55,11 +55,85 @@ pub enum Outcome {
         status: u16,
         body: Value,
         provider: Option<String>,
+        /// Upstream response headers to relay (see `forwardable_headers`).
+        headers: Headers,
     },
     Stream {
         provider: String,
         body: axum::body::Body,
+        headers: Headers,
     },
+}
+
+/// Relayed upstream response headers, in wire order.
+pub type Headers = Vec<(String, String)>;
+
+/// Everything classification and passthrough need about a failed upstream
+/// response, taken from that one response so they cannot drift apart.
+struct UpstreamError {
+    status: u16,
+    retry_after: Option<Duration>,
+    body: String,
+    headers: Headers,
+}
+
+/// The newest real upstream error seen during a walk, kept so that an
+/// exhausted single-candidate walk can answer with the upstream's own
+/// response instead of a synthetic one.
+struct RawError {
+    status: u16,
+    body: String,
+    candidate: String,
+    headers: Headers,
+}
+
+/// The upstream response headers that are safe and useful to hand the client.
+///
+/// Dropped: hop-by-hop and entity headers, which describe pxy's connection to
+/// the UPSTREAM and would misdescribe the one pxy is writing (litellm's
+/// exclusion set); and AI-gateway telemetry prefixes, which Claude Code's own
+/// telemetry inspects to detect that it is talking through a gateway
+/// (CLIProxyAPI strips the same list, for the same reason).
+///
+/// Everything else is forwarded verbatim, which is the entire point:
+/// `retry-after` and the `x-ratelimit-*`/`anthropic-ratelimit-*` families are
+/// what a harness's own backoff and limit UI read. pxy dropping them is why
+/// agents fight pxy's retry timing instead of the upstream's.
+fn forwardable_headers(h: &reqwest::header::HeaderMap) -> Headers {
+    const DROP: &[&str] = &[
+        "transfer-encoding",
+        "content-encoding",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "server",
+        "date",
+        // pxy writes its own on the response it builds.
+        "content-type",
+        // pxy owns this one; an upstream value would name the wrong hop.
+        "x-pxy-provider",
+        // These describe pxy's connection to the UPSTREAM host, not the
+        // loopback one pxy is answering on, so relaying them is at best noise
+        // and at worst misleading: a session cookie for the upstream handed to
+        // a local agent that is not a browser and will never use it, an
+        // alternative-service advert for a host the client is not talking to,
+        // and a transport-security policy for a different origin.
+        "set-cookie",
+        "set-cookie2",
+        "alt-svc",
+        "strict-transport-security",
+    ];
+    const DROP_PREFIX: &[&str] =
+        &["x-litellm-", "helicone-", "x-portkey-", "cf-aig-", "x-kong-", "x-bt-"];
+    h.iter()
+        .filter(|(k, _)| {
+            let n = k.as_str();
+            !DROP.contains(&n) && !DROP_PREFIX.iter().any(|p| n.starts_with(p))
+        })
+        // Non-UTF8 header values cannot be relayed safely; there are none in
+        // practice and dropping one is better than mangling it.
+        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+        .collect()
 }
 
 /// kv key holding the route pin, set from `pxy route` / the desktop panel.
@@ -254,7 +328,7 @@ pub async fn handle_chat(
     // only when context was the sole problem is a 400 the honest answer.
     let mut other_failures = false;
     // Newest real upstream error of the walk (status, body, candidate).
-    let mut last_raw: Option<(u16, String, String)> = None;
+    let mut last_raw: Option<RawError> = None;
 
     for attempt in 0..=MAX_RETRIES {
         skipped.clear();
@@ -293,13 +367,14 @@ pub async fn handle_chat(
                     app.state.model_result(&cand.state_provider(), &cand.model.id, false);
                     skipped.push(format!("{}: {reason}", cand.full_id()));
                 }
-                AttemptResult::SkipRaw { reason, status, body } => {
+                AttemptResult::SkipRaw { reason, status, body, headers } => {
                     warn!(candidate = %cand.full_id(), %reason, "failover");
                     other_failures = true;
                     app.state.model_result(&cand.state_provider(), &cand.model.id, false);
                     // Keep the newest upstream error: if the walk ends with
                     // nothing better, this is what the client should see.
-                    last_raw = Some((status, body, cand.full_id()));
+                    last_raw =
+                        Some(RawError { status, body, candidate: cand.full_id(), headers });
                     skipped.push(format!("{}: {reason}", cand.full_id()));
                 }
                 AttemptResult::SkipContextWindow(reason) => {
@@ -352,8 +427,8 @@ pub async fn handle_chat(
     // at 5pm" with a synthetic overloaded_error throws away the only thing its
     // limit UI and status-specific retry logic can act on. A multi-candidate
     // walk keeps the aggregate below: N different failures don't reduce to one.
-    if !multi && let Some((status, body, id)) = last_raw {
-        return passthrough_json(client_format, status, &body, &id);
+    if !multi && let Some(e) = last_raw {
+        return passthrough_json(client_format, e.status, &e.body, &e.candidate, e.headers);
     }
     error_outcome(
         client_format,
@@ -476,7 +551,12 @@ fn usage_outcome(report: String, client_format: ClientFormat, stream: bool) -> O
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }),
         };
-        return Outcome::Json { status: 200, body, provider: Some("pxy".into()) };
+        return Outcome::Json {
+            status: 200,
+            body,
+            provider: Some("pxy".into()),
+            headers: Vec::new(),
+        };
     }
     let sse = match client_format {
         ClientFormat::Anthropic => {
@@ -520,7 +600,11 @@ fn usage_outcome(report: String, client_format: ClientFormat, stream: bool) -> O
             )
         }
     };
-    Outcome::Stream { provider: "pxy".into(), body: axum::body::Body::from(sse) }
+    Outcome::Stream {
+        provider: "pxy".into(),
+        body: axum::body::Body::from(sse),
+        headers: Vec::new(),
+    }
 }
 
 /// Extra full-chain walks after the first one fails (3 walks total).
@@ -661,7 +745,7 @@ enum AttemptResult {
     /// the upstream's OWN answer instead of a synthetic one: Claude Code reads
     /// "usage limit reached, resets at …" out of that body, and its
     /// status-specific retry logic keys off the real type.
-    SkipRaw { reason: String, status: u16, body: String },
+    SkipRaw { reason: String, status: u16, body: String, headers: Headers },
     /// Upstream 400'd because the input exceeds THIS model's real context
     /// window (our estimate under-counted): skip it and every candidate
     /// with the same or smaller window, no cooldown.
@@ -872,10 +956,21 @@ async fn try_candidate(
     };
 
     let status = resp.status().as_u16();
+    // Captured before the body is consumed; relayed on success, on a raw error
+    // passthrough, and on the terminal error of an exhausted single-candidate
+    // walk — `retry-after` and the rate-limit families are what the client's
+    // own backoff reads.
+    let fwd_headers = forwardable_headers(resp.headers());
     if status >= 400 {
         let retry_after = parse_retry_after(resp.headers());
         let err_body = resp.text().await.unwrap_or_default();
-        return classify_error(app, cand, client_format, status, retry_after, err_body, multi);
+        return classify_error(
+            app,
+            cand,
+            client_format,
+            UpstreamError { status, retry_after, body: err_body, headers: fwd_headers },
+            multi,
+        );
     }
 
     // Success: count the request now; tokens follow when usage is known.
@@ -904,6 +999,9 @@ async fn try_candidate(
             input_estimate,
             tool_names,
             search,
+            // Cloned: the pre-first-event error path below still needs them to
+            // relay `retry-after` on a stream that died before committing.
+            fwd_headers.clone(),
         )
         .await
         {
@@ -915,7 +1013,18 @@ async fn try_candidate(
                 // becoming a retry storm plus a synthetic 429.
                 match error_event_status(&data) {
                     Some(status) => {
-                        classify_error(app, cand, client_format, status, None, data, multi)
+                        classify_error(
+                            app,
+                            cand,
+                            client_format,
+                            UpstreamError {
+                                status,
+                                retry_after: None,
+                                body: data,
+                                headers: fwd_headers,
+                            },
+                            multi,
+                        )
                     }
                     None => {
                         app.state.set_cooldown(
@@ -1012,6 +1121,7 @@ async fn try_candidate(
             status: 200,
             body: client_body,
             provider: Some(cand.full_id()),
+            headers: fwd_headers,
         })
     }
 }
@@ -1131,11 +1241,10 @@ fn classify_error(
     app: &App,
     cand: &Candidate,
     client_format: ClientFormat,
-    status: u16,
-    retry_after: Option<Duration>,
-    err_body: String,
+    err: UpstreamError,
     multi: bool,
 ) -> AttemptResult {
+    let UpstreamError { status, retry_after, body: err_body, headers: fwd_headers } = err;
     // Context-window 400s fail over on multi-candidate walks: the estimate
     // under-counted for THIS model, but larger-window candidates further
     // down the chain can still serve the request. Single-model requests
@@ -1175,11 +1284,11 @@ fn classify_error(
                 AttemptResult::Skip(reason)
             }
             ErrorAction::Passthrough => {
-                passthrough_outcome(client_format, status, &err_body, &cand.full_id())
+                passthrough_outcome(client_format, status, &err_body, &cand.full_id(), fwd_headers)
             }
             ErrorAction::PassthroughCooldown => {
                 cool();
-                passthrough_outcome(client_format, status, &err_body, &cand.full_id())
+                passthrough_outcome(client_format, status, &err_body, &cand.full_id(), fwd_headers)
             }
         };
     }
@@ -1225,9 +1334,10 @@ fn classify_error(
             reason: format!("{status}: {}", truncate(&err_body, 200)),
             status,
             body: err_body,
+            headers: fwd_headers,
         };
     }
-    passthrough_outcome(client_format, status, &err_body, &cand.full_id())
+    passthrough_outcome(client_format, status, &err_body, &cand.full_id(), fwd_headers)
 }
 
 /// Return the upstream error to the client unmodified (the upstream's JSON
@@ -1242,14 +1352,11 @@ fn passthrough_json(
     status: u16,
     err_body: &str,
     full_id: &str,
+    headers: Headers,
 ) -> Outcome {
     let body = serde_json::from_str::<Value>(err_body)
         .unwrap_or_else(|_| error_body(client_format, "api_error", &truncate(err_body, 500)));
-    Outcome::Json {
-        status,
-        body,
-        provider: Some(full_id.to_string()),
-    }
+    Outcome::Json { status, body, provider: Some(full_id.to_string()), headers }
 }
 
 fn passthrough_outcome(
@@ -1257,8 +1364,9 @@ fn passthrough_outcome(
     status: u16,
     err_body: &str,
     full_id: &str,
+    headers: Headers,
 ) -> AttemptResult {
-    AttemptResult::Fatal(passthrough_json(client_format, status, err_body, full_id))
+    AttemptResult::Fatal(passthrough_json(client_format, status, err_body, full_id, headers))
 }
 
 /// kv key holding a provider's last-seen rolling-allowance snapshot.
@@ -2118,6 +2226,7 @@ async fn stream_outcome(
     input_estimate: u64,
     tool_names: Option<std::collections::HashSet<String>>,
     search: Option<SearchLoop>,
+    fwd_headers: Headers,
 ) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
@@ -2236,6 +2345,7 @@ async fn stream_outcome(
     Ok(Outcome::Stream {
         provider: cand.full_id(),
         body: axum::body::Body::from_stream(head.chain(rest)),
+        headers: fwd_headers,
     })
 }
 
@@ -2370,6 +2480,8 @@ fn error_outcome(format: ClientFormat, status: u16, etype: &str, message: &str) 
         status,
         body: error_body(format, etype, message),
         provider: None,
+        // pxy's own answer: there is no upstream response to relay from.
+        headers: Vec::new(),
     }
 }
 
@@ -2977,7 +3089,7 @@ mod tests {
         let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
             .await;
         match out {
-            Outcome::Stream { provider, body } => {
+            Outcome::Stream { provider, body, .. } => {
                 assert_eq!(provider, "b/m");
                 let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
                 let text = String::from_utf8_lossy(&bytes);
@@ -3237,7 +3349,7 @@ mod tests {
         match handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
             .await
         {
-            Outcome::Json { status, body, provider } => {
+            Outcome::Json { status, body, provider, .. } => {
                 assert_eq!(status, 200);
                 assert_eq!(provider.as_deref(), Some("pxy"));
                 assert!(body["content"][0]["text"].as_str().unwrap().contains("pxy usage"));
@@ -3248,7 +3360,7 @@ mod tests {
         let payload = json!({"model": "free", "stream": true,
             "messages": [{"role": "user", "content": "@@usage"}]});
         match handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await {
-            Outcome::Stream { provider, body } => {
+            Outcome::Stream { provider, body, .. } => {
                 assert_eq!(provider, "pxy");
                 let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
                 let text = String::from_utf8_lossy(&bytes);
@@ -3534,6 +3646,83 @@ mod tests {
     /// Multi-account: the candidate walk IS the account walk. Account "gh"
     /// 401s (auth = account-wide cooldown under `sub#gh`), so account "g"
     /// serves; the bare provider name still reports `sub/m` for the panels.
+    /// docs/11 §3.2: `Outcome` had no header field at all, so it was
+    /// structurally impossible for an upstream header to reach the client —
+    /// `retry-after` and the rate-limit families included, which is what a
+    /// harness's own backoff reads. They must now be relayed, minus the
+    /// hop-by-hop/entity set (which describes pxy's connection to the upstream,
+    /// not the one pxy is writing) and the gateway-telemetry prefixes.
+    #[tokio::test]
+    async fn upstream_headers_are_relayed_except_the_excluded_set() {
+        use axum::response::IntoResponse;
+        let router = axum::Router::new().route(
+            "/m",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [
+                        // Must survive — the client acts on these.
+                        ("retry-after", "42"),
+                        ("anthropic-ratelimit-unified-reset", "2026-09-01T00:00:00Z"),
+                        ("x-ratelimit-remaining-requests", "0"),
+                        ("request-id", "req_abc123"),
+                        // Must be dropped: describes the upstream hop.
+                        ("connection", "close"),
+                        // Must be dropped: Claude Code's telemetry reads these
+                        // to detect it is behind a gateway.
+                        ("x-litellm-version", "1.2.3"),
+                        ("helicone-id", "h-1"),
+                        // Must be dropped: upstream-connection state, useless
+                        // and misleading to a local agent.
+                        ("set-cookie", "sid=abc; Path=/"),
+                        ("alt-svc", r#"h3=":443""#),
+                    ],
+                    r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+                )
+                    .into_response()
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.only]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "hdr_relay",
+        );
+
+        let payload = json!({"model": "only/m", "messages": [{"role": "user", "content": "hi"}]});
+        let out =
+            handle_chat(app, ClientFormat::Anthropic, payload, ClientContext::default()).await;
+        let Outcome::Json { status, headers, .. } = out else { panic!("expected json") };
+        assert_eq!(status, 429);
+        let got: std::collections::HashMap<String, String> = headers.into_iter().collect();
+
+        for k in [
+            "retry-after",
+            "anthropic-ratelimit-unified-reset",
+            "x-ratelimit-remaining-requests",
+            "request-id",
+        ] {
+            assert!(got.contains_key(k), "{k} must be relayed; got {got:?}");
+        }
+        assert_eq!(got.get("retry-after").map(String::as_str), Some("42"));
+        for k in [
+            "connection",
+            "x-litellm-version",
+            "helicone-id",
+            "content-length",
+            "set-cookie",
+            "alt-svc",
+        ] {
+            assert!(!got.contains_key(k), "{k} must NOT be relayed; got {got:?}");
+        }
+    }
+
     /// The docs/10 "worst bug": a single-candidate walk replaced the upstream's
     /// real error with a synthetic 429 overloaded_error, so Claude Code's
     /// "usage limit reached, resets at ..." UI never saw the body it reads.
@@ -3886,7 +4075,7 @@ mod tests {
         let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
             .await;
         match out {
-            Outcome::Json { status, body, provider } => {
+            Outcome::Json { status, body, provider, .. } => {
                 assert_eq!(status, 200, "must fail over to the larger window: {body}");
                 assert_eq!(provider.as_deref(), Some("big/m"));
             }

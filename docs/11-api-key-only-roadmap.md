@@ -263,7 +263,7 @@ chars inside a prose string. Generalize the existing `multi && status == 404`
 carve-out to the whole ladder. Test `auth_failure_never_retried`
 (`router.rs:3203-3242`) locks in current behavior and must change with it.
 
-### 3.2 Forward upstream response headers (docs/10 §2.2)
+### 3.2 Forward upstream response headers — **FIXED 2026-08-31**
 
 `Outcome` (`router.rs:55-65`) has no header field, so it is structurally
 impossible for any upstream header to reach the client. Add the map; forward
@@ -276,6 +276,20 @@ Code's telemetry detects those and reports the gateway type.
 
 `retry-after` and `x-ratelimit-*` reaching the client are what let a harness's
 own backoff work instead of fighting pxy's.
+
+**Fixed.** `Outcome` gained a `headers` field on both variants, captured once in
+`attempt()` before the body is consumed and relayed on all three paths that have
+a real upstream response: non-streaming success, streaming success, and error
+passthrough — including the §3.1 terminal error, so an exhausted single-candidate
+walk now delivers the upstream's `retry-after` alongside its real status.
+pxy's own headers are applied last so they win any name collision.
+
+Beyond the two reference exclusion lists, live testing showed three more headers
+that describe **pxy's connection to the upstream** rather than the loopback
+response pxy is writing, so they are dropped too: `set-cookie` (a session cookie
+for the upstream, handed to a local agent that is not a browser),
+`alt-svc` (an HTTP/3 advert for a host the client is not talking to) and
+`strict-transport-security` (a policy for a different origin).
 
 ### 3.3 Generalize passive quota-header observation
 
@@ -581,7 +595,7 @@ anything. Fine.
 2. **§2 bugs.** ~~Web-search injection guard~~, ~~`is_object()` guard~~ (plus
    the `/v1/responses` edge it exposed) and ~~`<think>` default~~ all DONE.
    Remaining: non-streaming search, server-tool skip/error.
-3. **§3 plumbing.** Raw single-candidate errors → response headers →
+3. **§3 plumbing.** ~~Raw single-candidate errors~~, ~~response headers~~ DONE →
    `count_tokens` forwarding → `/v1/models` negotiation → structured cooldown
    429 → keepalive.
 4. **§4.1 cache_control injection** on the paid Anthropic reserves, gated on the
