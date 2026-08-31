@@ -253,6 +253,8 @@ pub async fn handle_chat(
     // a 429/5xx attempt…) means the terminal error must stay retryable —
     // only when context was the sole problem is a 400 the honest answer.
     let mut other_failures = false;
+    // Newest real upstream error of the walk (status, body, candidate).
+    let mut last_raw: Option<(u16, String, String)> = None;
 
     for attempt in 0..=MAX_RETRIES {
         skipped.clear();
@@ -289,6 +291,15 @@ pub async fn handle_chat(
                     other_failures = true;
                     // A real attempt failed: feed the failure-rate rule.
                     app.state.model_result(&cand.state_provider(), &cand.model.id, false);
+                    skipped.push(format!("{}: {reason}", cand.full_id()));
+                }
+                AttemptResult::SkipRaw { reason, status, body } => {
+                    warn!(candidate = %cand.full_id(), %reason, "failover");
+                    other_failures = true;
+                    app.state.model_result(&cand.state_provider(), &cand.model.id, false);
+                    // Keep the newest upstream error: if the walk ends with
+                    // nothing better, this is what the client should see.
+                    last_raw = Some((status, body, cand.full_id()));
                     skipped.push(format!("{}: {reason}", cand.full_id()));
                 }
                 AttemptResult::SkipContextWindow(reason) => {
@@ -334,6 +345,15 @@ pub async fn handle_chat(
                 skipped.join("; ")
             ),
         );
+    }
+    // The retries are spent and every candidate failed. On a single-candidate
+    // request the upstream's own error IS the story — the client asked for
+    // exactly this model, so replacing a real 429 "usage limit reached, resets
+    // at 5pm" with a synthetic overloaded_error throws away the only thing its
+    // limit UI and status-specific retry logic can act on. A multi-candidate
+    // walk keeps the aggregate below: N different failures don't reduce to one.
+    if !multi && let Some((status, body, id)) = last_raw {
+        return passthrough_json(client_format, status, &body, &id);
     }
     error_outcome(
         client_format,
@@ -636,6 +656,12 @@ enum AttemptResult {
     Done(Outcome),
     /// Retryable/skippable failure: try the next candidate.
     Skip(String),
+    /// Skip, but the upstream answered with a real error. The status and body
+    /// are carried so a walk that ends with nothing better can hand the client
+    /// the upstream's OWN answer instead of a synthetic one: Claude Code reads
+    /// "usage limit reached, resets at …" out of that body, and its
+    /// status-specific retry logic keys off the real type.
+    SkipRaw { reason: String, status: u16, body: String },
     /// Upstream 400'd because the input exceeds THIS model's real context
     /// window (our estimate under-counted): skip it and every candidate
     /// with the same or smaller window, no cooldown.
@@ -1195,7 +1221,11 @@ fn classify_error(
             None => (None, retryable, format!("{status} {reason}")),
         };
         app.state.set_cooldown(&cand.state_provider(), model_scope, wait, retryable, &why);
-        return AttemptResult::Skip(format!("{status}: {}", truncate(&err_body, 200)));
+        return AttemptResult::SkipRaw {
+            reason: format!("{status}: {}", truncate(&err_body, 200)),
+            status,
+            body: err_body,
+        };
     }
     passthrough_outcome(client_format, status, &err_body, &cand.full_id())
 }
@@ -1204,19 +1234,31 @@ fn classify_error(
 /// when it parses, pxy's error shape otherwise). Claude Code's auto-retry
 /// depends on unmodified error bodies — this is also what `passthrough`
 /// error rules resolve to.
+/// The upstream's own error, handed to the client unchanged. Its body is
+/// reused verbatim when it parses as JSON — Claude Code's retry and limit UI
+/// read the real `type`/`message` out of it.
+fn passthrough_json(
+    client_format: ClientFormat,
+    status: u16,
+    err_body: &str,
+    full_id: &str,
+) -> Outcome {
+    let body = serde_json::from_str::<Value>(err_body)
+        .unwrap_or_else(|_| error_body(client_format, "api_error", &truncate(err_body, 500)));
+    Outcome::Json {
+        status,
+        body,
+        provider: Some(full_id.to_string()),
+    }
+}
+
 fn passthrough_outcome(
     client_format: ClientFormat,
     status: u16,
     err_body: &str,
     full_id: &str,
 ) -> AttemptResult {
-    let body = serde_json::from_str::<Value>(err_body)
-        .unwrap_or_else(|_| error_body(client_format, "api_error", &truncate(err_body, 500)));
-    AttemptResult::Fatal(Outcome::Json {
-        status,
-        body,
-        provider: Some(full_id.to_string()),
-    })
+    AttemptResult::Fatal(passthrough_json(client_format, status, err_body, full_id))
 }
 
 /// kv key holding a provider's last-seen rolling-allowance snapshot.
@@ -3102,7 +3144,13 @@ mod tests {
         let payload = json!({"model": "d/m", "messages": [{"role": "user", "content": "hi"}]});
         let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
         match out {
-            Outcome::Json { status, .. } => assert_eq!(status, 429, "synthetic exhaustion"),
+            // The client asked for exactly this model, so it gets the
+            // upstream's own 401 and body — not a synthetic overloaded_error
+            // that hides an invalid key behind "try again later".
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 401, "upstream error must pass through raw");
+                assert_eq!(body["error"]["message"], "invalid api key", "body verbatim: {body}");
+            }
             Outcome::Stream { .. } => panic!("expected json"),
         }
         assert_eq!(seen.load(Ordering::SeqCst), 1, "a dead key must not be re-fired");
@@ -3486,6 +3534,69 @@ mod tests {
     /// Multi-account: the candidate walk IS the account walk. Account "gh"
     /// 401s (auth = account-wide cooldown under `sub#gh`), so account "g"
     /// serves; the bare provider name still reports `sub/m` for the panels.
+    /// The docs/10 "worst bug": a single-candidate walk replaced the upstream's
+    /// real error with a synthetic 429 overloaded_error, so Claude Code's
+    /// "usage limit reached, resets at ..." UI never saw the body it reads.
+    /// The in-request retry must survive (a transient 429 with a near
+    /// Retry-After still recovers) — only the TERMINAL answer changes.
+    #[tokio::test]
+    async fn exhausted_single_candidate_returns_the_real_upstream_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use axum::response::IntoResponse;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        // A quota 429 naming a window: non-retryable, so the walk gives up at
+        // once rather than sleeping on it.
+        let router = axum::Router::new().route(
+            "/limited",
+            axum::routing::post(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have exceeded your daily quota. Resets at 2026-09-01T00:00:00Z"}}"#,
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.only]
+                base_url = "{base}/limited"
+                models = ["m"]
+                "#
+            ),
+            "raw_terminal_error",
+        );
+
+        let payload = json!({"model": "only/m", "messages": [{"role": "user", "content": "hi"}]});
+        let out =
+            handle_chat(app, ClientFormat::Anthropic, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 429, "the upstream's own status");
+                // The whole point: the real type and message survive, so the
+                // client can say WHEN the limit resets.
+                assert_eq!(body["error"]["type"], "rate_limit_error", "got {body}");
+                assert!(
+                    body["error"]["message"].as_str().unwrap_or("").contains("Resets at"),
+                    "reset hint must survive: {body}"
+                );
+                assert!(
+                    !body["error"]["type"].as_str().unwrap_or("").contains("overloaded"),
+                    "must not be pxy's synthetic error: {body}"
+                );
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a dated quota 429 is not re-fired");
+    }
+
     /// axum's `Json<Value>` accepts any valid JSON, so a scalar or array body
     /// reaches the router. Every downstream step indexes by key, and
     /// serde_json's IndexMut panics on a non-object — which killed the handler

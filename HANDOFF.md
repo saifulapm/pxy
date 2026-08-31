@@ -154,7 +154,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 174 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
+- 175 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
@@ -506,12 +506,24 @@ groq + mistral (STT), agnes (images/video).
      then replays as history, burning context every turn. The failure modes are
      asymmetric: a false positive only reclassifies text as reasoning, where
      clients still show it. Redundant `= true` lines dropped from both configs.
-   All three carry regression tests verified to fail without the fix (174 total).
+   - **docs/11 §3.1 / docs/10's "worst bug": single-candidate walks now return the
+     REAL upstream error.** A synthetic `429 overloaded_error` used to replace it,
+     so Claude Code's "usage limit reached, resets at …" UI and its
+     status-specific retry never saw the body they read. NOT fixed the way
+     docs/10 proposed (returning raw straight out of `classify_error`) — that
+     would have killed the in-request retry that recovers a transient 429 with a
+     near `Retry-After`. Instead `AttemptResult::SkipRaw` carries the upstream
+     status+body up the walk, and `handle_chat` returns it verbatim only when a
+     SINGLE-candidate walk exhausts its retries. Cooldowns, cooldown scoping and
+     retries are untouched; multi-candidate walks keep the aggregate (N failures
+     don't reduce to one). Verified live: an explicit model with a dead key
+     answers `401 Unauthorized` where it used to answer a synthetic 429.
+     `auth_failure_never_retried` updated exactly as docs/10 predicted.
+   All four carry regression tests verified to fail without the fix (175 total).
    **Still open in §2**: non-streaming search silently dropped, other server tools
-   silently dropped. Then
-   docs/11 §3 plumbing (raw single-candidate errors, response headers,
-   `count_tokens` forwarding) and §4.1 `cache_control` injection on the paid
-   Anthropic reserves.
+   silently dropped. Then the rest of docs/11 §3 (response headers,
+   `count_tokens` forwarding, `/v1/models` negotiation) and §4.1 `cache_control`
+   injection on the paid Anthropic reserves.
 
 1. **Add more free providers** — research is DONE: see `docs/08-free-provider-candidates.md`.
    Ready-to-use config blocks are already staged (commented) at the bottom of

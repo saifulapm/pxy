@@ -234,10 +234,28 @@ malformed chat requests now return 400 with **zero** upstream calls.
 These are docs/10's surviving Tier 0 items plus what the sweep added. All are
 plumbing; none is impersonation.
 
-### 3.1 Single-candidate errors must pass through raw (docs/10 §2.1)
+### 3.1 Single-candidate errors must pass through raw — **FIXED 2026-08-31**
 
 Unchanged and now *more* important, not less: with OAuth gone, every provider's
 error body is the only thing a harness has to work with.
+
+**Fixed — but not the way this section first proposed.** Returning the raw error
+straight out of `classify_error` would have killed the in-request retry, which
+`retry_after_backoff_recovers_single_candidate` protects: a transient 429 with a
+near `Retry-After` recovers transparently today instead of failing the turn.
+That resilience is worth keeping. So the fix moved to the *terminal* answer
+instead: a new `AttemptResult::SkipRaw` carries the upstream's status and body
+up the walk, and when a **single-candidate** walk exhausts its retries,
+`handle_chat` returns that verbatim rather than synthesizing
+`429 overloaded_error`. Retries, cooldowns and scoping are untouched; only the
+final answer changes. Multi-candidate walks keep the aggregate — N different
+failures genuinely don't reduce to one.
+
+Verified live: an explicit model with a dead key now answers `401 Unauthorized`
+where it used to answer a synthetic 429. `auth_failure_never_retried` was
+updated exactly as this doc predicted (it asserted the synthetic status); its
+load-bearing assertions — a dead key is never re-fired, and the walk fails fast
+without backing off — still hold.
 `classify_error` (`router.rs:1217-1252`) turns `401|402|403|408|409|429|≥500`
 into `Skip` regardless of `multi`, and an exhausted walk returns a synthetic
 `429 overloaded_error` (`router.rs:327-336`) with the real body truncated to 200
