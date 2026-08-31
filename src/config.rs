@@ -412,6 +412,15 @@ pub struct ProviderConfig {
     /// translation, just before the wire. Per-model `drop_params` adds to it.
     #[serde(default)]
     pub drop_params: Vec<String>,
+    /// Inject Anthropic prompt-cache breakpoints (`cache_control`) into
+    /// requests that carry none — OpenAI-dialect clients (codex, opencode,
+    /// fx) can't set them, and on the paid Anthropic-format reserves the
+    /// replayed transcript is where the money goes. OFF by default: several
+    /// gateways 400 on the field, and whether an aggregator relays it must be
+    /// proven (`cache_read_input_tokens` on turn 2+) before enabling.
+    /// Clients that set their own markers are always left alone.
+    #[serde(default)]
+    pub inject_cache_control: bool,
     /// Body-matched error overrides (CLIProxyAPI's request-scoped errors):
     /// absorb aggregator/WAF error text without code changes. FIRST matching
     /// rule (case-insensitive substring on the error body) wins over the
@@ -575,6 +584,7 @@ impl ProviderConfig {
             enabled: true,
             timeout_secs: default_timeout(),
             parse_think_tags: default_true(),
+            inject_cache_control: false,
             drop_params: Vec::new(),
             errors: Vec::new(),
             accounts: Vec::new(),

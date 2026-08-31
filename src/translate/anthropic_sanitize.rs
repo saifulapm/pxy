@@ -35,16 +35,38 @@ pub fn sanitize(body: &mut Value) {
 fn strip_invalid_blocks(messages: &mut Vec<Value>) {
     for msg in messages.iter_mut() {
         let Some(blocks) = msg["content"].as_array_mut() else { continue };
-        blocks.retain(|b| match b["type"].as_str() {
-            Some("thinking") => {
-                b["signature"].as_str().is_some_and(|s| !s.is_empty())
-            }
-            Some("redacted_thinking") => {
-                b["data"].as_str().is_some_and(|s| !s.is_empty())
-            }
+        let keep = |b: &Value| match b["type"].as_str() {
+            Some("thinking") => b["signature"].as_str().is_some_and(|s| !s.is_empty()),
+            Some("redacted_thinking") => b["data"].as_str().is_some_and(|s| !s.is_empty()),
             Some("text") => !b["text"].as_str().unwrap_or_default().is_empty(),
             _ => true,
-        });
+        };
+        // A dropped block may carry the client's cache_control breakpoint;
+        // losing the marker silently un-caches the whole prefix on every
+        // later turn (docs/10 §2.4). The previous kept block covers the same
+        // prefix — the dropped block contributed no content — so the marker
+        // moves there (or to the next kept block when nothing precedes it).
+        let mut kept: Vec<Value> = Vec::with_capacity(blocks.len());
+        let mut pending_marker: Option<Value> = None;
+        for mut b in blocks.drain(..) {
+            if keep(&b) {
+                if let Some(m) = pending_marker.take()
+                    && !b["cache_control"].is_object()
+                {
+                    b["cache_control"] = m;
+                }
+                kept.push(b);
+            } else if b["cache_control"].is_object() {
+                match kept.last_mut() {
+                    Some(prev) if !prev["cache_control"].is_object() => {
+                        prev["cache_control"] = b["cache_control"].take();
+                    }
+                    Some(_) => {} // the neighbour has its own breakpoint
+                    None => pending_marker = Some(b["cache_control"].take()),
+                }
+            }
+        }
+        *blocks = kept;
     }
     messages.retain(|m| match &m["content"] {
         Value::String(s) => !s.is_empty(),
@@ -298,6 +320,46 @@ mod tests {
         let m = msgs(&body);
         assert_eq!(m[0]["role"], "user");
         assert_eq!(m[1]["content"].as_array().unwrap().len(), 1);
+    }
+
+    /// docs/10 §2.4: an empty text block that carries the client's
+    /// cache_control breakpoint must not take the marker down with it — the
+    /// previous block covers the identical prefix, so it moves there (or to
+    /// the next block when the empty one led the message).
+    #[test]
+    fn dropped_blocks_hand_their_cache_marker_to_a_neighbour() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "real"},
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ]},
+        ]});
+        sanitize(&mut body);
+        let content = msgs(&body)[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["cache_control"]["ttl"], "1h", "marker moved back: {content:?}");
+
+        // Empty block first: the marker moves forward to the next kept block.
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "real"},
+            ]},
+        ]});
+        sanitize(&mut body);
+        let content = msgs(&body)[0]["content"].as_array().unwrap();
+        assert!(content[0]["cache_control"].is_object(), "{content:?}");
+
+        // A neighbour with its own breakpoint keeps it (never overwritten).
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "real", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+            ]},
+        ]});
+        sanitize(&mut body);
+        let content = msgs(&body)[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["cache_control"]["ttl"], "1h", "{content:?}");
     }
 
     #[test]

@@ -117,6 +117,14 @@ small_model = "zai/glm-4.5-flash"
 # and left unparsed those reach the client as ordinary assistant text and get
 # replayed as history every turn. Set `parse_think_tags = false` to opt a
 # provider out.
+#
+# `inject_cache_control = true` (Anthropic-format providers, default OFF)
+# injects Anthropic prompt-cache breakpoints into requests that carry none:
+# OpenAI-dialect clients (codex, opencode, fx) can't set them, and on the paid
+# reserves the replayed transcript is where the money goes. Enable per
+# aggregator only after proving the marker is relayed upstream
+# (cache_read_input_tokens > 0 on turn 2 of a session); some gateways 400 on
+# the field. Clients that set their own markers are always left alone.
 
 # Tencent Cloud TokenHub (international, Singapore node) — OpenAI-compatible
 # gateway. Key from the TokenHub console API Key page; each model must be

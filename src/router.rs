@@ -876,6 +876,13 @@ async fn try_candidate(
     // client accumulated — repair it at the one choke point.
     if upstream_format == WireFormat::Anthropic {
         crate::translate::anthropic_sanitize::sanitize(&mut body);
+        // Prompt-cache breakpoints for clients whose dialect can't set them
+        // (docs/11 §4.1) — after the sanitizer so markers land on blocks
+        // that will actually be sent. Opt-in per provider: some gateways
+        // 400 on the field, and relay must be proven before it is enabled.
+        if provider_cfg.inject_cache_control {
+            crate::translate::cache_control::inject(&mut body);
+        }
     }
     body["model"] = json!(cand.model.id);
 
@@ -4428,6 +4435,104 @@ mod tests {
         assert!(body["error"]["reset_time"].as_str().is_some_and(|t| t.contains('T')), "{body}");
         let ra = headers.iter().find(|(k, _)| k == "retry-after").expect("retry-after header");
         assert_eq!(ra.1, secs.to_string());
+    }
+
+    /// docs/11 §4.1: an OpenAI-dialect client (codex/opencode/fx) routed to an
+    /// Anthropic-format provider with `inject_cache_control` gets the standard
+    /// breakpoints — its own protocol has no way to set them. Off by default,
+    /// and a client-set marker (Anthropic dialect) always wins.
+    #[tokio::test]
+    async fn cache_control_is_injected_for_openai_clients_when_enabled() {
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/anthropic",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({
+                        "id": "m1", "type": "message", "role": "assistant",
+                        "model": "big", "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 5, "output_tokens": 2},
+                    }))
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let mk_app = |inject: bool, name: &str| {
+            test_app(
+                &format!(
+                    r#"
+                    [server]
+                    [providers.paid]
+                    base_url = "{base}/anthropic"
+                    format = "anthropic"
+                    inject_cache_control = {inject}
+                    models = ["big"]
+                    "#
+                ),
+                name,
+            )
+        };
+        let payload = json!({
+            "model": "paid/big",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "turn 1"},
+                {"role": "user", "content": "turn 2"},
+            ],
+        });
+
+        let out = handle_chat(
+            mk_app(true, "cache_inject_on"),
+            ClientFormat::Openai,
+            payload.clone(),
+            ClientContext::default(),
+        )
+        .await;
+        assert!(matches!(out, Outcome::Json { status: 200, .. }));
+        {
+            let bodies = seen.lock().unwrap();
+            let sent = &bodies[0];
+            assert!(
+                sent["system"][0]["cache_control"].is_object(),
+                "system breakpoint expected: {sent}"
+            );
+            let msgs = sent["messages"].as_array().unwrap();
+            let marked = msgs
+                .iter()
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .filter(|b| b["cache_control"].is_object())
+                .count();
+            assert_eq!(marked, 2, "last two messages marked: {sent}");
+        }
+
+        // Default off: the wire stays marker-free.
+        let out = handle_chat(
+            mk_app(false, "cache_inject_off"),
+            ClientFormat::Openai,
+            payload,
+            ClientContext::default(),
+        )
+        .await;
+        assert!(matches!(out, Outcome::Json { status: 200, .. }));
+        let bodies = seen.lock().unwrap();
+        let sent = bodies.last().unwrap();
+        assert!(sent["system"].as_str().is_some() || !sent["system"][0]["cache_control"].is_object());
+        assert!(
+            sent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .all(|b| !b["cache_control"].is_object()),
+            "no markers without the flag: {sent}"
+        );
     }
 
     #[tokio::test]

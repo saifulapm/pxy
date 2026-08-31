@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod anthropic_sanitize;
+pub mod cache_control;
 pub mod aisdk;
 pub mod anthropic_to_openai;
 pub mod openai_to_anthropic;
