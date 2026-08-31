@@ -46,11 +46,16 @@ fn strip_invalid_blocks(messages: &mut Vec<Value>) {
         // later turn (docs/10 §2.4). The previous kept block covers the same
         // prefix — the dropped block contributed no content — so the marker
         // moves there (or to the next kept block when nothing precedes it).
+        // Every mutable index below needs an object target: the keep closure
+        // deliberately tolerates non-object blocks (`_ => true`), and
+        // serde_json's IndexMut PANICS on a string — the same hazard class as
+        // handle_chat's door check.
         let mut kept: Vec<Value> = Vec::with_capacity(blocks.len());
         let mut pending_marker: Option<Value> = None;
         for mut b in blocks.drain(..) {
             if keep(&b) {
-                if let Some(m) = pending_marker.take()
+                if b.is_object()
+                    && let Some(m) = pending_marker.take()
                     && !b["cache_control"].is_object()
                 {
                     b["cache_control"] = m;
@@ -58,11 +63,13 @@ fn strip_invalid_blocks(messages: &mut Vec<Value>) {
                 kept.push(b);
             } else if b["cache_control"].is_object() {
                 match kept.last_mut() {
-                    Some(prev) if !prev["cache_control"].is_object() => {
+                    Some(prev) if prev.is_object() && !prev["cache_control"].is_object() => {
                         prev["cache_control"] = b["cache_control"].take();
                     }
-                    Some(_) => {} // the neighbour has its own breakpoint
-                    None => pending_marker = Some(b["cache_control"].take()),
+                    // The neighbour has its own breakpoint: drop the orphan.
+                    Some(prev) if prev.is_object() => {}
+                    // No attachable neighbour yet: carry it forward.
+                    _ => pending_marker = Some(b["cache_control"].take()),
                 }
             }
         }
@@ -360,6 +367,34 @@ mod tests {
         sanitize(&mut body);
         let content = msgs(&body)[0]["content"].as_array().unwrap();
         assert_eq!(content[0]["cache_control"]["ttl"], "1h", "{content:?}");
+    }
+
+    /// Review-caught panic: content arrays may hold non-object blocks (a
+    /// bare string), which `keep` tolerates — the marker move must never
+    /// mut-index one (serde_json IndexMut panics on a string). Both
+    /// orderings: scalar before the dropped marker block, and after it.
+    #[test]
+    fn marker_move_skips_non_object_blocks_without_panicking() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [
+                "bare string block",
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+            ]},
+        ]});
+        sanitize(&mut body);
+        assert_eq!(msgs(&body)[0]["content"].as_array().unwrap().len(), 1);
+
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+                "bare string block",
+                {"type": "text", "text": "real"},
+            ]},
+        ]});
+        sanitize(&mut body);
+        let content = msgs(&body)[0]["content"].as_array().unwrap();
+        // The marker skipped the string and landed on the next object block.
+        assert!(content[1]["cache_control"].is_object(), "{content:?}");
     }
 
     #[test]

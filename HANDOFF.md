@@ -584,6 +584,13 @@ groq + mistral (STT), agnes (images/video).
      (kiro-fronted; flag stays off; gorouter same operator); agentrouter
      unverifiable that day (Opus channels down) — re-probe and enable there
      once `cache_read_input_tokens` appears on turn 2.
+   - Review of the round caught ONE bug (fixed, +1 test, 191 total): the
+     sanitizer's marker move mut-indexed content blocks that can be
+     non-objects (a bare string in the array) — serde_json IndexMut panics on
+     those, the third instance of that hazard class here. Known minor:
+     `forward_count_tokens` pays a failed round-trip per call (≤10s) on an
+     Anthropic-format head whose gateway lacks /count_tokens — fail-open,
+     watch on the resale gateways.
 
 1. **Add more free providers** — research is DONE: see `docs/08-free-provider-candidates.md`.
    Ready-to-use config blocks are already staged (commented) at the bottom of
