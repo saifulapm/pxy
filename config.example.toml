@@ -564,7 +564,9 @@ rpm = 10
 
 # agentrouter speaks Anthropic messages natively (docs/06). Its WAF rejects
 # unknown clients ("unauthorized client detected") — a claude-cli User-Agent
-# is the minimal passing fingerprint (probed 2026-08-24). PAID balance
+# is the minimal passing fingerprint (probed 2026-08-24; re-probed 2026-08-31:
+# an honest pxy UA is still rejected, so the override stays — the last one
+# anywhere in pxy). PAID balance
 # (prepaid credits) — [groups.payperuse] only; premium manual-use reserve.
 [providers.agentrouter]
 format = "anthropic"
@@ -602,7 +604,11 @@ models = [
 
 # TabiToken — reseller in the agentrouter mold; usage object leaks `kiro_credits`,
 # so it fronts Kiro/Amazon-Q accounts. $120 referral credits (2026-08-25). Same
-# WAF: claude-cli User-Agent required (403 without). Speaks Anthropic natively.
+# Speaks Anthropic natively. Honest UA verified 2026-08-31: pxy/0.1.0 gets a
+# real 200 completion, so no User-Agent override. cache_control probe the same
+# day: the field is TOLERATED (no 400) but usage reports no cache fields and
+# turn 2 bills full input — kiro-fronted backend, no observable caching, so
+# inject_cache_control stays off here.
 # ⚠️ Injects a ~7k-token hidden system prompt billed to us on EVERY call — fine
 # for real coding sessions, wasteful for tiny calls. Their billing endpoint
 # returns dummy limits, so no remote balance readout. PAID balance — kept OUT
@@ -613,7 +619,6 @@ base_url = "https://tabitoken.com/v1/messages"
 balance_url = "https://tabitoken.com/v1/dashboard/billing/usage"
 auth_header = "x-api-key"
 api_key = { pass = "AI/tabitoken/main" }
-headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
 models = [
   { id = "claude-opus-5", context_length = 200000, max_output_tokens = 64000 },
   { id = "claude-opus-5-thinking", context_length = 200000, max_output_tokens = 64000 },
@@ -621,7 +626,7 @@ models = [
   { id = "claude-opus-4-8-thinking", context_length = 200000, max_output_tokens = 64000 },
 ]
 
-# GoRouter — same operator as tabitoken (identical WAF, model list, ~7k prompt
+# GoRouter — same operator as tabitoken (identical gateway, model list, ~7k prompt
 # injection, `kiro_credits` leak). $70 referral credits (2026-08-25). Same
 # caveats apply. PAID balance — [groups.payperuse] only; premium manual-use reserve.
 [providers.gorouter]
@@ -630,7 +635,6 @@ base_url = "https://gorouter.app/v1/messages"
 balance_url = "https://gorouter.app/v1/dashboard/billing/usage"
 auth_header = "x-api-key"
 api_key = { pass = "AI/gorouter/main" }
-headers = { User-Agent = "claude-cli/2.1.241 (external, cli)" }
 models = [
   { id = "claude-opus-5", context_length = 200000, max_output_tokens = 64000 },
   { id = "claude-opus-5-thinking", context_length = 200000, max_output_tokens = 64000 },

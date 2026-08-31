@@ -1,4 +1,4 @@
-# pxy — handoff (as of 2026-08-25)
+# pxy — handoff (as of 2026-08-31)
 
 Read this first in a new session, then `docs/07-pxy-design.md` for design rationale.
 
@@ -154,10 +154,12 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 176 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
+- 190 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
-  Anthropic history sanitizing).
+  Anthropic history sanitizing, non-streaming search, server-tool skip/400,
+  count_tokens forwarding, models negotiation, structured cooldown 429,
+  cache_control injection).
 - **fx agent support (2026-08-26)**: `pxy launch fx` (vercel-labs/fx). fx speaks a THIRD
   dialect — the Vercel AI SDK LanguageModel spec v4 — at `POST /v3/ai/language-model`:
   `prompt[]` not `messages[]`, model id + streaming as HEADERS, typed SSE parts. pxy
@@ -436,12 +438,16 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   (identical gateway, models, injection, `kiro_credits`) — same caveats. Combined Opus
   reserve across both: ~$190.
 
-⚠️ **Residual, worth revisiting**: those three resale gateways are the ONLY place left
-where pxy sends a client identity that is not its own — a `claude-cli/...` User-Agent
-in `config.example.toml`, because their gateway rejects other values. It is config, not
-code, and they are paid accounts we hold credits with. But it sits against the rule the
-2026-08-31 round settled on (identify honestly everywhere), so: try an honest
-`pxy/<version>` UA against each and drop the override wherever it still works.
+**Residual RESOLVED 2026-08-31 — honest-UA probe of the three resale gateways:**
+tabitoken and gorouter answered a real 200 to `pxy/0.1.0`, so their
+`User-Agent` overrides were DELETED from both configs (they identify honestly
+now). agentrouter still rejects anything but `claude-cli/...` ("unauthorized
+client detected", 401 before any model call), so its override stays — the one
+place left where pxy sends a client identity not its own, config-only, on a
+paid account we hold credits with, re-probed and documented in the config
+comment. Same probe session: agentrouter's whole Opus lineup was answering
+"Budget pool quota has been exhausted" (their channel pool, not our balance) —
+retry later, same churn as its deepseek channel.
 - `fireworks` — pay-per-token, $1 signup credit only.
 
 **Commented out (dead):** `deepseek` ($0 balance, no free tier), `v0-vercel` (API plan-gated,
@@ -541,11 +547,43 @@ groq + mistral (STT), agnes (images/video).
      detect a gateway), and — found by live testing, not in either reference —
      `set-cookie`/`alt-svc`/`strict-transport-security`, which describe pxy's
      connection to the UPSTREAM rather than the loopback response pxy writes.
-   All five carry regression tests verified to fail without the fix (176 total).
-   **Still open in §2**: non-streaming search silently dropped, other server tools
-   silently dropped. Then the rest of docs/11 §3 (response headers,
-   `count_tokens` forwarding, `/v1/models` negotiation) and §4.1 `cache_control`
-   injection on the paid Anthropic reserves.
+   All five carry regression tests verified to fail without the fix.
+   **§2/§3/§4.1 round completed 2026-08-31 (190 tests):**
+   - **Non-streaming web search served** (§2.2): the translator injects on
+     dialect evidence alone; a served search on a non-streaming request
+     streams upstream via the force_stream mechanism and `collect_stream_json`
+     re-assembles the CLIENT dialect's JSON from the translated stream — the
+     whole loop (interception, continuation, spliced blocks) unchanged. No
+     search provider → the §2.1 strip still applies, plain JSON round-trip.
+   - **Server tools never silently dropped** (§2.3): `code_execution_*`/
+     `bash_*`/`text_editor_*`/`computer_*` (dated `type`, no `input_schema`)
+     skip OpenAI-format candidates on a walk (Anthropic peers serve them via
+     passthrough), 400 up front on a single OpenAI-bound candidate, and an
+     all-unservable walk ends 400, not 429 (same honesty carve-out as
+     context-window).
+   - **`count_tokens` forwards** (§3.4) to the resolved candidate's real
+     tokenizer when it speaks Anthropic (same auth + sanitize; every failure
+     falls back to the local estimate). **`/v1/models` negotiates**: an
+     `anthropic-version` header or `claude-cli` UA gets the Anthropic list
+     shape; codex keeps its manifest; others the OpenAI list.
+   - **Structured cooldown 429** (§3.5): the exhausted-walk answer carries
+     `Retry-After` + `error.code model_cooldown`/`reset_seconds`/`reset_time`
+     from the soonest cooldown expiry, non-retryable included (new
+     `State::cooldown_remaining`). Fixed in passing: `soonest_recovery` read
+     bare provider names, so multi-account cooldowns were invisible to the
+     in-request retry backoff.
+   - **Keepalive REJECTED** (§3.4): emitting bytes before aggregation ends
+     would forfeit force_stream's pre-commit failover; no client timeout ever
+     observed. Revisit only on a demonstrated timeout.
+   - **`cache_control` injection built** (§4.1, `translate/cache_control.rs`,
+     per-provider `inject_cache_control`, default OFF): standard breakpoints
+     for OpenAI-dialect clients on Anthropic upstreams, yield-to-client rule,
+     ≤3 of 4 markers, thinking-final messages skipped. The sanitizer also
+     stopped losing a client marker attached to a dropped empty block. Live
+     probe: tabitoken tolerates the field but shows NO cache accounting
+     (kiro-fronted; flag stays off; gorouter same operator); agentrouter
+     unverifiable that day (Opus channels down) — re-probe and enable there
+     once `cache_read_input_tokens` appears on turn 2.
 
 1. **Add more free providers** — research is DONE: see `docs/08-free-provider-candidates.md`.
    Ready-to-use config blocks are already staged (commented) at the bottom of

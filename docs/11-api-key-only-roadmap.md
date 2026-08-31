@@ -156,21 +156,27 @@ covers both directions — tool absent with no provider configured (and the
 client's own tool preserved), tool present when one is. Verified to fail
 without the guard.
 
-### 2.2 Non-streaming requests silently lose web search
+### 2.2 Non-streaming requests silently lose web search — **FIXED 2026-08-31**
 
-Same injection site: no injection when `stream == false`
-(`anthropic_to_openai.rs:718-725` locks this in as a test). A non-streaming
-Claude Code turn that asks for search just gets no search, with no error. Either
-run the search loop on the non-streaming path too, or return an honest error —
-silently dropping a declared capability is the thing that makes a harness feel
-subtly broken.
+Same injection site: no injection when `stream == false`. A non-streaming
+Claude Code turn that asked for search just got no search, with no error.
 
-### 2.3 Non-`web_search` server tools vanish
+**Fixed** by taking the first option (run the loop, don't error): the
+translator now injects on dialect evidence alone, and when the router will
+serve the search on a non-streaming request it streams upstream anyway (the
+existing `force_stream` mechanism — the interception lives in StreamCtx) and
+re-assembles the CLIENT dialect's JSON from the translated stream
+(`collect_stream_json`, aggregating post-translation rather than
+force_stream's pre-translation). The whole loop — interception, search,
+continuation, spliced `server_tool_use` blocks — works unchanged. Without a
+search provider the §2.1 strip still applies and the request stays a plain
+JSON round-trip.
+
+### 2.3 Non-`web_search` server tools vanish — **FIXED 2026-08-31**
 
 `code_execution_20250522`, `bash_20250124`, `text_editor_20250124`, `computer_*`
-are dropped by the tool filter at `anthropic_to_openai.rs:79` with no error
-(test at `:691-714` asserts the drop). Both references do better in the same
-cheap way: **recognize them by prefix so they are never mangled, and fail
+were dropped by the tool filter at `anthropic_to_openai.rs:79` with no error.
+Both references do better in the same cheap way: **recognize them and fail
 loudly** rather than silently, when the target can't serve them.
 
 - CLIProxyAPI: `IsClaudeServerToolType` prefix list,
@@ -178,10 +184,16 @@ loudly** rather than silently, when the target can't serve them.
 - litellm: explicit drop-with-warning for `computer_use`/`image_generation`/
   `shell`, `responses/litellm_completion_transformation/transformation.py:1870-1879`.
 
-Recommendation: a declared server tool that pxy cannot fulfil on the chosen
-upstream should **skip that candidate on a multi-candidate walk** (same shape as
-the existing `tool_call = false` rule), and return a real 400 on a
-single-candidate one. Never a silent drop.
+**Fixed exactly as recommended**: such tools are deterministic per candidate
+(`openai_unservable_server_tools` — a dated `type`, no `input_schema`, not
+web_search), so an OpenAI-format candidate is skipped on a multi-candidate
+walk (same shape as the `tool_call = false` rule; an Anthropic-format peer
+serves them natively via passthrough), a single-candidate OpenAI-bound
+request 400s up front naming the tools, and a walk where nothing can serve
+them ends in an honest 400, not a retryable 429 (same honesty carve-out as
+the context-window rule). Unlike `tool_call = false`, single-candidate is NOT
+exempt: the drop happens in pxy's own translation, so the upstream never gets
+to answer for itself.
 
 ### 2.4 `<think>` tags leak into Claude Code as visible text — **FIXED 2026-08-31**
 
@@ -309,28 +321,47 @@ the reset instant (`helps/claude_ratelimit.go:22-48`) — is worth taking whole.
 
 ### 3.4 `count_tokens`, `/v1/models` negotiation, keepalive
 
-- **`count_tokens`** (docs/10 §2.3): `server.rs:447-452` takes no `State`, so it
-  physically cannot forward. Claude Code drives auto-compaction off this number,
-  so a wrong answer makes compaction fire early or late versus native. Forward to
-  `format = "anthropic"` upstreams; keep the local estimate as the fallback for
-  OpenAI-format ones (they have no such endpoint). The estimator is at least
-  honest now (`estimate_tokens`, ASCII/4 + non-ASCII×1).
-- **Content-negotiated `/v1/models`**: pxy always answers OpenAI-shaped
-  (`server.rs:540-605`); it works only because CC's discovery schema is loose.
-  Both references negotiate on `Anthropic-Version` header or a `claude-cli` UA
-  (`server_routes.go:568-608`). Cheap correctness.
-- **Keepalive on long non-streaming requests**: CLIProxyAPI's
-  `nonstream-keepalive-interval` (`internal/api/server_keepalive.go`) exists
-  because slow upstreams trip client read timeouts. pxy's `force_stream`
-  aggregation path (`translate/aggregate.rs`) has exactly this exposure — it can
-  hold a socket silent for the whole generation.
+- **`count_tokens`** (docs/10 §2.3) — **FIXED 2026-08-31**: the handler now
+  resolves the model exactly like a chat request (pin included) and forwards
+  to the first candidate's `…/count_tokens` when it speaks the Anthropic
+  protocol (same auth, same `anthropic_sanitize`, 10s timeout). Every failure
+  mode — OpenAI-format target, bad id, network, non-`input_tokens` shape —
+  falls back to the local estimate: a count must never fail a request the
+  real call might serve.
+- **Content-negotiated `/v1/models`** — **FIXED 2026-08-31**: an
+  `anthropic-version` header or a `claude-cli` User-Agent (the two signals
+  both references use) gets the Anthropic list shape (`type`/`display_name`/
+  `created_at`, `has_more`/`first_id`/`last_id`), same ids and order,
+  `context_length` riding along. Everyone else keeps the OpenAI list.
+- **Keepalive on long non-streaming requests** — **REJECTED 2026-08-31**:
+  CLIProxyAPI's `nonstream-keepalive-interval` exists because slow upstreams
+  trip client read timeouts, and pxy's `force_stream` aggregation has the
+  exposure on paper. But emitting keepalive bytes means committing a 200 and
+  a streaming body *before* aggregation finishes — which forfeits exactly
+  what the force_stream path's failover is for (a truncated upstream stream
+  currently becomes a model-scoped cooldown plus a walk to the next
+  candidate, invisible to the client). Every local agent pxy serves streams
+  its real turns; no client read-timeout has been observed. Trading real
+  failover for a hypothetical timeout is a bad buy — revisit only if a
+  client demonstrably times out on a force_stream model.
 
-### 3.5 Structured cooldown errors
+### 3.5 Structured cooldown errors — **FIXED 2026-08-31**
 
-When every candidate is cooling, pxy returns prose. CLIProxyAPI returns a `429`
+When every candidate is cooling, pxy returned prose. CLIProxyAPI returns a `429`
 carrying `Retry-After` plus a JSON body with `code: model_cooldown`,
 `reset_time`, `reset_seconds` (`sdk/cliproxy/auth/selector.go:82-149`). A harness
 can act on that; it cannot act on a sentence.
+
+**Fixed**: the exhausted-walk 429 now carries `Retry-After` plus
+`error.code = "model_cooldown"` / `reset_seconds` / `reset_time` whenever any
+candidate's cooldown will expire. Non-retryable cooldowns count too (new
+`State::cooldown_remaining`, a report rather than `recovery_wait`'s
+eligibility promise): a drained daily tier is non-retryable *and* expires at
+reset, which is exactly what the client should be told to wait for — and even
+a dead key's ladder cooldown is when pxy itself would next re-attempt. Fixed
+in passing: `soonest_recovery` read cooldowns under the bare provider name,
+so multi-account (`provider#account`) cooldowns were invisible to the
+in-request retry backoff.
 
 ### 3.6 `WireFormat::Responses` — demoted, not dropped
 
@@ -347,9 +378,27 @@ polish for the field losses (`prompt_cache_key`, `reasoning` items,
 Saiful asked for a compression option, globally or per provider. Three separate
 things hide under that word, and they rank very differently.
 
-### 4.1 Prompt caching is the real lever — and pxy does nothing here
+### 4.1 Prompt caching is the real lever — **BUILT 2026-08-31, relay unproven**
 
-**There is no `cache_control` handling anywhere in `src/`.** Grep finds only the
+> Implemented as `translate/cache_control.rs`, gated per provider
+> (`inject_cache_control`, default off), applied after `anthropic_sanitize`
+> at the same choke point: last system block (string system converts to block
+> form), last tool only without a system prompt, last two cacheable messages
+> (thinking-final messages skipped whole), ≤3 of the 4 breakpoints, and
+> litellm's yield-to-client rule — any client-set marker stops injection.
+> The sanitizer fix flagged below also landed: a dropped empty text block now
+> hands its `cache_control` to the previous kept block instead of losing it.
+>
+> Live probe 2026-08-31: **tabitoken** tolerates the field (no 400) but its
+> usage reports no cache fields and turn 2 bills full input — kiro-fronted,
+> no observable caching, so the flag stays off there (gorouter: same
+> operator, same conclusion assumed). **agentrouter** was unverifiable that
+> day — every Opus channel answered "Budget pool quota has been exhausted"
+> (their side; same churn as the deepseek channel). Re-probe agentrouter and
+> flip `inject_cache_control = true` on it once `cache_read_input_tokens`
+> shows up on turn 2.
+
+**There was no `cache_control` handling anywhere in `src/`.** Grep finds only the
 usage-accounting fields. Concretely:
 
 - Anthropic → Anthropic: markers survive by accident (the payload is cloned,
@@ -592,16 +641,17 @@ anything. Fine.
 
 1. ~~**§0 removal.**~~ **DONE 2026-08-31** — four provider kinds deleted,
    `WireFormat` collapsed, `RefreshLock` / `write_pass` / `ProviderKind` gone.
-2. **§2 bugs.** ~~Web-search injection guard~~, ~~`is_object()` guard~~ (plus
-   the `/v1/responses` edge it exposed) and ~~`<think>` default~~ all DONE.
-   Remaining: non-streaming search, server-tool skip/error.
-3. **§3 plumbing.** ~~Raw single-candidate errors~~, ~~response headers~~ DONE →
-   `count_tokens` forwarding → `/v1/models` negotiation → structured cooldown
-   429 → keepalive.
-4. **§4.1 cache_control injection** on the paid Anthropic reserves, gated on the
-   yield-to-client rule and the 4-breakpoint cap, verified by
-   `cache_read_input_tokens` on turn 2+.
-5. **§5.2 / §5 suffix** and **§6** items as polish.
+2. ~~**§2 bugs.**~~ **ALL DONE 2026-08-31** — web-search injection guard,
+   `is_object()` guard (plus the `/v1/responses` edge), `<think>` default,
+   non-streaming search, server-tool skip/error.
+3. ~~**§3 plumbing.**~~ **DONE 2026-08-31** — raw single-candidate errors,
+   response headers, `count_tokens` forwarding, `/v1/models` negotiation,
+   structured cooldown 429. Keepalive REJECTED (§3.4: it would cost
+   force_stream's pre-commit failover).
+4. ~~**§4.1 cache_control injection**~~ **BUILT 2026-08-31**, off pending
+   per-aggregator relay proof (see §4.1 — agentrouter was down for the
+   probe; tabitoken showed no observable caching).
+5. **§5.2 / §5 suffix** and **§6** items as polish — the only queue left.
 
 ## 9. Verification gate
 
