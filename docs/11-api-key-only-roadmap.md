@@ -14,7 +14,7 @@ clients, beside pxy rather than inside it.
 ## 0. The decision that reframes the whole queue: drop OAuth
 
 > **STATUS: DONE 2026-08-31**, branch `remove-oauth-providers`. ~2,940 lines net
-> deleted, 170/170 tests green, clippy 58 warnings (was 79, none added), real
+> deleted, 171/171 tests green, clippy 58 warnings (was 79, none added), real
 > streaming + non-streaming requests verified in both dialects against the live
 > config on a test daemon. Both config files had all four blocks commented out
 > already, so nothing live changed. Details in HANDOFF NEXT STEPS §0.
@@ -126,7 +126,7 @@ Everything else stands, and §2-§5 add what the three-way sweep turned up.
 
 ## 2. Tier 0 — bugs that break a harness today
 
-### 2.1 `pxy_web_search` is offered when nothing can intercept it — **live right now**
+### 2.1 `pxy_web_search` is offered when nothing can intercept it — **FIXED 2026-08-31**
 
 `anthropic_to_openai.rs:101-106` injects the `pxy_web_search` function whenever
 `stream == true` and the client sent an Anthropic `web_search*` server tool. The
@@ -141,10 +141,20 @@ offered a tool, calls it, nothing strips the call, and Claude Code receives a
 own comment (`web_search.rs:8-12`, and the comment at the injection site) says it
 exists to prevent — the guard just isn't wired to the config.
 
-Fix: gate the injection on the same condition as the interceptor. The cleanest
-shape is to decide once in the router and pass the flag into the translator,
-rather than duplicating the config read. Same asymmetry exists for
-`codex --search` via `responses.rs:329`.
+**Fixed** by enforcing the invariant at the one place that can see all of it.
+The translators inject on their own dialect's evidence; only `attempt()` knows
+the upstream format, whether a search provider exists, and whether the turn
+genuinely streams (interception lives entirely in `StreamCtx`, so `force_stream`
+never runs the loop either). So the router now computes `has_search_tool`,
+builds `SearchLoop` only when all three hold, and **strips the tool from the
+outbound body whenever it won't**. That also closes the `codex --search` variant
+for free: `responses.rs:329` injects before routing, so it could previously send
+`pxy_web_search` to an *Anthropic* upstream, which no gate covered.
+
+Regression test `web_search_never_reaches_an_upstream_that_pxy_cannot_serve`
+covers both directions — tool absent with no provider configured (and the
+client's own tool preserved), tool present when one is. Verified to fail
+without the guard.
 
 ### 2.2 Non-streaming requests silently lose web search
 
@@ -196,11 +206,21 @@ flag as an escape hatch.
 `translate/kiro.rs:249-269` doesn't filter on `input_schema`, so a server tool
 became `"inputSchema": {"json": null}`. Deleted along with the provider.
 
-### 2.6 Panic guard (docs/10 §2.7, still open)
+### 2.6 Panic guard — **FIXED 2026-08-31**
 
-`anthropic_sanitize.rs:23` and `router.rs:678` `IndexMut` a body that axum's
+`anthropic_sanitize.rs:23` and `router.rs` `IndexMut` a body that axum's
 `Json<Value>` will happily hand over as `[]`, `"x"` or `5` → handler task panic
-instead of a 400. One `is_object()` check.
+instead of a 400. Confirmed against serde_json 1.0.151 (`cannot access key
+"messages" in JSON string`). Guarded in `handle_chat`, which both chat dialects
+funnel through.
+
+A live sweep of every JSON endpoint then turned up a second, separate defect the
+audit had missed: **`/v1/responses` answered `5` with a 200 and a real upstream
+call.** `responses::request` builds a fresh object from whatever it is handed, so
+a scalar became an empty-but-valid chat request and pxy spent quota asking the
+model what the user meant. `handle_chat`'s guard cannot see it — the body is an
+object by then — so the `responses` handler needed its own edge check. All 12
+malformed chat requests now return 400 with **zero** upstream calls.
 
 ---
 
@@ -533,8 +553,9 @@ anything. Fine.
 
 1. ~~**§0 removal.**~~ **DONE 2026-08-31** — four provider kinds deleted,
    `WireFormat` collapsed, `RefreshLock` / `write_pass` / `ProviderKind` gone.
-2. **§2 bugs.** Web-search injection guard (live), non-streaming search,
-   server-tool skip/error, `<think>` default, `is_object()` guard.
+2. **§2 bugs.** ~~Web-search injection guard (live)~~ DONE, ~~`is_object()`
+   guard~~ DONE (plus the `/v1/responses` edge it exposed). Remaining:
+   non-streaming search, server-tool skip/error, `<think>` default.
 3. **§3 plumbing.** Raw single-candidate errors → response headers →
    `count_tokens` forwarding → `/v1/models` negotiation → structured cooldown
    429 → keepalive.

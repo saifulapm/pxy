@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use jiff::Timestamp;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::catalog::{Candidate, Catalog};
 use crate::config::{Config, ErrorAction, WireFormat};
@@ -199,6 +199,18 @@ pub async fn handle_chat(
     payload: Value,
     ctx: ClientContext,
 ) -> Outcome {
+    // axum's Json<Value> accepts any valid JSON, so `[]`, `"x"` and `5` all
+    // reach here. Everything downstream indexes the body by key, and
+    // serde_json's IndexMut PANICS on a non-object — so a malformed request
+    // would kill the handler task instead of answering. Reject it at the door.
+    if !payload.is_object() {
+        return error_outcome(
+            client_format,
+            400,
+            "invalid_request_error",
+            "request body must be a JSON object",
+        );
+    }
     let requested = payload["model"]
         .as_str()
         .filter(|m| !m.is_empty())
@@ -739,11 +751,21 @@ async fn try_candidate(
     // `codex --search` — so the marker is the injected function itself.
     // Built before the send so the follow-up call replays this exact request
     // with the results appended.
-    let search = (upstream_format == WireFormat::Openai
-        && !app.cfg.search.providers.is_empty()
-        && body["tools"]
-            .as_array()
-            .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)))
+    //
+    // Those translators inject on their own dialect's evidence; only here is
+    // it known whether pxy can actually SERVE the call — the interception
+    // lives entirely in StreamCtx, so it needs an OpenAI upstream, a
+    // configured search provider, and a genuinely streaming turn (force_stream
+    // re-assembles the body instead and never runs the loop). This is the one
+    // place that sees all three, so it is also the place that must enforce the
+    // invariant: the tool reaches the wire only if pxy will intercept it.
+    let has_search_tool = body["tools"]
+        .as_array()
+        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME));
+    let search = (has_search_tool
+        && stream
+        && upstream_format == WireFormat::Openai
+        && !app.cfg.search.providers.is_empty())
     .then(|| SearchLoop {
         filter: SearchCallFilter::default(),
         uses_left: web_search::plan(payload).map_or(web_search::DEFAULT_MAX_USES, |p| p.max_uses),
@@ -752,6 +774,18 @@ async fn try_candidate(
         body: body.clone(),
         timeout: Duration::from_secs(provider_cfg.timeout_secs),
     });
+    if has_search_tool && search.is_none() {
+        // Offering a function nobody will intercept hands the client a
+        // tool_use for a tool it never declared, which wedges the turn.
+        // Drop it and let the model answer without search.
+        if let Some(tools) = body["tools"].as_array_mut() {
+            tools.retain(|t| t["function"]["name"] != web_search::TOOL_NAME);
+            if tools.is_empty() {
+                body.as_object_mut().map(|o| o.remove("tools"));
+            }
+        }
+        debug!(candidate = %cand.full_id(), "web_search dropped: pxy cannot serve it here");
+    }
 
     app.state.rpm_increment(&cand.state_provider());
     // A streaming upstream returns headers as soon as it accepts the request,
@@ -3452,6 +3486,163 @@ mod tests {
     /// Multi-account: the candidate walk IS the account walk. Account "gh"
     /// 401s (auth = account-wide cooldown under `sub#gh`), so account "g"
     /// serves; the bare provider name still reports `sub/m` for the panels.
+    /// axum's `Json<Value>` accepts any valid JSON, so a scalar or array body
+    /// reaches the router. Every downstream step indexes by key, and
+    /// serde_json's IndexMut panics on a non-object — which killed the handler
+    /// task instead of answering. Both dialects must return a clean 400.
+    #[tokio::test]
+    async fn non_object_bodies_are_rejected_not_panicked_on() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://unused.example/m"
+            models = ["m"]
+            [groups.free]
+            models = ["p/m"]
+            "#,
+            "non_object_body",
+        );
+        for body in [json!([]), json!("x"), json!(5), json!(null), json!(true)] {
+            for fmt in [ClientFormat::Openai, ClientFormat::Anthropic] {
+                let out =
+                    handle_chat(app.clone(), fmt, body.clone(), ClientContext::default()).await;
+                match out {
+                    Outcome::Json { status, .. } => {
+                        assert_eq!(status, 400, "body {body} ({fmt:?}) must be a clean 400");
+                    }
+                    Outcome::Stream { .. } => panic!("expected json for {body}"),
+                }
+            }
+        }
+    }
+
+    /// The live bug: `pxy_web_search` was injected by anthropic_to_openai on the
+    /// evidence of the client's server tool + `stream: true` alone, while the
+    /// interceptor additionally required a configured search provider. With
+    /// none configured the model was offered a function nothing would strip,
+    /// so the client got a tool_use for a tool it never declared and the turn
+    /// wedged. The tool must never reach the wire unless pxy will serve it.
+    #[tokio::test]
+    async fn web_search_never_reaches_an_upstream_that_pxy_cannot_serve() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    // The request streams, so the mock must speak SSE — a JSON
+                    // body would read as a dead stream and trigger failover.
+                    let sse = concat!(
+                        "data: {\"choices\":[{\"index\":0,",
+                        "\"delta\":{\"content\":\"answered\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        // No [[search.providers]] — exactly Saiful's live config.
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                "#
+            ),
+            "web_search_guard",
+        );
+
+        // Claude Code's shape: the dated server tool, plus a real client tool
+        // so `tools` survives the strip and the request stays well-formed.
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what happened today?"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+                {"name": "Read", "description": "read a file",
+                 "input_schema": {"type": "object", "properties": {"p": {"type": "string"}}}},
+            ],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        // Drain the stream so the upstream call actually happens.
+        if let Outcome::Stream { body, .. } = out {
+            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        }
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "expected exactly one upstream call");
+        let tools = bodies[0]["tools"].as_array().expect("client tool must survive");
+        assert!(
+            !tools.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME),
+            "pxy_web_search must not be offered when no search provider is configured: {:?}",
+            bodies[0]["tools"]
+        );
+        assert!(
+            tools.iter().any(|t| t["function"]["name"] == "Read"),
+            "the client's own tool must still be sent: {:?}",
+            bodies[0]["tools"]
+        );
+        drop(bodies);
+
+        // The mirror case: with a provider configured pxy CAN serve the call,
+        // so the tool must still be offered — the guard must not over-strip.
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                [[search.providers]]
+                name = "brave"
+                kind = "brave"
+                api_key = "k"
+                "#
+            ),
+            "web_search_guard_on",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what happened today?"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        if let Outcome::Stream { body, .. } = out {
+            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        }
+        let bodies = seen.lock().unwrap();
+        let last = bodies.last().expect("second call recorded");
+        assert!(
+            last["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)),
+            "pxy_web_search must be offered when a search provider IS configured: {:?}",
+            last["tools"]
+        );
+    }
+
     #[tokio::test]
     async fn multi_account_walks_accounts_fill_first() {
         use axum::http::HeaderMap;

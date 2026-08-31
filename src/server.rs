@@ -171,6 +171,21 @@ async fn responses(
 ) -> Response {
     use futures_util::StreamExt;
 
+    // handle_chat rejects a non-object body, but it never sees one here:
+    // responses::request builds a fresh object out of whatever it is given, so
+    // `5` would translate into an empty-but-valid chat request and spend a real
+    // upstream call to ask the model what the user meant. Reject at this edge.
+    if !payload.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {
+                "message": "request body must be a JSON object",
+                "type": "invalid_request_error",
+            }})),
+        )
+            .into_response();
+    }
+
     let ctx = client_ctx(&headers);
     let model = payload["model"]
         .as_str()

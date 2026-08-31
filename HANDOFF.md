@@ -154,7 +154,7 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
   with raw error passthrough. Embeddings deliberately have NO cross-model failover:
   different embedding models produce incompatible vector spaces.
 - Error bodies pass through unmodified (Claude Code's auto-retry depends on it).
-- 171 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
+- 173 tests: `cargo test` (integration tests against local mock upstreams: dead-stream failover, retry-after recovery, auth
   fail-fast, fatal stream-error passthrough, disconnect accounting, media chain failover,
   cooldown persistence, drop_params, context-window failover, tool-capability filtering,
   Anthropic history sanitizing).
@@ -481,13 +481,30 @@ groq + mistral (STT), agnes (images/video).
      (It is not vacuous: `small` and `tiny` deliberately share one mock route so the
      call counter proves the smaller-window peer was skipped, not merely that the
      walk reached `big`.)
-   **Next up in docs/11 §8**: the §2 bugs — the live `pxy_web_search` injection guard
-   (offered whenever `stream: true` even with no search provider configured, so the
-   client gets a `tool_use` for a tool it never declared), non-streaming search
-   silently dropped, other server tools silently dropped, `<think>` parsing off by
-   default on most providers, and the `is_object()` panic guard. Then docs/11 §3
-   plumbing (raw single-candidate errors, response headers, `count_tokens`
-   forwarding) and §4.1 `cache_control` injection on the paid Anthropic reserves.
+   **docs/11 §2 bugs — first two FIXED 2026-08-31** (same branch):
+   - **`pxy_web_search` was offered when nothing could intercept it.** The
+     translators injected it on their own dialect's evidence, but interception
+     lives entirely in `StreamCtx` and also needs a configured search provider —
+     and every `[[search.providers]]` block in the live config is commented out.
+     Claude Code with web search on therefore got a `tool_use` for a tool it never
+     declared, wedging the turn. `attempt()` now owns the invariant: it builds the
+     `SearchLoop` only for an OpenAI upstream + configured provider + genuinely
+     streaming turn, and STRIPS the tool from the outbound body otherwise. Also
+     closes the `codex --search` variant, which injected pre-routing and could
+     send the tool to an Anthropic upstream.
+   - **Non-object request bodies panicked the handler task.** axum's `Json<Value>`
+     accepts `[]`/`"x"`/`5`, and serde_json's IndexMut panics on them. Guarded in
+     `handle_chat`. A live endpoint sweep then found a SECOND defect the audit
+     missed: `/v1/responses` answered `5` with a 200 **and a real upstream call**,
+     because `responses::request` manufactures a valid object before `handle_chat`
+     ever sees the body — so that handler needed its own edge check. All 12
+     malformed chat requests now 400 with zero upstream calls.
+   Both have regression tests verified to fail without the fix (173 tests total).
+   **Still open in §2**: non-streaming search silently dropped, other server tools
+   silently dropped, `<think>` parsing off by default on most providers. Then
+   docs/11 §3 plumbing (raw single-candidate errors, response headers,
+   `count_tokens` forwarding) and §4.1 `cache_control` injection on the paid
+   Anthropic reserves.
 
 1. **Add more free providers** — research is DONE: see `docs/08-free-provider-candidates.md`.
    Ready-to-use config blocks are already staged (commented) at the bottom of
