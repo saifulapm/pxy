@@ -51,8 +51,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
             "/v1/fetch",
             post(crate::media::search::fetch).get(crate::media::search::fetch_get),
         )
-        // fx (vercel-labs/fx) impersonates its AI Gateway here: the generation
-        // endpoint plus the catalog/credits GETs it makes. See translate/aisdk.
+        // fx (vercel-labs/fx) talks to its AI Gateway API, which pxy serves
+        // locally: the generation endpoint plus the catalog/credits GETs it
+        // makes. See translate/aisdk.
         .route("/v3/ai/language-model", post(ai_language_model))
         .route("/coding-agent/v1/models", get(fx_models))
         .route("/coding-agent/v1/credits", get(fx_credits))

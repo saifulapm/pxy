@@ -218,7 +218,7 @@ balance_url = "https://openrouter.ai/api/v1/credits"
 api_key = { pass = "AI/openrouter/main" }
 headers = { HTTP-Referer = "http://localhost", X-Title = "pxy" }
 models = [
-  # cloaked frontier model, free while in stealth (prompts likely used for training)
+  # codenamed pre-release frontier model, free while unreleased (prompts likely used for training)
   { id = "stealth/ox-alpha", context_length = 1000000 },
   # GMI Cloud promo: unlimited + free Aug 24 - Sep 6 2026, served by GMICloud.
   # Tool calling verified 2026-08-25. REMOVE from [groups.free] after Sep 6 (goes paid).

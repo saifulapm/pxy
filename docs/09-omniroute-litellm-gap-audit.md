@@ -406,5 +406,5 @@ multi-tenant keys/budgets, MCP/A2A/ACP, compression engines, semantic/
 scoring/bandit routing, quota pools/DRR, i18n, Docker/k8s/tunnels,
 enterprise RBAC/audit, gamification, integrations, batches/files, music,
 hedging (burns two free accounts per answer), shadow routing (actively
-harmful), and the stealth/ban-evasion material (JA3/JA4 impersonation,
-zero-width client-name obfuscation) — noted only for awareness.
+harmful), and anything whose purpose is to disguise which client is making
+the request — rejected outright, not deferred.

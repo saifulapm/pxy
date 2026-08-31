@@ -42,9 +42,9 @@ them. Everything below assumes the first reading.
 | kind | legal status (docs/10 §0.2) | verdict |
 |---|---|---|
 | `ClaudeOauth` | prohibited for non-CC clients; gray for CC itself | **remove** — subscription goes native |
-| `GithubCopilot` | effectively prohibited; enforcement record is real; impersonates VS Code at `providers/copilot.rs:20-49` | **remove** — highest risk in the stack, and it's a *paid* sub |
+| `GithubCopilot` | effectively prohibited; enforcement record is real; presented itself as the VS Code extension rather than as pxy | **remove** — highest risk in the stack, and it's a *paid* sub |
 | `Kiro` | flatly prohibited, kiro.dev FAQ verbatim | **remove** |
-| `KimiCoding` | **explicitly permitted** (forward proxy OK) — but `providers/kimi.rs:32` forges `kimi-code-cli/0.26.0`, breaking their one named rule | not a legal removal. Remove on *other* grounds: credits dead since 2026-08-25, and it carries the rotating-refresh machinery |
+| `KimiCoding` | **explicitly permitted** (forward proxy OK) — but it misreported itself as Moonshot's own CLI, breaking their one named rule | not a legal removal. Remove on *other* grounds: credits dead since 2026-08-25, and it carries the rotating-refresh machinery |
 | `kilocode` | permitted, and **not OAuth code at all** — a long-lived JWT via a `cmd` secret | **keep**, nothing to do |
 
 So the legal deletions are three; kimi is a judgement call that happens to land
@@ -360,7 +360,7 @@ both smaller and destructive. Caching wins on arithmetic before you even reach
 the risk argument.
 
 Both references implement the same shape, and it is small:
-- CLIProxyAPI `ensureCacheControl` (`claude_executor_cloaking.go:1093`) — last
+- CLIProxyAPI's `ensureCacheControl` — last
   system block, last cacheable message, last tool only when there is no system
   prompt; `injectMessagesCacheControl` (`:1526`) skips assistant turns ending in
   a thinking-like block, which cannot host a marker; `enforceCacheControlLimit`
@@ -554,9 +554,10 @@ the tokens saved. Revisit only if `pxy status` shows real exhaustion.
 ## 7. Explicitly rejected (carried forward)
 
 From docs/09 §11 and docs/10 §0, all still rejected and now largely moot after
-§0: uTLS/JA3 spoofing, `cch=` body signing, MCP tool-name cloaking, zero-width
-obfuscation, synthetic device identities, plugin FFI ABI, WebSocket/Realtime
-surfaces, cluster mode, management REST API + TUI.
+§0: **anything whose purpose is to disguise which client is making the request**
+(the specific techniques are deliberately not catalogued — pxy implements none
+of them and the list only rots), plus the plugin FFI ABI, WebSocket/Realtime
+surfaces, cluster mode and the management REST API + TUI.
 
 Newly rejected in this round: prompt/context compression engines (§4.3),
 reasoning replay caches and signature compatibility engines (§5.5), downstream
@@ -565,7 +566,8 @@ HTTP compression (§4.2), multi-tenant routing strategies and budget enforcement
 
 Also worth recording: **neither CLIProxyAPI nor litellm implements MCP
 passthrough** (`mcp_servers`, `mcp_list_tools`, `mcp_call`). CLIProxyAPI's only
-MCP code is tool-name *cloaking*, which is impersonation. pxy passes
+MCP code renames tools to disguise their origin, which is in the rejected
+category above. pxy passes
 `mcp_servers` through untouched to Anthropic-format upstreams and drops it for
 OpenAI ones — which is the same behavior, arrived at by not implementing
 anything. Fine.

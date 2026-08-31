@@ -1,5 +1,14 @@
 # Native-fidelity audit — 2026-08-31
 
+> **Status: partly superseded, and compressed on 2026-08-31.** docs/11 is the
+> live roadmap. pxy is now API-key only, so §1's ChatGPT/Codex path is cancelled
+> and §2.5's header-forwarding proposal is reversed. This file has also been
+> trimmed of third-party client-impersonation mechanics and of the credential
+> flow recipe for the cancelled path: pxy implements none of it, the code that
+> once did was deleted (docs/11 §0), and a decision record only needs the
+> decisions. The compliance verdicts in §0.2 are the load-bearing part — they
+> are why four providers are gone, and they must survive.
+
 Goal set by Saiful: *"when I use Claude Code with my Claude subscription through
 pxy, I want 100% the same performance as native. Same for codex with a ChatGPT
 subscription. So I can use pxy everywhere without worrying."*
@@ -18,37 +27,31 @@ axis: **on the paths where pxy is not translating anything — Claude Code →
 
 ## 0. The framing that matters
 
-CLIProxyAPI spends roughly half its Claude code on *impersonation*: uTLS
-ClientHello spoofing pinned to Claude Code 2.1.220, HTTP header name-casing and
-ordering reconstruction, a reverse-engineered `cch=` xxHash body signature,
-synthetic per-credential device identities, MCP tool-name cloaking, zero-width
-obfuscation of sensitive words. It needs all of that because it re-shapes
-foreign clients (a Gemini CLI request, an OpenAI SDK request) into something
-Anthropic's OAuth endpoint will accept from "Claude Code".
+Roughly half of CLIProxyAPI's Claude-specific code exists to make a foreign
+client (a Gemini CLI request, an OpenAI SDK request) look to Anthropic like
+Claude Code. **pxy takes none of that approach, and the details are deliberately
+not recorded here** — they are a catalogue of ways to misrepresent a client,
+they go stale on every upstream release, and pxy's answer to all of them is no.
 
-**pxy's target case does not need any of it.** When the client genuinely *is*
-Claude Code and the credential is Saiful's own Claude subscription, the request
+**pxy's target case never needed any of it.** When the client genuinely *is*
+Claude Code and the credential is the user's own subscription, the request
 already has native shape and a legitimate token. Fidelity here is achieved by
 **subtraction, not addition** — stop mutating a request that was already
 correct. Everything in §2 is something pxy currently *does to* a valid request.
 
-This also keeps docs/09 §11's non-goal intact: the stealth/ban-evasion material
-(JA3/JA4 impersonation, `cch` signing, zero-width cloaking) stays rejected. It
-is not needed for the stated goal, and it rots — `helps/utls_client.go:160-163`
-says to re-capture packets whenever the Claude Code version changes.
+This keeps docs/09 §11's non-goal intact: anything whose purpose is to disguise
+which client is talking stays rejected, permanently and without exception.
 
 ---
 
 ## 0.1 Compliance — checked 2026-08-31, and it constrains the design
 
-**Why CLIProxyAPI impersonates Claude Code**: not for performance. Anthropic
-added a *server-side* authenticity check. Around 2026-01-09 a server-side switch
-started rejecting subscription OAuth credentials presented by non-Claude-Code
-clients ("this credential is only authorized for use with Claude Code"). The
-whole impersonation stack — uTLS ClientHello, header casing/ordering, the `cch=`
-body hash, synthetic device identity, the `claude-code-20250219` beta, the
-system sentinel — exists to defeat that check. It is circumvention of a
-technical restriction, by construction.
+**The key fact**: Anthropic verifies server-side that a subscription OAuth
+credential is being presented by Claude Code itself — a switch that landed
+around 2026-01-09. Every proxy that carries subscription traffic from another
+client is therefore working around a deliberate technical restriction, whatever
+the mechanism. That is the reason pxy does not do it, and the reason the
+mechanisms are not documented here.
 
 **Authoritative policy text** (code.claude.com/docs/en/legal-and-compliance,
 "Authentication and credential use"):
@@ -147,11 +150,10 @@ an official surface for exactly this case: `codex app-server` accepts
 the user's ChatGPT auth lifecycle"*, taking `accessToken`, `chatgptAccountId`
 and `chatgptPlanType` directly, with a documented
 `account/chatgptAuthTokens/refresh` request
-(learn.chatgpt.com/docs/app-server). Codex's own Rust code treats a non-first-
-party `originator` as an expected category (`is_first_party_originator`,
-feature-gated with "Only support first-party clients for now"), and the
-override var is named `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` — so spoofing a
-first-party originator is clearly not intended.
+(learn.chatgpt.com/docs/app-server). Codex's own code treats third-party
+callers as an expected category with their own identifier, and gates the
+first-party identifier behind an explicitly internal override — i.e. presenting
+a third-party client as first-party is clearly not intended.
 
 **So Tier 1 should drive `codex app-server` rather than reimplement the wire
 protocol against `chatgpt.com/backend-api/codex`.** Same capability, inside an
@@ -211,13 +213,13 @@ But the **enforcement record is primary and strong**:
    third-party access as *your own registered OAuth App → user authorizes →
    pass their `gho_`/`ghu_` token to the SDK*, billed to the user's subscription.
 
-**pxy is squarely in the named conduct.** `providers/copilot.rs:20-49` sends
-`copilot-integration-id: vscode-chat`, `editor-version: vscode/1.126.0`,
-`editor-plugin-version: copilot-chat/0.54.0`,
-`user-agent: GitHubCopilotChat/0.54.0`. That is impersonating VS Code, not
-merely using an undocumented endpoint. This is a **paid subscription Saiful
-relies on** (300 premium req/month), and the realistic downside is losing
-Copilot access, not a warning.
+**pxy was squarely in the named conduct**: `providers/copilot.rs` presented
+itself to the API as the VS Code extension rather than as pxy — not merely using
+an undocumented endpoint. Against a **paid subscription** (300 premium
+req/month) the realistic downside was losing Copilot access outright, not a
+warning. **Resolved 2026-08-31: the provider and that file were deleted**
+(docs/11 §0). The sanctioned route, if this is ever wanted again, is the Copilot
+SDK behind your own registered OAuth App.
 
 ### AWS Kiro — the only flat prohibition
 
@@ -258,27 +260,26 @@ Four conditions attach; the on-point one for a proxy is FAQ Q2:
 > *Accessing Kimi through a proxy (**forward proxy**) is fine; forwarding your
 > own account to other people (**reverse proxy**) is a violation.*
 
-That is exactly the distinction pxy needs, and pxy is on the permitted side —
+That is exactly the distinction pxy needs, and pxy was on the permitted side —
 **except for rule 3, 不伪造或篡改客户端身份信息 ("don't spoof or alter client
 identity information"), which explicitly names User-Agent forgery.**
-`providers/kimi.rs:32` sends `user-agent: kimi-code-cli/0.26.0`.
+`providers/kimi.rs` misrepresented itself as Moonshot's own CLI.
 
-This is gratuitous: Moonshot permits third-party clients outright, so pxy gains
-nothing by forging the CLI's identity and takes on the one violation the vendor
-actively screens for. Moonshot deployed a UA-based risk-control rule in
-May 2026 that false-flagged paying subscribers with `access_terminated_error`
-and was rolled back (staff `yuikns`, forum.moonshot.ai/t/…/421). **Send an
-honest `pxy/<version>` UA instead.** Note the X-Msh-* device identity is a
-different thing — it is the device profile minted at login and must be reused,
-not forged.
+That was gratuitous: Moonshot permits third-party clients outright, so pxy
+gained nothing by it while taking on the one violation the vendor actively
+screens for. **Resolved 2026-08-31: the provider was deleted** (docs/11 §0, on
+separate grounds — its credits were dead). If it is ever re-added it must send
+an honest `pxy/<version>` UA. The lesson generalises: where a vendor permits
+third-party clients, identifying yourself honestly is both the compliant and
+the lower-risk option.
 
 ### The pattern worth internalizing
 
-pxy's own impersonation is concentrated in exactly the two providers that
-punish it (`copilot.rs`, `kimi.rs`) and absent from the ones that don't care.
-Same lesson as §0: **the honest request is usually also the compliant one**,
-and where a vendor permits third-party clients, forging identity converts a
-permitted use into a violation for zero benefit.
+pxy's misrepresentation of its client was concentrated in exactly the two
+providers that punish it, and absent from the ones that don't care. Same lesson
+as §0: **the honest request is usually also the compliant one**. Both providers
+were removed on 2026-08-31, so as of docs/11 §0 pxy identifies itself honestly
+to every upstream it talks to.
 
 ---
 
@@ -296,25 +297,13 @@ So "use my codex subscription through pxy" is blocked on two independent
 things: acquiring/logging in the credential, and building a provider kind that
 spends it.
 
-CLIProxyAPI has the complete recipe (`internal/auth/codex/openai_auth.go:24-30`,
-`sdk/auth/codex_device.go:27-33`):
-
-| | |
-|---|---|
-| authorize | `https://auth.openai.com/oauth/authorize` |
-| token/refresh | `https://auth.openai.com/oauth/token` (form-encoded) |
-| client id | `app_EMoamEEZ73f0CkXaXp7hrann` |
-| redirect | `http://localhost:1455/auth/callback` |
-| auth scope | `openid email profile offline_access` |
-| refresh scope | `openid profile email` (**differs** — docs/09 §5 warns sending the wrong scope on refresh revokes siblings) |
-| extra params | `prompt=login`, `id_token_add_organizations=true`, `codex_cli_simplified_flow=true` |
-| account id | ID-token claim `https://api.openai.com/auth` → `chatgpt_account_id` (`jwt_parser.go:22,42-52`) |
-| inference | `POST https://chatgpt.com/backend-api/codex/responses` |
-| headers | `Chatgpt-Account-Id`, `Originator: codex-tui`, `Session-Id` = `prompt_cache_key`, UA `codex-tui/0.146.0 (…)` |
-
-A device-code flow exists (`…/api/accounts/deviceauth/usercode` → poll
-`…/deviceauth/token`), which is the headless/SSH-friendly path — the same shape
-as the kimi login already in `providers/kimi.rs`.
+**Superseded: docs/11 CANCELLED this path.** pxy is API-key only; the ChatGPT
+subscription is used through its own native client, beside pxy. The
+implementation notes that were here (OAuth client id, scopes, endpoints and the
+client-identity headers a third-party proxy sends) have been removed rather than
+carried forward — they were a recipe for spending a subscription credential from
+somewhere other than its own client, for a feature that will not be built.
+If this is ever revisited, the only route to consider is an official one.
 
 ---
 
@@ -411,35 +400,24 @@ not just latency — cache misses are billed against the quota. This is the most
 plausible mechanism by which a long pxy session would feel measurably worse
 than native, and it is silent.
 
-CLIProxyAPI's equivalent rule: cloaking and cache-control placement are both
-disabled unconditionally for a *confirmed native client*
-(`resolveClaudeWirePolicy`, `claude_executor_cloaking.go:984-990`;
-`shouldEnsureCacheControl`, `:1199-1201`) — "native owns its own breakpoints".
-Its detector requires **all four** signals (`x-app: cli` + plausible
-`claude-cli/…` UA + a `claude-code-*` beta + a valid `metadata.user_id`) plus an
-entrypoint allowlist (`helps/claude_client_detection.go:66-70,128-152`).
+CLIProxyAPI's equivalent rule is worth borrowing in the abstract: request
+rewriting of every kind is disabled for a *confirmed native client*, on the
+principle that **native owns its own cache breakpoints**. Its client detector
+is correspondingly strict, requiring several independent signals to agree
+before it treats a request as native.
 
-### 2.5 Request-header fingerprint diverges from native
+### 2.5 Request-header fingerprint diverges from native — **REVERSED**
 
-`server.rs:82-94` captures only `x-initiator` and `anthropic-beta` from the
-client; the upstream request is rebuilt from scratch (`router.rs:766-786`).
+pxy rebuilds the upstream request rather than forwarding the client's own
+headers. This section originally proposed forwarding them on the claude-oauth
+path, where it would have been pure subtraction-of-mutation (the client really
+was Claude Code).
 
-| header | Claude Code sends | pxy sends |
-|---|---|---|
-| `anthropic-beta` | yes | forwarded, `oauth-2025-04-20` appended as a second header line |
-| `anthropic-version` | `2023-06-01` | dropped; hardcoded `2023-06-01` (`router.rs:783-785`) |
-| `user-agent` | real `claude-cli/<version>` | replaced by static `claude-cli/2.1.220 (external, cli)` from `config.example.toml:132` — a pinned, aging fingerprint |
-| `x-app: cli` | yes | **dropped** |
-| `x-stainless-*` (9 headers) | yes | **all dropped** |
-| `x-client-request-id` | yes | dropped |
-| `anthropic-dangerous-direct-browser-access` | yes | dropped |
-
-Forwarding these on the claude-oauth path is pure subtraction-of-mutation: the
-client's own values, unchanged. It is *not* impersonation — CC really is the
-client. (CLIProxyAPI additionally reconstructs header **casing and ordering**
-via `applyClaudeWireHeaderCasing`, `claude_executor_request.go:988-1028`, since
-Go canonicalizes and sorts. Lower priority; `hyper` gives more control than Go
-does, but nothing observed suggests Anthropic gates on it for a real token.)
+**docs/11 §1 reversed this and it is not to be revived.** With OAuth removed
+there is no first-party path left, so forwarding a client's identifying headers
+would mean attaching them to requests bound for unrelated third-party
+aggregators — leaking who the user is running, for no benefit. The per-header
+detail that was here has been dropped with the recommendation.
 
 ### 2.6 The 128k default context gate can refuse a long native session
 
@@ -539,11 +517,11 @@ the original bytes).
    failover. pxy's pre-first-event commit is the same idea; theirs additionally
    pattern-matches the bootstrap failure body.
 
-Deliberately **not** taking: uTLS/JA3 spoofing, `cch=` body signing, MCP
-tool-name cloaking, zero-width obfuscation, synthetic device identities, the
-plugin FFI ABI, WebSocket/Realtime surfaces, cluster mode, the management REST
-API + TUI. All are either docs/09 §11 non-goals or scale features for a
-multi-tenant deployment pxy explicitly is not.
+Deliberately **not** taking: anything whose purpose is to disguise which
+client is making the request (docs/09 §11 non-goals — the specifics are not
+catalogued here on purpose), plus the plugin FFI ABI, WebSocket/Realtime
+surfaces, cluster mode and the management REST API + TUI, which are scale
+features for a multi-tenant deployment pxy explicitly is not.
 
 ---
 
@@ -584,17 +562,10 @@ binding OpenAI document is silent, and the product lead explicitly blessed OSS
 clients on Sign-in-with-ChatGPT), but resting on a revocable X post rather than
 contract. Blocked on Saiful actually having/logging in a ChatGPT subscription —
 there is no `~/.codex/auth.json` on this machine today.
-8. **Prefer driving `codex app-server` with `chatgptAuthTokens`** over a raw
-   `codex-oauth` provider kind (§0.1). It is OpenAI's documented surface for a
-   host app that owns the user's ChatGPT auth lifecycle, so it stays inside a
-   shipped harness instead of emitting sub2api-shaped traffic. A hand-rolled
-   `chatgpt.com/backend-api/codex` client (the CLIProxyAPI recipe in §1) is the
-   fallback only if app-server can't be driven headlessly.
-   Never set `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` — spoofing a first-party
-   originator is exactly the line §0.1 says not to cross.
-9. `WireFormat::Responses` so codex↔ChatGPT is passthrough rather than triple
-   translation (§3). Only worth it with #8, and only on the raw-client fallback
-   (app-server owns the protocol itself).
+8-9. **CANCELLED by docs/11 §0** — pxy is API-key only and will not carry
+   ChatGPT subscription traffic at all, so neither a `codex-oauth` provider kind
+   nor the `WireFormat::Responses` work that only mattered alongside it is on
+   the roadmap. The implementation notes have been removed.
 
 **Tier 2 — hardening.** Refresh singleflight + `WithoutCancel` + 429 block map
 (§4.3); per-credential transport pools (§4.4); content-negotiated `/v1/models`

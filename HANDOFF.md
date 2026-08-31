@@ -161,8 +161,8 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 - **fx agent support (2026-08-26)**: `pxy launch fx` (vercel-labs/fx). fx speaks a THIRD
   dialect — the Vercel AI SDK LanguageModel spec v4 — at `POST /v3/ai/language-model`:
   `prompt[]` not `messages[]`, model id + streaming as HEADERS, typed SSE parts. pxy
-  impersonates the gateway (translate/aisdk.rs wraps the OpenAI path like responses.rs
-  does for codex) and also serves `/coding-agent/v1/{models,credits}`. fx source is
+  implements that gateway API locally (translate/aisdk.rs wraps the OpenAI path like
+  responses.rs does for codex) and also serves `/coding-agent/v1/{models,credits}`. fx source is
   cloned to gitignored `references/fx` (Zig) — verify protocol claims there.
   Launch needs BOTH `FX_GATEWAY_BASE_URL` (catalog/credits) and `FX_GATEWAY_CHAT_URL`
   (generation — its own var; a base-URL-only override still sends the real token to
@@ -420,20 +420,28 @@ Key invariants worth preserving (learned the hard way, see docs/03 + docs/05):
 
 **Paid reserves (deliberately NOT in `auto`):**
 - `agentrouter` / `agentrouter-openai` — $125 balance, Opus 5 / Opus 4.8 / gpt-5.6-sol /
-  deepseek-v4f. WAF requires the `claude-cli/...` User-Agent (already set).
+  deepseek-v4f. Their gateway rejects requests that do not carry a `claude-cli/...`
+  User-Agent, so config sets one (see the residual note below).
   deepseek-v4f now also sits on the Anthropic route with `force_stream = true`
   (their route rejects it without stream) — but as of 2026-08-25 evening (and still
   2026-08-26) agentrouter has NO deepseek-v4f channel on EITHER route (503 "无可用渠道");
   upstream churn, retry later.
 - `tabitoken` — $120 referral credits (added 2026-08-25), Opus 5 / 4.8 (+ `-thinking`
-  variants). Same claude-cli UA WAF; speaks Anthropic natively; fronts Kiro/Amazon-Q
+  variants). Same User-Agent requirement; speaks Anthropic natively; fronts Kiro/Amazon-Q
   accounts (usage leaks `kiro_credits`). ⚠️ injects ~7k hidden prompt tokens per call,
   billed to us — use for real sessions, not one-liners. Remote usage IS readable
   (earlier "no balance endpoint" note was wrong: /v1/dashboard/billing/usage answers
-  with the claude-cli UA + Bearer — wired into `pxy status --remote`, used $2.40).
+  with that UA + Bearer — wired into `pxy status --remote`, used $2.40).
 - `gorouter` — $70 referral credits (added 2026-08-25). Same operator as tabitoken
-  (identical WAF, models, injection, `kiro_credits`) — same caveats. Combined Opus
+  (identical gateway, models, injection, `kiro_credits`) — same caveats. Combined Opus
   reserve across both: ~$190.
+
+⚠️ **Residual, worth revisiting**: those three resale gateways are the ONLY place left
+where pxy sends a client identity that is not its own — a `claude-cli/...` User-Agent
+in `config.example.toml`, because their gateway rejects other values. It is config, not
+code, and they are paid accounts we hold credits with. But it sits against the rule the
+2026-08-31 round settled on (identify honestly everywhere), so: try an honest
+`pxy/<version>` UA against each and drop the override wherever it still works.
 - `fireworks` — pay-per-token, $1 signup credit only.
 
 **Commented out (dead):** `deepseek` ($0 balance, no free tier), `v0-vercel` (API plan-gated,

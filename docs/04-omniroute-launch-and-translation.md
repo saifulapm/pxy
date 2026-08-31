@@ -6,9 +6,11 @@ Source: exploration of `references/OmniRoute`. Paths relative to that repo.
 
 - **`omniroute launch` / `run <target>`** (`bin/cli/commands/launch.mjs`, `run.mjs`,
   `cli-manifest.mjs`): env-var + ephemeral-config injection. This is the `pxy launch` analogue.
-- **AgentBridge** = TLS MITM (:443, /etc/hosts spoof, root CA) for agents that hardcode their
-  endpoint (Cursor, Copilot, Kiro IDE...). The `agent_bridge_*` tables belong to this. **pxy
-  skips this entirely.**
+- **AgentBridge** = OmniRoute's traffic-interception layer for agents that hardcode their
+  endpoint (Cursor, Copilot, Kiro IDE...). It worked by intercepting TLS at the machine
+  level. The `agent_bridge_*` tables belong to this. **pxy rejects this entirely and
+  always has** — it is a permanent non-goal (docs/09 §11), not a deferred feature. pxy
+  only ever serves agents that can be pointed at a local endpoint by configuration.
 
 ## Launch flow to copy (run.mjs:361-454)
 
