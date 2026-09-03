@@ -86,6 +86,15 @@ fn client_ctx(headers: &HeaderMap) -> ClientContext {
             .and_then(|v| v.to_str().ok())
             .map(String::from),
         agent: client_agent(headers),
+        // Client-wins: opencode's own id beats anything pxy would synthesize.
+        // It only sends `x-opencode-session` when the provider it is talking
+        // to is named `opencode*`; configured under any other name (pxy uses
+        // `pxy`) it sends the session-affinity spelling instead.
+        session: ["x-opencode-session", "x-session-affinity", "x-session-id"]
+            .iter()
+            .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string()),
     }
 }
 
@@ -932,14 +941,24 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         // never be fresher than the last call pxy routed — the age is part of
         // the line, and a snapshot from before an out-of-band session
         // (tokenharbor's own CLI, their web chat) will read low.
+        // A provider can meter TWO independent windows (tokenharbor bills the
+        // free lineup and a paid pass separately, and its dashboard shows both
+        // bars); each gets its own row, the pass under `provider#pass` in the
+        // same spelling the state keys use for sub-accounts.
         let snapshots: Vec<(String, String, Value)> = cfg
             .providers
             .iter()
             .filter(|(n, p)| p.enabled && wanted(n))
-            .filter_map(|(n, _)| {
-                let raw = state.kv_get(&crate::router::free_quota_key(n)).ok().flatten()?;
+            .flat_map(|(n, _)| {
+                [
+                    (n.clone(), crate::router::free_quota_key(n), "free"),
+                    (format!("{n}#pass"), crate::router::plan_quota_key(n), "pass"),
+                ]
+            })
+            .filter_map(|(label, key, allowance)| {
+                let raw = state.kv_get(&key).ok().flatten()?;
                 let snap: Value = serde_json::from_str(&raw).ok()?;
-                Some((n.clone(), free_quota_summary(&snap, now), snap))
+                Some((label, allowance_summary(&snap, now, allowance), snap))
             })
             .collect();
         if targets.is_empty() && snapshots.is_empty() && !json_out {
@@ -1074,12 +1093,12 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
 
 /// A remembered allowance snapshot as one line. The age is not decoration:
 /// this number is only as current as the last request pxy routed there.
-fn free_quota_summary(snap: &Value, now: Timestamp) -> String {
+fn allowance_summary(snap: &Value, now: Timestamp, allowance: &str) -> String {
     let pct = snap["usedPct"].as_f64().unwrap_or(0.0);
     let plan = snap["plan"].as_str().filter(|s| !s.is_empty()).unwrap_or("free");
-    // Printed as sent: at a few hundred tokens into a 7-day allowance the
+    // Printed as sent: at a few hundred tokens into a multi-week allowance the
     // interesting digit is often the fractional one.
-    let mut line = format!("{plan} tier {pct}% of the rolling allowance used");
+    let mut line = format!("{plan} tier · {pct}% of the rolling {allowance} allowance used");
     let resets = snap["resetsAt"].as_str().unwrap_or("");
     if !resets.is_empty() {
         // chars().take, not byte-slicing: a non-ASCII upstream stamp would
@@ -1124,6 +1143,28 @@ fn newapi_balance(body: &Value) -> Option<(f64, f64)> {
 /// report money while every call returns "Insufficient Balance". Lead with the
 /// money, never omit the verdict, and treat a missing flag as unusable: we
 /// cannot claim it works.
+/// ZenMux pay-as-you-go (`GET /api/v1/management/payg/balance`, Management API
+/// Key only). Shaped like OpenRouter's but with NO `total_usage`, and the
+/// meaning differs: `total_credits` is what is LEFT, not the grant. So this
+/// must be tried only AFTER the OpenRouter arm, and it insists on ZenMux's own
+/// `{success, data.currency}` envelope rather than matching `total_credits`
+/// alone — otherwise a spent OpenRouter account would read as full.
+/// The top-up/bonus split is printed because bonus credits are promotional:
+/// they are the half that can expire out from under you.
+fn zenmux_balance(body: &Value) -> Option<String> {
+    if !body["success"].is_boolean() || !body["data"]["currency"].is_string() {
+        return None;
+    }
+    let d = &body["data"];
+    let total = d["total_credits"].as_f64()?;
+    Some(match (d["top_up_credits"].as_f64(), d["bonus_credits"].as_f64()) {
+        (Some(top), Some(bonus)) => {
+            format!("${total:.2} left (${top:.2} top-up + ${bonus:.2} bonus)")
+        }
+        _ => format!("${total:.2} left"),
+    })
+}
+
 fn deepseek_balance(body: &Value) -> Option<String> {
     let infos = body["balance_infos"].as_array()?;
     let num = |v: &Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
@@ -1207,6 +1248,9 @@ async fn fetch_balance(
         let line = format!("${:.2} left of ${credits:.2}", credits - usage);
         return (line, Some(body));
     }
+    if let Some(line) = zenmux_balance(&body) {
+        return (line, Some(body));
+    }
     if let Some((left, grant)) = newapi_balance(&body) {
         return (format!("${left:.2} left of ${grant:.2}"), Some(body));
     }
@@ -1287,6 +1331,38 @@ mod tests {
     /// DeepSeek reports money as strings and usability as a separate flag.
     /// Reading the number alone is the trap: an account whose grant expired
     /// still reports a total while refusing every call.
+    #[test]
+    /// The documented ZenMux payg body, and the collisions it must NOT cause:
+    /// `total_credits` means "left" here but "granted" at OpenRouter.
+    #[test]
+    fn zenmux_balance_reads_left_credits_with_the_bonus_split() {
+        let line = zenmux_balance(&json!({
+            "success": true,
+            "data": {"currency": "usd", "total_credits": 482.74,
+                     "top_up_credits": 35.0, "bonus_credits": 447.74},
+        }))
+        .unwrap();
+        assert_eq!(line, "$482.74 left ($35.00 top-up + $447.74 bonus)");
+        // A $5 top-up with no promo credits.
+        let plain = zenmux_balance(&json!({
+            "success": true,
+            "data": {"currency": "usd", "total_credits": 5.0,
+                     "top_up_credits": 5.0, "bonus_credits": 0.0},
+        }))
+        .unwrap();
+        assert_eq!(plain, "$5.00 left ($5.00 top-up + $0.00 bonus)");
+        // An OpenRouter body must fall through to the OpenRouter arm, not be
+        // claimed here (no `success` envelope, and total_credits is the grant).
+        assert!(
+            zenmux_balance(&json!({"data": {"total_credits": 10.0, "total_usage": 4.0}})).is_none()
+        );
+        // Error envelope: no numbers to report.
+        assert!(
+            zenmux_balance(&json!({"success": false, "message": "Invalid API key", "data": null}))
+                .is_none()
+        );
+    }
+
     #[test]
     fn deepseek_balance_reads_strings_and_leads_with_usability() {
         let ok = deepseek_balance(&json!({
@@ -1513,17 +1589,37 @@ mod tests {
     #[test]
     fn free_quota_snapshot_line_carries_age_and_reset() {
         let now: Timestamp = "2026-08-26T12:00:00Z".parse().unwrap();
-        let line = free_quota_summary(
+        let line = allowance_summary(
             &json!({
                 "usedPct": 12.0, "plan": "free",
                 "resetsAt": "2026-09-02T10:08:33.419881+00:00",
                 "observedAt": "2026-08-26T09:30:00Z",
             }),
             now,
+            "free",
         );
-        assert!(line.contains("free tier 12% of the rolling allowance used"), "{line}");
+        assert!(line.contains("free tier · 12% of the rolling free allowance used"), "{line}");
         assert!(line.contains("resets 2026-09-02 10:08"), "{line}");
         assert!(line.contains("seen 2h ago"), "{line}");
+    }
+
+    /// The Agent Pass window is reported as its own row, named for the pass
+    /// (`x-th-plan`) rather than folded into the free line.
+    #[test]
+    fn agent_pass_snapshot_line_names_the_pass_allowance() {
+        let now: Timestamp = "2026-09-03T12:00:00Z".parse().unwrap();
+        let line = allowance_summary(
+            &json!({
+                "usedPct": 0.0, "plan": "agent",
+                "resetsAt": "2026-09-09T10:08:33.419881+00:00",
+                "observedAt": "2026-09-03T11:00:00Z",
+            }),
+            now,
+            "pass",
+        );
+        assert!(line.contains("agent tier · 0% of the rolling pass allowance used"), "{line}");
+        assert!(line.contains("resets 2026-09-09 10:08"), "{line}");
+        assert!(line.contains("seen 60m ago"), "{line}");
     }
 
     #[test]

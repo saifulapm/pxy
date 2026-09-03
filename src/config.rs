@@ -564,6 +564,9 @@ pub enum MediaKind {
     Agnes,
     /// DashScope (Alibaba) multimodal-generation: images/TTS/ASR on one URL.
     Dashscope,
+    /// Meta: images are plain OpenAI shape, but ASR takes a `request` JSON
+    /// part beside the `audio` bytes and answers `{transcript}`.
+    Meta,
 }
 
 #[cfg(test)]

@@ -101,6 +101,20 @@ async fn attempt_transcription(
                 .send()
                 .await
         }
+        MediaKind::Meta => {
+            // Meta ASR: a `request` JSON part naming the model and encoding,
+            // beside the raw bytes as `audio`. Neither part needs a
+            // content-type (verified live), and WAV is the only encoding the
+            // endpoint serves — anything else is rejected upstream.
+            let form = reqwest::multipart::Form::new()
+                .text("request", json!({"model": r.model, "audioEncoding": "WAV"}).to_string())
+                .part(
+                    "audio",
+                    reqwest::multipart::Part::bytes(upload.bytes.clone())
+                        .file_name(upload.filename.clone()),
+                );
+            req.multipart(form).send().await
+        }
         _ => {
             // OpenAI multipart (groq, mistral) — elevenlabs differs only in
             // the model field name.
@@ -156,9 +170,12 @@ async fn attempt_transcription(
     let wrapped_text = |v: &Value| match r.media.kind {
         MediaKind::Cloudflare => v["result"]["text"].as_str().map(String::from),
         MediaKind::Dashscope => super::dashscope::transcription_text(v),
+        // An empty `transcript` is a real answer (silence), not a defect.
+        MediaKind::Meta => v["transcript"].as_str().map(String::from),
         _ => None,
     };
-    let unwraps = matches!(r.media.kind, MediaKind::Cloudflare | MediaKind::Dashscope);
+    let unwraps =
+        matches!(r.media.kind, MediaKind::Cloudflare | MediaKind::Dashscope | MediaKind::Meta);
     let (body, content_type) = if unwraps {
         let text = serde_json::from_slice::<Value>(&bytes).ok().as_ref().and_then(wrapped_text);
         let Some(text) = text else {

@@ -453,11 +453,104 @@ retry later, same churn as its deepseek channel.
 **Commented out (dead):** `deepseek` ($0 balance, no free tier), `v0-vercel` (API plan-gated,
 404s), plus `freemodel-dev` (insufficient balance).
 
+**`tokenharbor` — Agent Pass bought 2026-09-03 ($0.99/mo), provider re-enabled.**
+The account now meters TWO independent rolling 4-week windows, which is what its
+dashboard's two bars are: a **free allowance** (the free lineup) and a **pass
+allowance** (everything the Agent Pass unlocks, ~800+ deepseek-v4-flash requests).
+Neither has an endpoint — both are reported only in undocumented response headers,
+and a response carries whichever window it drew on: `x-th-free-used-pct` /
+`x-th-free-resets` on free-lineup calls, `x-th-plan-used-pct` / `x-th-plan-resets`
+on pass calls, with `x-th-plan` naming the pass ("free", "agent", …). The router
+snapshots each under its own kv key (`free_quota:` / `plan_quota:`) and
+`pxy status --remote` prints one row per window — `tokenharbor` and
+`tokenharbor#pass`. ⚠️ The old "never billed" note is WRONG now: past the included
+usage TokenHarbor falls through to **pay-as-you-go at 5% off** rather than
+stopping, so the 100% cooldown is a BILLING GUARD. It stays deliberately
+provider-wide and blunt — over-broad in one direction (a spent free window also
+parks the paid models, which still have their own allowance), which is the safe
+direction to be wrong in. Probed 2026-09-03: glm-5.3-flash, gpt-5.6-luna,
+mimo-v2.5-pro and qwen3.8-flash all meter against the pass.
+
+**`x-opencode-session` — REQUIRED from 2026-09-06 (email from opencode.ai, 2026-09-03).**
+They flagged that our requests arrived with NO user agent and no session header, and
+warned that from 09/06 requests missing it "may error". Verified on a local stub: pxy
+sent neither — it STRIPPED even a client-supplied `x-opencode-session`/`User-Agent`,
+because upstream headers come only from `providers::prepare` (config `headers` + auth).
+Fix (router.rs): every provider whose NAME starts with `opencode` now gets
+`x-opencode-session` — the same rule the opencode CLI itself uses to decide whether to
+emit the header set. Value = the client's own id when present (`ClientContext.session`
+reads `x-opencode-session`, then `x-session-affinity` / `x-session-id` — opencode only
+sends the first spelling when its provider is named `opencode*`, and `pxy launch
+opencode` registers pxy as `pxy`, so the fallbacks are the realistic path), otherwise
+`conversation_fingerprint()`. ⚠️ That fingerprint is deliberately NOT a per-request
+UUID: opencode routes on this value (`stickyId` in their zen handler), so a fresh id
+each turn scatters one conversation across upstreams and loses every prompt-cache hit
+— the exact bug OmniRoute #10571 fixed. It mixes only what survives a conversation:
+model + system prompt + FIRST user message + sorted tool names, FNV-1a (hand-rolled:
+`DefaultHasher` does not promise stability across restarts/Rust versions, which this
+needs). Scoped on purpose — the id fingerprints a conversation and must not reach
+third-party upstreams; a test asserts deepseek/meta/tokenharbor/zenmux never match.
+The **User-Agent is config-only** (`headers = { User-Agent = … }`, the agentrouter
+mechanism) on opencode-zen/opencode-go. ⚠️ Saiful's explicit call 2026-09-03: it claims
+the opencode CLI identity `opencode/latest/1.18.21/cli` (real format
+`opencode/<channel>/<version>/<client>`, from their `installation/index.ts`) rather
+than an honest `pxy/0.1.0` — so this is now the SECOND place pxy sends an identity not
+its own, alongside agentrouter. Bump the version when the local CLI moves.
+Verified end-to-end on a stub: turns 1 and 4 of one conversation share an id, a
+different conversation differs, a client id wins, and a non-opencode provider gets
+neither header. NOTE 2026-09-03: opencode-zen is answering "Model is unavailable" /
+"Internal server error" upstream for its free ids — pre-existing, identical with and
+without the UA, unrelated to this change.
+
+**`zenmux` — re-enabled 2026-09-03 with 18 PAID models; $5 prepaid balance.**
+`pxy status --remote` can read it, but ONLY with a **Management API Key**: the whole
+`/api/v1/management/*` family answers 403 "Invalid API key" to the inference key and
+needs a separate key from https://zenmux.ai/platform/management, stored at
+`AI/zenmux/manage`. Endpoint `GET /api/v1/management/payg/balance`; the docs' path
+is the one thing worth remembering, since every guessable spelling (`/api/v1/credits`,
+`/api/v1/user/balance`, …) falls through to their Next.js app and returns an HTML 404
+— only `/api/v1/generation` and `/api/v1/management/*` reach the API router at all.
+Body is `{success, data:{currency, total_credits, top_up_credits, bonus_credits}}`:
+OpenRouter-shaped but with NO `total_usage`, and `total_credits` is what is LEFT
+rather than the grant — so `zenmux_balance()` keys on the `{success, data.currency}`
+envelope and is tried AFTER the OpenRouter arm, or a spent OpenRouter account would
+read as full. ZenMux wants `Authorization: Bearer <key>` while pxy sends `balance_key`
+RAW (aihubmix's Manage Key must not be prefixed), so the Bearer is baked into the
+secret via `cmd` — no code change, since `balance_key` IS the raw header value.
+⚠️ That cmd needs `set -e` + `test -n`: a bare `printf "Bearer %s" "$(pass show …)"`
+exits 0 when the entry is missing, sends a hollow `Bearer `, and the row degrades to
+a misleading generic "HTTP 401" instead of naming the missing secret.
+Free list churns — `deepseek/deepseek-v4-flash-vision-exp-free` is now delisted.
+
 **Service/media-only providers (Phase 2, 2026-08-25):** `elevenlabs` (STT/TTS, xi-api-key
 auth), `voyage` (rerank + embeddings), `jina` (rerank; same key as jina-reader), plus
 `[[search.providers]]` brave/jina/firecrawl and `[[fetch.providers]]` jina-reader/firecrawl.
 Media capabilities on existing providers: cloudflare (images/STT/TTS via run endpoint),
-groq + mistral (STT), agnes (images/video).
+groq + mistral (STT), agnes (images/video), meta (images/STT).
+
+**`meta` — first-party Meta Model API, added 2026-09-03 (PAID, no free tier).**
+One key (`AI/facebook/main`) serves chat, images and ASR. Chat goes over the
+**Anthropic** route (`/v1/messages`): verified live to return `redacted_thinking`
+blocks, `tool_use` + `stop_reason`, and real SSE — higher fidelity than its
+OpenAI route, which drops the thinking blocks. Two tiers of the same models:
+`muse-spark-1.3`/`1.2` at $1.25/$4.25 per 1M, and `-contributor` at $0.10/$0.20
+**in exchange for Meta training on your prompts and completions**. Contributor
+ids are listed first; `meta/muse-spark-1.3-contributor` is the tail of
+`[groups.credit]`. ⚠️ Prompt caching is AUTOMATIC (a cold probe reported 497
+`cache_read_input_tokens` with no `cache_control` sent) — so this provider must
+NOT get `inject_cache_control`; docs/11 §4.1 does not apply to it. No
+`balance_url`: Meta publishes no billing endpoint, spend is console-only.
+Its ASR needed the one new media dialect, **`kind = "meta"`**: `/v1/asr/transcribe`
+takes a `request` JSON part (`model` + `audioEncoding: "WAV"`) beside an `audio`
+part, and answers `{transcript, turns, audioDurationMs}` — the OpenAI `file` +
+`model` form 400s with "Both a 'request' and an 'audio' part are required".
+pxy unwraps it to `{text}`. Images are ordinary OpenAI
+`/v1/images/generations` (b64_json), untouched by the dialect. ⚠️ Meta's ASR
+accepts ONLY RIFF/WAVE mono 16-bit PCM at 16/24 kHz (≤32 MB, ≤10 min) and pxy
+forwards client bytes untouched, so mp3/m4a uploads are rejected upstream.
+Verified end-to-end through :4100 on 2026-09-03, ASR included (TTS→WAV→Meta
+round-trip returned the sentence verbatim). Not in `[media]` defaults — those
+chains stay free-first, and Meta bills per image ($0.01) and per audio-hour ($0.18).
 
 ## Where we left off — NEXT STEPS
 

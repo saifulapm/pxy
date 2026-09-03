@@ -47,6 +47,12 @@ pub struct ClientContext {
     /// from the x-pxy-agent header or the api-key suffix `pxy launch` sets.
     /// Only feeds the per-model usage stats — never routing.
     pub agent: Option<String>,
+    /// The client's own conversation id, if it sent one: `x-opencode-session`,
+    /// or the `x-session-affinity` / `x-session-id` spelling opencode falls
+    /// back to when the provider it is configured with isn't named `opencode*`
+    /// (which is pxy's case — `pxy launch opencode` registers it as `pxy`).
+    /// Forwarded ONLY to opencode-family upstreams; see `opencode_session`.
+    pub session: Option<String>,
 }
 
 /// Outcome handed to the HTTP layer.
@@ -968,6 +974,18 @@ async fn try_candidate(
     for (k, v) in &prepared.headers {
         req = req.header(k, v);
     }
+    // opencode.ai routes on `x-opencode-session` and, from 2026-09-06, errors
+    // without it. Client's own id wins; otherwise fingerprint the conversation
+    // so the value is stable across the turns of one session. Scoped to
+    // opencode upstreams — this identifies a conversation and is nobody
+    // else's business.
+    if is_opencode_provider(&cand.provider)
+        && !prepared.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-opencode-session"))
+    {
+        let session =
+            ctx.session.clone().unwrap_or_else(|| conversation_fingerprint(payload));
+        req = req.header("x-opencode-session", session);
+    }
     if upstream_format == WireFormat::Anthropic {
         if let Some(beta) = &ctx.anthropic_beta {
             req = req.header("anthropic-beta", beta.clone());
@@ -1085,7 +1103,7 @@ async fn try_candidate(
     // After the clear: a success response can still carry "you just used the
     // last of your quota" headers, and that cooldown must survive it.
     check_quota_exhaustion(&app.state, &cand.state_provider(), resp.headers());
-    record_free_allowance(&app.state, &cand.state_provider(), resp.headers());
+    record_allowances(&app.state, &cand.state_provider(), resp.headers());
     if !stream && search.is_none() {
         info!(candidate = %cand.full_id(), stream, "routed");
     }
@@ -1478,32 +1496,136 @@ fn passthrough_outcome(
     AttemptResult::Fatal(passthrough_json(client_format, status, err_body, full_id, headers))
 }
 
+/// Is this an opencode.ai upstream? Their gateway wants an `x-opencode-session`
+/// on every request (from 2026-09-06 requests without one "may error"), and it
+/// is the key their side routes on — same session means the same upstream
+/// provider, which is what makes prompt caching hit across a conversation.
+///
+/// Matched on the provider NAME, which is exactly the rule the opencode CLI
+/// itself uses to decide whether to emit the header set. The scope matters:
+/// the id fingerprints the conversation, so it must not be handed to unrelated
+/// third-party upstreams.
+fn is_opencode_provider(provider: &str) -> bool {
+    provider.starts_with("opencode")
+}
+
+/// A conversation-stable session id derived from the request itself, for
+/// clients that send none of their own (claude, codex, fx …).
+///
+/// Deliberately NOT random per request: opencode routes on this value, so a
+/// fresh id every turn would scatter one conversation across upstreams and
+/// lose every prompt-cache hit — the exact bug OmniRoute #10571 fixed. Only
+/// fields that survive a conversation are mixed in: the model, the system
+/// prompt, the FIRST user message, and the tool names. Later turns append
+/// messages, so anything reading the whole history would change every turn.
+///
+/// FNV-1a rather than a crypto hash: this is an opaque grouping key, not a
+/// security boundary, and 64 bits is plenty to keep distinct conversations
+/// apart. Hand-rolled because it must stay stable across restarts and Rust
+/// versions, which `DefaultHasher` explicitly does not promise.
+fn conversation_fingerprint(payload: &Value) -> String {
+    fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    // Flatten a string-or-content-array field to the text it carries.
+    fn text_of(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p["text"].as_str().or_else(|| p.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        }
+    }
+
+    let mut h = 0xcbf2_9ce4_8422_2325;
+    if let Some(model) = payload["model"].as_str() {
+        h = fnv1a(model.as_bytes(), h);
+    }
+    // Anthropic carries the system prompt beside the messages; OpenAI puts it
+    // in the first message. Mix in whichever exists.
+    h = fnv1a(text_of(&payload["system"]).as_bytes(), h);
+    if let Some(msgs) = payload["messages"].as_array() {
+        for role in ["system", "user"] {
+            if let Some(m) = msgs.iter().find(|m| m["role"] == role) {
+                h = fnv1a(text_of(&m["content"]).as_bytes(), h);
+            }
+        }
+    }
+    // Tool names, sorted: the tool set identifies the harness, and its wire
+    // order is not stable across turns.
+    if let Some(tools) = payload["tools"].as_array() {
+        let mut names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t["name"].as_str().or_else(|| t["function"]["name"].as_str()))
+            .collect();
+        names.sort_unstable();
+        h = fnv1a(names.join(",").as_bytes(), h);
+    }
+    format!("pxy_{h:016x}")
+}
+
 /// kv key holding a provider's last-seen rolling-allowance snapshot.
 pub fn free_quota_key(provider: &str) -> String {
     format!("free_quota:{provider}")
 }
 
-/// TokenHarbor meters its free tier as a personal rolling 7x24h allowance,
-/// priced by the list-price value of the work — pxy cannot compute that, and
-/// there is no balance endpoint to poll (every /v1/usage-shaped path 404s).
-/// The only readout is a set of undocumented headers on a successful free
-/// completion, so remember the last one: `pxy status --remote` reports the
-/// snapshot with its age instead of a number nobody can fetch.
+/// kv key for the PAID plan's allowance, metered independently of the free one
+/// (tokenharbor's Agent Pass runs alongside the free window, not instead of it).
+pub fn plan_quota_key(provider: &str) -> String {
+    format!("plan_quota:{provider}")
+}
+
+/// TokenHarbor meters its allowances as personal rolling 4-week windows, priced
+/// by the list-price value of the work — pxy cannot compute that, and there is
+/// no balance endpoint to poll (every /v1/usage-shaped path 404s). The only
+/// readout is a set of undocumented headers on a successful completion, so
+/// remember the last one: `pxy status --remote` reports the snapshot with its
+/// age instead of a number nobody can fetch.
 ///
-/// At 100% used the provider is cooled until the window actually rolls: the
-/// exhaustion 429 names no window the body classifier recognizes, so the
-/// generic ladder would keep re-probing a pool that cannot answer for days.
-fn record_free_allowance(state: &State, provider: &str, headers: &reqwest::header::HeaderMap) {
+/// There are TWO independent windows and a response carries whichever one it
+/// drew on: `x-th-free-*` on the free lineup, `x-th-plan-*` on the models a
+/// paid pass unlocks (`x-th-plan` names the pass — "free", "agent", …). They
+/// are snapshotted under separate keys so both show up side by side.
+///
+/// At 100% used the provider is cooled until the window actually rolls. That
+/// is deliberately provider-wide and deliberately BLUNT: past the included
+/// usage TokenHarbor does not stop, it falls through to pay-as-you-go (the
+/// Agent Pass advertises "then 5% off pay-as-you-go"), so an exhausted window
+/// is the moment calls start costing real money. Cooling the whole provider
+/// is the billing guard; it is over-broad in one direction — a spent free
+/// window also parks the paid models, which still have their own allowance —
+/// and that is the safe direction to be wrong in.
+fn record_allowances(state: &State, provider: &str, headers: &reqwest::header::HeaderMap) {
+    let windows = [("free", free_quota_key(provider)), ("plan", plan_quota_key(provider))];
+    for (family, key) in windows {
+        record_allowance(state, provider, headers, family, &key);
+    }
+}
+
+fn record_allowance(
+    state: &State,
+    provider: &str,
+    headers: &reqwest::header::HeaderMap,
+    family: &str,
+    key: &str,
+) {
     let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
-    let Some(pct) =
-        get("x-th-free-used-pct").and_then(|s| s.trim_end_matches('%').trim().parse::<f64>().ok())
+    let Some(pct) = get(&format!("x-th-{family}-used-pct"))
+        .and_then(|s| s.trim_end_matches('%').trim().parse::<f64>().ok())
     else {
         return;
     };
-    let resets = get("x-th-free-resets").unwrap_or_default();
+    let resets = get(&format!("x-th-{family}-resets")).unwrap_or_default();
     let plan = get("x-th-plan").unwrap_or_default();
     let _ = state.kv_set(
-        &free_quota_key(provider),
+        key,
         &json!({
             "usedPct": pct,
             "resetsAt": resets,
@@ -1522,16 +1644,18 @@ fn record_free_allowance(state: &State, provider: &str, headers: &reqwest::heade
             .unwrap_or(Duration::from_secs(3600));
         warn!(
             provider,
+            family,
             pct,
             wait_secs = wait.as_secs(),
-            "upstream reports the free allowance spent; cooling down until it rolls"
+            "upstream reports the allowance spent; cooling down until it rolls \
+             (further calls would bill pay-as-you-go)"
         );
         state.set_cooldown(
             provider,
             None,
             Some(wait),
             false,
-            &format!("free allowance spent (resets {resets})"),
+            &format!("{family} allowance spent (resets {resets})"),
         );
     }
 }
@@ -2908,10 +3032,79 @@ mod tests {
         assert!(s2.cooldown("oa", "any").is_none());
     }
 
+    /// The whole point of the fingerprint: it must NOT move as a conversation
+    /// grows, or opencode scatters one session across upstreams and every
+    /// prompt-cache hit is lost.
+    #[test]
+    fn conversation_fingerprint_survives_appended_turns() {
+        let turn1 = json!({
+            "model": "glm-5.3-flash",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Refactor the parser"},
+            ],
+            "tools": [{"function": {"name": "read"}}, {"function": {"name": "edit"}}],
+        });
+        // Same session, three turns later: history appended, tools reordered.
+        let turn4 = json!({
+            "model": "glm-5.3-flash",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Refactor the parser"},
+                {"role": "assistant", "content": "Which file?"},
+                {"role": "user", "content": "src/lib.rs"},
+                {"role": "assistant", "content": "Done."},
+            ],
+            "tools": [{"function": {"name": "edit"}}, {"function": {"name": "read"}}],
+        });
+        let id = conversation_fingerprint(&turn1);
+        assert_eq!(id, conversation_fingerprint(&turn4));
+        assert!(id.starts_with("pxy_"), "{id}");
+
+        // A different conversation must not collide.
+        let other = json!({
+            "model": "glm-5.3-flash",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Write the changelog"},
+            ],
+        });
+        assert_ne!(id, conversation_fingerprint(&other));
+        // Same prompt on a different model is a different upstream session.
+        let mut swapped = turn1.clone();
+        swapped["model"] = json!("gpt-5.6-luna");
+        assert_ne!(id, conversation_fingerprint(&swapped));
+
+        // Anthropic shape: system beside the messages, content as blocks.
+        let anthropic = json!({
+            "model": "glm-5.3-flash",
+            "system": [{"type": "text", "text": "You are Claude Code."}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        });
+        let a1 = conversation_fingerprint(&anthropic);
+        let mut anthropic2 = anthropic.clone();
+        anthropic2["messages"] = json!([
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        ]);
+        assert_eq!(a1, conversation_fingerprint(&anthropic2));
+        assert_ne!(a1, id);
+    }
+
+    #[test]
+    fn only_opencode_providers_are_matched() {
+        assert!(is_opencode_provider("opencode-go"));
+        assert!(is_opencode_provider("opencode-zen"));
+        // The conversation id must never leak to unrelated upstreams.
+        for p in ["deepseek", "meta", "tokenharbor", "zenmux", "commandcode"] {
+            assert!(!is_opencode_provider(p), "{p}");
+        }
+    }
+
     #[test]
     fn free_allowance_headers_are_remembered_and_cool_at_100() {
         let s = state("free_quota");
-        record_free_allowance(
+        record_allowances(
             &s,
             "th",
             &headers(&[
@@ -2928,9 +3121,11 @@ mod tests {
         assert!(snap["observedAt"].as_str().is_some());
         // A partly-spent allowance is a readout, not a verdict.
         assert!(s.cooldown("th", "any").is_none());
+        // A free-lineup call says nothing about the paid window.
+        assert!(s.kv_get(&plan_quota_key("th")).unwrap().is_none());
 
         // Spent: cool until the window actually rolls, and don't retry into it.
-        record_free_allowance(
+        record_allowances(
             &s,
             "th",
             &headers(&[
@@ -2943,8 +3138,65 @@ mod tests {
         // Far-future reset -> a wait measured in days, not the 1h fallback.
         assert!(cd.until.saturating_duration_since(std::time::Instant::now()).as_secs() > 86_400);
         // A provider that reports nothing must not get a phantom row.
-        record_free_allowance(&s, "other", &headers(&[("x-quota-5h", "3%")]));
+        record_allowances(&s, "other", &headers(&[("x-quota-5h", "3%")]));
         assert!(s.kv_get(&free_quota_key("other")).unwrap().is_none());
+    }
+
+    /// A paid pass meters a SECOND window: a call on a pass-unlocked model
+    /// reports `x-th-plan-*`, which must land under its own key rather than
+    /// overwriting (or being mistaken for) the free allowance.
+    #[test]
+    fn agent_pass_allowance_is_tracked_beside_the_free_one() {
+        let s = state("plan_quota");
+        record_allowances(
+            &s,
+            "th",
+            &headers(&[
+                ("x-th-plan", "agent"),
+                ("x-th-plan-used-pct", "7.5"),
+                ("x-th-plan-resets", "2099-09-09T10:08:33.419881+00:00"),
+            ]),
+        );
+        let snap: Value =
+            serde_json::from_str(&s.kv_get(&plan_quota_key("th")).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["usedPct"], 7.5);
+        assert_eq!(snap["plan"], "agent");
+        assert_eq!(snap["resetsAt"], "2099-09-09T10:08:33.419881+00:00");
+        assert!(s.kv_get(&free_quota_key("th")).unwrap().is_none());
+        assert!(s.cooldown("th", "any").is_none());
+
+        // Both windows on one response (as the dashboard shows them) are kept
+        // apart, each with its own reset.
+        record_allowances(
+            &s,
+            "th2",
+            &headers(&[
+                ("x-th-plan", "agent"),
+                ("x-th-free-used-pct", "40"),
+                ("x-th-free-resets", "2099-09-09T10:08:33.419881+00:00"),
+                ("x-th-plan-used-pct", "3"),
+                ("x-th-plan-resets", "2099-10-01T00:00:00+00:00"),
+            ]),
+        );
+        let free: Value =
+            serde_json::from_str(&s.kv_get(&free_quota_key("th2")).unwrap().unwrap()).unwrap();
+        let pass: Value =
+            serde_json::from_str(&s.kv_get(&plan_quota_key("th2")).unwrap().unwrap()).unwrap();
+        assert_eq!(free["usedPct"], 40.0);
+        assert_eq!(pass["usedPct"], 3.0);
+        assert_eq!(pass["resetsAt"], "2099-10-01T00:00:00+00:00");
+
+        // Pass spent -> cooled, because the next call bills pay-as-you-go.
+        record_allowances(
+            &s,
+            "th3",
+            &headers(&[
+                ("x-th-plan", "agent"),
+                ("x-th-plan-used-pct", "100"),
+                ("x-th-plan-resets", "2099-09-09T10:08:33.419881+00:00"),
+            ]),
+        );
+        assert!(!s.cooldown("th3", "any").expect("provider cooled").retryable);
     }
 
     #[test]
