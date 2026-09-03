@@ -502,6 +502,30 @@ neither header. NOTE 2026-09-03: opencode-zen is answering "Model is unavailable
 "Internal server error" upstream for its free ids — pre-existing, identical with and
 without the UA, unrelated to this change.
 
+**`amd` — AMD Radeon Cloud (developer.amd.com.cn), added 2026-09-03. FREE, 4 models.**
+`DeepSeek-V4-Flash` and `-Vision-Exp` (1M ctx), `Qwen3.8-Flash-Next` (256k),
+`MiniCPM5-1B` (128k); all four tool-call, two do vision. Serves BOTH dialects;
+pxy uses **OpenAI** on purpose — MiniCPM5-1B leaks literal `<think>` tags into
+`content` when a reply is truncated mid-thought (measured: max_tokens=50 → 3/3
+raw from AMD, 0/3 through pxy; max_tokens=250 → neither leaks), and
+`parse_think_tags` only runs on OpenAI-format upstreams. `/messages` is AMD's own
+translation layer over OpenAI-native models, so it buys nothing.
+⚠️ "Limited Free" is a REAL budget and `GET /radeon/api/v1/usage` publishes it —
+that is the `balance_url`, and `amd_balance()` renders it as
+`day $0.0006/$1.00 (0%) · resets … · 20 rpm`. It reports `rpm_limit: 20` (the
+limits block is measured, not guessed) and `daily_cost_limit_usd: 1` on a rolling
+24h window keyed to first use, not a wall-clock day. Printed to 4dp because a
+day's real traffic lands in the third decimal. NOTE `/models` reports per-token
+pricing and `free: false` for all four despite the console listing them FREE:
+the amounts are notional "points", not a charge.
+⚠️ Its 429 is a GLOBAL shared concurrency pool, not our quota — "at its
+concurrency limit (64); please retry later or use another model"
+(`model_concurrency_rate_limit_exceeded`), arriving in <1s and clearing on its
+own, so plain cooldown+failover is right and no error rule is needed. The
+envelope is nested one deeper than the OpenAI norm: `{"detail":{"error":{…}}}`.
+Latency is uneven (.com.cn host): mostly 1-4s, once 31s on deepseek-v4-flash.
+Not in any group yet — explicit `amd/<model>` only.
+
 **`zenmux` — re-enabled 2026-09-03 with 18 PAID models; $5 prepaid balance.**
 `pxy status --remote` can read it, but ONLY with a **Management API Key**: the whole
 `/api/v1/management/*` family answers 403 "Invalid API key" to the inference key and

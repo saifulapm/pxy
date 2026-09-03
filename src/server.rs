@@ -1136,13 +1136,6 @@ fn newapi_balance(body: &Value) -> Option<(f64, f64)> {
     Some((left / UNITS_PER_USD, (left + used) / UNITS_PER_USD))
 }
 
-/// DeepSeek's `GET /user/balance` as a status line, or `None` when this is not
-/// that shape. Two traps live here: the amounts are STRINGS (their precision
-/// choice), and the number is not the fact that matters — `is_available` is.
-/// An expired grant still counts inside `total_balance`, so an account can
-/// report money while every call returns "Insufficient Balance". Lead with the
-/// money, never omit the verdict, and treat a missing flag as unusable: we
-/// cannot claim it works.
 /// ZenMux pay-as-you-go (`GET /api/v1/management/payg/balance`, Management API
 /// Key only). Shaped like OpenRouter's but with NO `total_usage`, and the
 /// meaning differs: `total_credits` is what is LEFT, not the grant. So this
@@ -1165,6 +1158,38 @@ fn zenmux_balance(body: &Value) -> Option<String> {
     })
 }
 
+/// AMD Radeon Cloud (`GET /radeon/api/v1/usage`). The free tier is a rolling
+/// 24h COST budget, and this is the only place it is published — `/models`
+/// reports per-token prices and `free: false` even though the console lists
+/// all four models as free, because the amounts are notional "points" rather
+/// than a charge. What matters is the daily cap and what is left of it.
+/// Matched on the pair of daily_cost_* fields, which nothing else here uses.
+/// Printed to 4dp: a day's real traffic lands in the third decimal, so the 2dp
+/// the dollar-balance providers use would read a flat $0.00 forever.
+fn amd_balance(body: &Value) -> Option<String> {
+    let limit = body["daily_cost_limit_usd"].as_f64()?;
+    let used = body["daily_cost_used_usd"].as_f64()?;
+    let pct = if limit > 0.0 { used / limit * 100.0 } else { 0.0 };
+    let mut line = format!("day ${used:.4}/${limit:.2} ({pct:.0}%)");
+    // Their reset is 24h from first use in the window, not a wall-clock hour,
+    // so it is worth printing rather than assuming midnight.
+    if let Some(reset) = body["daily_reset_at"].as_str() {
+        let stamp: String = reset.chars().take(16).collect();
+        line.push_str(&format!(" · resets {}", stamp.replace('T', " ")));
+    }
+    if let Some(rpm) = body["rpm_limit"].as_u64() {
+        line.push_str(&format!(" · {rpm} rpm"));
+    }
+    Some(line)
+}
+
+/// DeepSeek's `GET /user/balance` as a status line, or `None` when this is not
+/// that shape. Two traps live here: the amounts are STRINGS (their precision
+/// choice), and the number is not the fact that matters — `is_available` is.
+/// An expired grant still counts inside `total_balance`, so an account can
+/// report money while every call returns "Insufficient Balance". Lead with the
+/// money, never omit the verdict, and treat a missing flag as unusable: we
+/// cannot claim it works.
 fn deepseek_balance(body: &Value) -> Option<String> {
     let infos = body["balance_infos"].as_array()?;
     let num = |v: &Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
@@ -1249,6 +1274,9 @@ async fn fetch_balance(
         return (line, Some(body));
     }
     if let Some(line) = zenmux_balance(&body) {
+        return (line, Some(body));
+    }
+    if let Some(line) = amd_balance(&body) {
         return (line, Some(body));
     }
     if let Some((left, grant)) = newapi_balance(&body) {
@@ -1361,6 +1389,29 @@ mod tests {
             zenmux_balance(&json!({"success": false, "message": "Invalid API key", "data": null}))
                 .is_none()
         );
+    }
+
+    /// AMD's free tier is a rolling 24h cost budget; the real numbers are tiny,
+    /// so the line must not round them away.
+    #[test]
+    fn amd_balance_reports_the_daily_cost_budget() {
+        let line = amd_balance(&json!({
+            "rpm_limit": 20,
+            "daily_cost_limit_usd": 1,
+            "daily_cost_used_usd": 0.0005776446,
+            "daily_reset_at": "2026-09-04T11:05:36.196Z",
+        }))
+        .unwrap();
+        assert_eq!(line, "day $0.0006/$1.00 (0%) · resets 2026-09-04 11:05 · 20 rpm");
+        // A budget actually being consumed still reads correctly.
+        let busy = amd_balance(&json!({
+            "daily_cost_limit_usd": 1, "daily_cost_used_usd": 0.75,
+        }))
+        .unwrap();
+        assert_eq!(busy, "day $0.7500/$1.00 (75%)");
+        // Other providers' bodies must not be claimed by this arm.
+        assert!(amd_balance(&json!({"data": {"total_credits": 10.0, "total_usage": 4.0}})).is_none());
+        assert!(amd_balance(&json!({"balance_infos": [{"currency": "USD"}]})).is_none());
     }
 
     #[test]
