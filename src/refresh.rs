@@ -3,7 +3,7 @@
 //! Two catalogs answer two different questions and neither answers both:
 //!   * a provider's `/models` says what THIS ACCOUNT may call (ids, availability,
 //!     and — for the richer gateways — pricing that proves free-ness);
-//!   * models.dev says what a model DOES (tool calling, context) and covers ~94%
+//!   * models.dev says what a model DOES (tool calling, reasoning, context) and covers ~94%
 //!     of what we configure.
 //! Joining them is the whole mechanism: `--generate` writes `models.toml` with
 //! EVERY model discovery listed, free and paid alike. That file is a REPORT —
@@ -70,6 +70,7 @@ impl Tri {
 pub struct Caps {
     pub tool_call: Option<bool>,
     pub context: Option<u64>,
+    pub reasoning: Option<bool>,
 }
 
 /// One model as offered by one provider.
@@ -79,6 +80,7 @@ pub struct Discovered {
     pub canonical: String,
     pub free: Tri,
     pub tool_call: Tri,
+    pub reasoning: Tri,
     pub context: Option<u64>,
 }
 
@@ -134,6 +136,7 @@ pub async fn fetch_capabilities(http: &reqwest::Client) -> Result<HashMap<String
             let caps = Caps {
                 tool_call: rec["tool_call"].as_bool(),
                 context: rec["limit"]["context"].as_u64(),
+                reasoning: rec["reasoning"].as_bool(),
             };
             // First writer wins: providers are iterated in a stable order and
             // the facts are about the MODEL, not the reseller.
@@ -272,6 +275,7 @@ pub async fn discover(
             id: id.to_string(),
             free: free_of(rec, id),
             tool_call: Tri::from_opt(known.and_then(|c| c.tool_call)),
+            reasoning: Tri::from_opt(known.and_then(|c| c.reasoning)),
             context: discovered_context(rec, known),
             canonical: canon,
         });
@@ -434,6 +438,7 @@ struct Row {
     id: String,
     context: u64,
     tool_call: Option<bool>,
+    reasoning: Option<bool>,
     free: Option<bool>,
 }
 
@@ -467,6 +472,7 @@ fn generate(
                     id: d.id.clone(),
                     context: d.context.unwrap_or(crate::config::default_context()),
                     tool_call: d.tool_call.as_opt(),
+                    reasoning: d.reasoning.as_opt(),
                     free: d.free.as_opt(),
                 },
             );
@@ -520,7 +526,10 @@ fn render_generated(per_provider: &BTreeMap<String, Vec<Row>>, stamp: &str) -> S
         "# it really serves 262k). A model missing here is not proof of removal: a\n",
         "# listing can omit a model that works (zai/glm-4.7-flash is absent from\n",
         "# Z.AI's own listing). `free` is a DISPLAY fact (provider pricing as\n",
-        "# discovery saw it); routing never reads it.\n\n",
+        "# discovery saw it); routing never reads it. `reasoning` is models.dev's\n",
+        "# claim about the MODEL, not about this reseller's route to it — it is what\n",
+        "# makes clients that declare capabilities up front (pi) offer a thinking\n",
+        "# level at all, so paste it, then check the level does something.\n\n",
     ));
     for (prov, rows) in per_provider {
         out.push_str(&format!("[providers.{prov}]\nmodels = [\n"));
@@ -528,6 +537,9 @@ fn render_generated(per_provider: &BTreeMap<String, Vec<Row>>, stamp: &str) -> S
             let mut extra = String::new();
             if let Some(t) = r.tool_call {
                 extra.push_str(&format!(", tool_call = {t}"));
+            }
+            if let Some(t) = r.reasoning {
+                extra.push_str(&format!(", reasoning = {t}"));
             }
             if let Some(f) = r.free {
                 extra.push_str(&format!(", free = {f}"));
@@ -655,9 +667,9 @@ mod tests {
             "p".to_string(),
             vec![
                 Discovered { id: "pinned".into(), canonical: "pinned".into(), free: Tri::Yes,
-                             tool_call: Tri::No, context: Some(1_000_000) },
+                             tool_call: Tri::No, reasoning: Tri::Yes, context: Some(1_000_000) },
                 Discovered { id: "new".into(), canonical: "new".into(), free: Tri::No,
-                             tool_call: Tri::Unknown, context: Some(400_000) },
+                             tool_call: Tri::Unknown, reasoning: Tri::Unknown, context: Some(400_000) },
             ],
         )]);
 
@@ -667,7 +679,7 @@ mod tests {
         std::fs::remove_file(&out_path).ok();
 
         // Discovery's numbers, verbatim — including for a model config.toml pins.
-        assert!(out.contains(r#"{ id = "pinned", context_length = 1000000, tool_call = false, free = true }"#), "{out}");
+        assert!(out.contains(r#"{ id = "pinned", context_length = 1000000, tool_call = false, reasoning = true, free = true }"#), "{out}");
         assert!(out.contains(r#"{ id = "new", context_length = 400000, free = false }"#), "{out}");
         // Hand-written models are NOT copied in.
         assert!(!out.contains("hand-only"), "{out}");
@@ -679,13 +691,15 @@ mod tests {
             &BTreeMap::from([(
                 "p".to_string(),
                 vec![
-                    Row { id: "known".into(), context: 8192, tool_call: Some(true), free: Some(false) },
-                    Row { id: "unknown".into(), context: 128_000, tool_call: None, free: None },
+                    Row { id: "known".into(), context: 8192, tool_call: Some(true),
+                          reasoning: Some(false), free: Some(false) },
+                    Row { id: "unknown".into(), context: 128_000, tool_call: None,
+                          reasoning: None, free: None },
                 ],
             )]),
             "2026-08-29",
         );
-        assert!(out.contains(r#"{ id = "known", context_length = 8192, tool_call = true, free = false }"#), "{out}");
+        assert!(out.contains(r#"{ id = "known", context_length = 8192, tool_call = true, reasoning = false, free = false }"#), "{out}");
         assert!(out.contains(r#"{ id = "unknown", context_length = 128000 }"#), "{out}");
         // The rows exist to be pasted into config.toml, so they must parse as
         // config.toml model entries — a report nobody can copy from is useless.

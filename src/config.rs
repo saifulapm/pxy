@@ -878,8 +878,9 @@ pub struct ModelSpec {
     /// Asserted extended-thinking support, for clients that must declare a
     /// model's capabilities up front (pi's provider registration). CAPABILITY
     /// METADATA — routing never reads it, and pxy's own think translation is
-    /// unaffected either way. Set it only from a real verified call; `None` =
-    /// nobody knows, which every client reads as "no".
+    /// unaffected either way. `models.toml` reports models.dev's answer for
+    /// every discovered model, so a pasted row arrives with it already set;
+    /// `None` = nobody knows, which every client reads as "no".
     pub reasoning: Option<bool>,
     /// Always request streaming upstream, even for a non-streaming client
     /// call; pxy collects the stream and returns ordinary JSON. For upstreams
