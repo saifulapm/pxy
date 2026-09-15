@@ -164,6 +164,14 @@ pub struct GroupConfig {
     /// usually enough once title-cased — but "payperuse" can only become
     /// "Pay Per Use" if somebody says so.
     pub name: Option<String>,
+    /// Asserted extended-thinking support for the WHOLE chain, overriding the
+    /// per-member rule (every member `reasoning = true`, or the group offers
+    /// nothing). The rule is right by default — a chain that falls through to
+    /// a non-thinker must not advertise a level it cannot deliver — but it
+    /// cannot be satisfied for a member whose provider has `discover = false`
+    /// and whose upstream is down or out of budget, because there is no call
+    /// to verify it with. Set this only when you know the chain thinks.
+    pub reasoning: Option<bool>,
 }
 
 impl GroupConfig {
@@ -882,6 +890,15 @@ pub struct ModelSpec {
     /// every discovered model, so a pasted row arrives with it already set;
     /// `None` = nobody knows, which every client reads as "no".
     pub reasoning: Option<bool>,
+    /// Which thinking efforts this model actually accepts, in pxy's canonical
+    /// order ("none", "minimal", "low", "medium", "high", "xhigh", "max").
+    /// CAPABILITY METADATA, like `reasoning`: routing never reads it, but a
+    /// client that must declare levels up front (pi's thinkingLevelMap) uses
+    /// it to hide the ones this model would reject — agentrouter's glm-5.3
+    /// 400s on "medium" and asks for low/high/max. Empty = nobody knows, and
+    /// the client falls back to its own default set.
+    #[serde(default)]
+    pub effort: Vec<String>,
     /// Always request streaming upstream, even for a non-streaming client
     /// call; pxy collects the stream and returns ordinary JSON. For upstreams
     /// that error or time out without `stream: true` on some models
@@ -914,6 +931,7 @@ impl ModelEntry {
                 tool_call: None,
                 free: None,
                 reasoning: None,
+                effort: Vec::new(),
                 force_stream: false,
                 drop_params: Vec::new(),
             },

@@ -50,6 +50,11 @@ api_key = "pxy-local"   # soft gate; server binds 127.0.0.1 only
 #     `reasoning = true` — one unmarked member and clients that declare
 #     capabilities up front (pi) stop offering the thinking level for the whole
 #     group. Keep a chain inside one thinking class too, or accept the loss.
+#     `reasoning = true` ON THE GROUP asserts it for the whole chain instead:
+#     the escape hatch for a member that cannot be verified because its
+#     provider has `discover = false` and its upstream is down or out of
+#     budget. It is an assertion, not a discovery — wrong here means pi offers
+#     a level some member silently ignores.
 # ---------------------------------------------------------------------------
 
 # Zero cost, renewable. The default for everyday agent traffic.

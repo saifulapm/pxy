@@ -37,7 +37,39 @@ type CatalogRow = {
   contextLength: number;
   maxOutputTokens: number;
   reasoning?: boolean | null;
+  /// Which thinking efforts this row accepts (a group: what its whole chain
+  /// accepts). Empty = nobody knows.
+  effort?: string[];
 };
+
+/// pi's thinking levels, in its own order. "off" is pxy's "none".
+const PI_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type PiLevel = (typeof PI_LEVELS)[number];
+
+/// Translate pxy's accepted-effort list into pi's map. `null` is the load
+/// bearing value: pi hides a null level from the picker AND clamps a requested
+/// one to the nearest level that survives, so a model that only takes
+/// low/high/max turns pi's default "medium" into "high" instead of a 400.
+/// An empty list says nobody knows, and pi keeps its own default set — never
+/// an all-null map, which would leave a reasoning model with no level at all.
+function thinkingLevelMap(effort: string[] | undefined): Partial<Record<PiLevel, string | null>> | undefined {
+  if (!effort?.length) return undefined;
+  const accepted = new Set(effort);
+  const map: Partial<Record<PiLevel, string | null>> = {};
+  for (const level of PI_LEVELS) {
+    if (level === "off") {
+      // "off" is the one level that is never unsupported: pi sends NO effort
+      // param for an unmapped one, and a model that does not take the literal
+      // "none" still tolerates being asked nothing. Claiming otherwise would
+      // take away the user's ability to stop thinking on the strength of a
+      // value models.dev merely did not list.
+      if (accepted.has("none")) map.off = "none";
+      continue;
+    }
+    map[level] = accepted.has(level) ? level : null;
+  }
+  return map;
+}
 
 async function catalog(): Promise<ProviderModelConfig[]> {
   const { stdout } = await run(PXY_BIN, ["models", "--json"], {
@@ -53,6 +85,9 @@ async function catalog(): Promise<ProviderModelConfig[]> {
     // reasons when every member of its chain does — a thinking level pi offers
     // for a model that has none is a capability it shows and cannot deliver.
     reasoning: row.reasoning === true,
+    // Which of those levels the model will actually take. Absent for a row
+    // nobody has measured, which leaves pi on its own default set.
+    thinkingLevelMap: thinkingLevelMap(row.effort),
     // pxy's config has no per-model image capability to report, so every row
     // is text — the same thing the models.json merge advertised.
     input: ["text"],

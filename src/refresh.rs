@@ -71,6 +71,11 @@ pub struct Caps {
     pub tool_call: Option<bool>,
     pub context: Option<u64>,
     pub reasoning: Option<bool>,
+    /// The thinking efforts models.dev says this model accepts, already in
+    /// canonical order. Empty when it only reports a toggle (thinking on or
+    /// off, no levels) or says nothing at all — both of which are "unknown"
+    /// to a client, not "supports none".
+    pub effort: Vec<String>,
 }
 
 /// One model as offered by one provider.
@@ -81,6 +86,7 @@ pub struct Discovered {
     pub free: Tri,
     pub tool_call: Tri,
     pub reasoning: Tri,
+    pub effort: Vec<String>,
     pub context: Option<u64>,
 }
 
@@ -137,6 +143,7 @@ pub async fn fetch_capabilities(http: &reqwest::Client) -> Result<HashMap<String
                 tool_call: rec["tool_call"].as_bool(),
                 context: rec["limit"]["context"].as_u64(),
                 reasoning: rec["reasoning"].as_bool(),
+                effort: effort_levels(rec),
             };
             // First writer wins: providers are iterated in a stable order and
             // the facts are about the MODEL, not the reseller.
@@ -151,6 +158,34 @@ pub async fn fetch_capabilities(http: &reqwest::Client) -> Result<HashMap<String
         );
     }
     Ok(out)
+}
+
+/// pxy's canonical effort order, lowest first. It is also pi's, minus the
+/// spelling of "off": models.dev says "none" where pi's level is "off", and
+/// the extension renames it on the way out.
+pub const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The efforts one models.dev record accepts, canonically ordered and filtered
+/// to the ones pxy knows. Only an `{"type": "effort", "values": [...]}` entry
+/// answers this: a bare `{"type": "toggle"}` means thinking is on or off with
+/// no levels to choose from, which is not the same as supporting none.
+fn effort_levels(rec: &Value) -> Vec<String> {
+    let Some(opts) = rec["reasoning_options"].as_array() else {
+        return Vec::new();
+    };
+    let Some(values) = opts
+        .iter()
+        .find(|o| o["type"].as_str() == Some("effort"))
+        .and_then(|o| o["values"].as_array())
+    else {
+        return Vec::new();
+    };
+    let listed: BTreeSet<&str> = values.iter().filter_map(Value::as_str).collect();
+    EFFORTS
+        .iter()
+        .filter(|e| listed.contains(*e))
+        .map(|e| e.to_string())
+        .collect()
 }
 
 /// Where a provider's model list lives. Explicit override wins; otherwise
@@ -276,6 +311,7 @@ pub async fn discover(
             free: free_of(rec, id),
             tool_call: Tri::from_opt(known.and_then(|c| c.tool_call)),
             reasoning: Tri::from_opt(known.and_then(|c| c.reasoning)),
+            effort: known.map(|c| c.effort.clone()).unwrap_or_default(),
             context: discovered_context(rec, known),
             canonical: canon,
         });
@@ -439,6 +475,7 @@ struct Row {
     context: u64,
     tool_call: Option<bool>,
     reasoning: Option<bool>,
+    effort: Vec<String>,
     free: Option<bool>,
 }
 
@@ -473,6 +510,7 @@ fn generate(
                     context: d.context.unwrap_or(crate::config::default_context()),
                     tool_call: d.tool_call.as_opt(),
                     reasoning: d.reasoning.as_opt(),
+                    effort: d.effort.clone(),
                     free: d.free.as_opt(),
                 },
             );
@@ -529,7 +567,11 @@ fn render_generated(per_provider: &BTreeMap<String, Vec<Row>>, stamp: &str) -> S
         "# discovery saw it); routing never reads it. `reasoning` is models.dev's\n",
         "# claim about the MODEL, not about this reseller's route to it — it is what\n",
         "# makes clients that declare capabilities up front (pi) offer a thinking\n",
-        "# level at all, so paste it, then check the level does something.\n\n",
+        "# level at all, so paste it, then check the level does something. `effort`\n",
+        "# is which levels that model ACCEPTS: pasting it stops pi from offering a\n",
+        "# level the upstream 400s on (agentrouter's glm-5.3 rejects \"medium\" and\n",
+        "# asks for low/high/max). Absent = unknown, and the client uses its own\n",
+        "# default set.\n\n",
     ));
     for (prov, rows) in per_provider {
         out.push_str(&format!("[providers.{prov}]\nmodels = [\n"));
@@ -540,6 +582,11 @@ fn render_generated(per_provider: &BTreeMap<String, Vec<Row>>, stamp: &str) -> S
             }
             if let Some(t) = r.reasoning {
                 extra.push_str(&format!(", reasoning = {t}"));
+            }
+            if !r.effort.is_empty() {
+                let list =
+                    r.effort.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
+                extra.push_str(&format!(", effort = [{list}]"));
             }
             if let Some(f) = r.free {
                 extra.push_str(&format!(", free = {f}"));
@@ -631,6 +678,36 @@ mod tests {
         assert_eq!(free_of(&json!({}), "gpt-5.6-sol"), Tri::Unknown);
     }
 
+    /// Only an explicit effort list answers "which levels does it take". A
+    /// toggle says thinking is on or off with no levels to pick, and silence
+    /// says nobody measured — reporting either as an empty-but-present list
+    /// would tell pi to hide every level and leave a reasoning model unusable.
+    #[test]
+    fn effort_levels_come_only_from_an_effort_entry() {
+        let levels = |v: Value| effort_levels(&v);
+        assert_eq!(
+            levels(json!({"reasoning_options": [{"type": "effort", "values": ["low", "high", "max"]}]})),
+            ["low", "high", "max"]
+        );
+        // Canonical order, not the order upstream happened to list them.
+        assert_eq!(
+            levels(json!({"reasoning_options": [{"type": "effort", "values": ["max", "none", "low"]}]})),
+            ["none", "low", "max"]
+        );
+        // A budget_tokens sibling must not hide the effort entry.
+        assert_eq!(
+            levels(json!({"reasoning_options": [{"type": "budget_tokens"}, {"type": "effort", "values": ["high"]}]})),
+            ["high"]
+        );
+        // Unknown spellings are dropped rather than passed to a client.
+        assert_eq!(
+            levels(json!({"reasoning_options": [{"type": "effort", "values": ["ludicrous", "high"]}]})),
+            ["high"]
+        );
+        assert!(levels(json!({"reasoning_options": [{"type": "toggle"}]})).is_empty());
+        assert!(levels(json!({})).is_empty());
+    }
+
     #[test]
     fn tri_state_never_collapses_unknown() {
         assert_eq!(Tri::from_opt(None), Tri::Unknown);
@@ -667,9 +744,11 @@ mod tests {
             "p".to_string(),
             vec![
                 Discovered { id: "pinned".into(), canonical: "pinned".into(), free: Tri::Yes,
-                             tool_call: Tri::No, reasoning: Tri::Yes, context: Some(1_000_000) },
+                             tool_call: Tri::No, reasoning: Tri::Yes,
+                             effort: vec!["low".into(), "high".into()], context: Some(1_000_000) },
                 Discovered { id: "new".into(), canonical: "new".into(), free: Tri::No,
-                             tool_call: Tri::Unknown, reasoning: Tri::Unknown, context: Some(400_000) },
+                             tool_call: Tri::Unknown, reasoning: Tri::Unknown,
+                             effort: Vec::new(), context: Some(400_000) },
             ],
         )]);
 
@@ -679,7 +758,7 @@ mod tests {
         std::fs::remove_file(&out_path).ok();
 
         // Discovery's numbers, verbatim — including for a model config.toml pins.
-        assert!(out.contains(r#"{ id = "pinned", context_length = 1000000, tool_call = false, reasoning = true, free = true }"#), "{out}");
+        assert!(out.contains(r#"{ id = "pinned", context_length = 1000000, tool_call = false, reasoning = true, effort = ["low", "high"], free = true }"#), "{out}");
         assert!(out.contains(r#"{ id = "new", context_length = 400000, free = false }"#), "{out}");
         // Hand-written models are NOT copied in.
         assert!(!out.contains("hand-only"), "{out}");
@@ -692,14 +771,15 @@ mod tests {
                 "p".to_string(),
                 vec![
                     Row { id: "known".into(), context: 8192, tool_call: Some(true),
-                          reasoning: Some(false), free: Some(false) },
+                          reasoning: Some(false), effort: vec!["low".into(), "max".into()],
+                          free: Some(false) },
                     Row { id: "unknown".into(), context: 128_000, tool_call: None,
-                          reasoning: None, free: None },
+                          reasoning: None, effort: Vec::new(), free: None },
                 ],
             )]),
             "2026-08-29",
         );
-        assert!(out.contains(r#"{ id = "known", context_length = 8192, tool_call = true, reasoning = false, free = false }"#), "{out}");
+        assert!(out.contains(r#"{ id = "known", context_length = 8192, tool_call = true, reasoning = false, effort = ["low", "max"], free = false }"#), "{out}");
         assert!(out.contains(r#"{ id = "unknown", context_length = 128000 }"#), "{out}");
         // The rows exist to be pasted into config.toml, so they must parse as
         // config.toml model entries — a report nobody can copy from is useless.

@@ -266,7 +266,8 @@ fn models(cfg: &config::Config, json: bool) -> Result<()> {
                 "id": name, "kind": "group", "label": group.label,
                 "size": group.chain.len(),
                 "contextLength": ctx, "maxOutputTokens": max_out,
-                "reasoning": catalog::chain_reasoning(&group.chain),
+                "reasoning": group.reasoning,
+                "effort": catalog::chain_effort(&group.chain),
                 "members": group.chain.iter().map(|c| c.full_id()).collect::<Vec<_>>(),
             })
         })
@@ -293,6 +294,7 @@ fn models(cfg: &config::Config, json: bool) -> Result<()> {
             "toolCall": cand.model.tool_call,
             "free": cand.model.free,
             "reasoning": cand.model.reasoning,
+            "effort": cand.model.effort,
             "groups": membership(&id),
         }));
     }

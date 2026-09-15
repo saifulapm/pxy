@@ -74,6 +74,10 @@ impl Candidate {
 pub struct Group {
     pub label: String,
     pub chain: Vec<Candidate>,
+    /// Whether clients that declare capabilities up front (pi) may offer a
+    /// thinking level for this group: the config's assertion when it made one,
+    /// else the per-member rule.
+    pub reasoning: bool,
 }
 
 pub struct Catalog {
@@ -98,7 +102,7 @@ impl Catalog {
             .groups
             .iter()
             .map(|(name, g)| {
-                let chain = g
+                let chain: Vec<Candidate> = g
                     .models
                     .iter()
                     .filter_map(|entry| {
@@ -122,7 +126,8 @@ impl Catalog {
                         Some(Candidate { provider: prov.to_string(), model: spec, account: None })
                     })
                     .collect();
-                (name.clone(), Group { label: g.label(name), chain })
+                let reasoning = g.reasoning.unwrap_or_else(|| chain_reasoning(&chain));
+                (name.clone(), Group { label: g.label(name), chain, reasoning })
             })
             .collect();
         Self { models, groups }
@@ -267,6 +272,24 @@ pub fn chain_limits(chain: &[Candidate]) -> (u64, u64) {
 /// min() — any member may serve the request, and a client told to expect
 /// thinking from one that has none is a client shown a broken capability.
 /// An empty chain reasons about nothing.
+/// The thinking efforts a whole chain accepts: the INTERSECTION over its
+/// members, in canonical order. Same logic as `chain_reasoning` and for the
+/// same reason — failover picks the member, so a level only one of them takes
+/// is a level the group cannot promise. A member that declares nothing knows
+/// nothing and is skipped rather than counted as accepting everything; an
+/// empty result means nobody knew, and the client keeps its own defaults.
+pub fn chain_effort(chain: &[Candidate]) -> Vec<String> {
+    let mut known = chain.iter().filter(|c| !c.model.effort.is_empty()).peekable();
+    if known.peek().is_none() {
+        return Vec::new();
+    }
+    crate::refresh::EFFORTS
+        .iter()
+        .filter(|e| known.clone().all(|c| c.model.effort.iter().any(|m| m == *e)))
+        .map(|e| e.to_string())
+        .collect()
+}
+
 pub fn chain_reasoning(chain: &[Candidate]) -> bool {
     !chain.is_empty() && chain.iter().all(|c| c.model.reasoning == Some(true))
 }
@@ -395,19 +418,65 @@ mod tests {
             models = ["zai/thinker", "zai/quiet"]
             [groups.one-denied]
             models = ["zai/thinker", "zai/denied"]
+            [groups.asserted]
+            models = ["zai/thinker", "zai/quiet"]
+            reasoning = true
+            [groups.disowned]
+            models = ["zai/thinker"]
+            reasoning = false
             "#,
         )
         .unwrap();
         let cat = Catalog::from_config(&c);
-        let group = |name: &str| {
-            chain_reasoning(&cat.groups().find(|(n, _)| *n == name).unwrap().1.chain)
-        };
+        let group = |name: &str| cat.groups().find(|(n, _)| *n == name).unwrap().1.reasoning;
         assert!(group("all-think"));
         // Unset is not a quiet yes: nobody has verified this model thinks.
         assert!(!group("one-unknown"));
         assert!(!group("one-denied"));
         // An empty chain reasons about nothing.
         assert!(!chain_reasoning(&[]));
+        // The config's own assertion wins both ways: it is the only way to
+        // claim a chain whose members cannot be verified (provider with
+        // `discover = false` and an upstream that is down or out of budget),
+        // and the only way to disclaim one the per-member rule would grant.
+        assert!(group("asserted"));
+        assert!(!group("disowned"));
+    }
+
+    /// Failover picks the member, so the group may only offer a level every
+    /// member takes — one that only some accept is a 400 waiting for the turn
+    /// the chain falls through.
+    #[test]
+    fn a_group_offers_only_the_efforts_its_whole_chain_takes() {
+        let c: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://p.example/chat"
+            models = [
+              { id = "wide", reasoning = true, effort = ["none", "low", "medium", "high"] },
+              { id = "narrow", reasoning = true, effort = ["low", "high", "max"] },
+              { id = "mute", reasoning = true },
+            ]
+            [groups.mixed]
+            models = ["p/wide", "p/narrow"]
+            [groups.with-unknown]
+            models = ["p/narrow", "p/mute"]
+            [groups.nobody-knows]
+            models = ["p/mute"]
+            "#,
+        )
+        .unwrap();
+        let cat = Catalog::from_config(&c);
+        let effort = |name: &str| chain_effort(&cat.groups().find(|(n, _)| *n == name).unwrap().1.chain);
+        // "medium" is dropped (narrow rejects it) and so is "max" and "none".
+        assert_eq!(effort("mixed"), ["low", "high"]);
+        // A member that declares nothing knows nothing: it must not veto the
+        // levels a measured member reported, nor invent any.
+        assert_eq!(effort("with-unknown"), ["low", "high", "max"]);
+        // Nobody measured anything -> say nothing, and let the client decide.
+        assert!(effort("nobody-knows").is_empty());
+        assert!(chain_effort(&[]).is_empty());
     }
 
     /// A mirrored id whose stripped base contains a slash but resolves to
