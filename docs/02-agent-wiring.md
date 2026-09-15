@@ -111,8 +111,17 @@ Fast-mode check + WebFetch domain-safety go directly to api.anthropic.com (ignor
   (`!pass show ...` works!). `compat` flags for quirky upstreams.
 - Launch: `pi --provider pxy --model <pattern>`. (`PI_MODEL`/`PI_PROVIDER` env are *outputs* for
   bash subprocesses, not selectors.)
-- `PI_CODING_AGENT_DIR` relocates the whole agent dir (settings+auth+sessions) — too blunt; prefer
-  merging our provider block into the user's `models.json` (additive by design).
+- `PI_CODING_AGENT_DIR` relocates the whole agent dir (settings+auth+sessions) — too blunt.
+- **Extensions can register a provider outright** (verified on 0.85.1): a `.ts` in
+  `~/.pi/agent/extensions/` whose default export calls `pi.registerProvider("pxy", { baseUrl,
+  apiKey, api, headers, models })` with the same fields the `models.json` block carries. The
+  factory may be `async` and pi waits for it, so the model list can be fetched at startup — it is
+  registered in time for the interactive picker and for `pi --list-models`. `refreshModels()` on
+  the same config re-reads the list without a restart.
+  This is what pxy uses, and it beats the `models.json` merge on both counts: a plain `pi` started
+  by hand gets the catalog too, and nothing the user owns is rewritten. Note the composition
+  order — **`models.json` overrides sit ABOVE registered providers**, so a stale `providers.pxy`
+  block left in `models.json` silently shadows the extension.
 
 ## Consequences for pxy design
 
@@ -123,7 +132,7 @@ Fast-mode check + WebFetch domain-safety go directly to api.anthropic.com (ignor
 3. `pxy launch` per agent:
    - claude → spawn with env vars only.
    - opencode → spawn with `OPENCODE_CONFIG_CONTENT` (generated from pxy catalog).
-   - pi → merge `pxy` provider into `~/.pi/agent/models.json` (idempotent), then
+   - pi → install `~/.pi/agent/extensions/pxy.ts` (rewritten every launch), then
      `pi --provider pxy --model ...`.
 4. pxy needs to strip/translate Claude Code beta fields when the upstream isn't Anthropic, and
    pass through error bodies unmodified so client-side auto-retry works.

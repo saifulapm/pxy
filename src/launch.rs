@@ -1,13 +1,13 @@
 //! `pxy launch <agent>` — wire a coding agent to the local proxy.
 //! Mechanisms verified per agent in docs/02-agent-wiring.md:
 //! claude = env vars only; opencode = OPENCODE_CONFIG_CONTENT inline JSON;
-//! pi = additive merge into ~/.pi/agent/models.json.
+//! pi = an extension in ~/.pi/agent/extensions that registers the provider.
 
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map};
 
 use crate::catalog::Catalog;
 use crate::config::Config;
@@ -28,7 +28,7 @@ pub fn launch(
     match agent {
         "claude" => launch_claude(cfg, &catalog, &model, dry_run, extra_args),
         "opencode" => launch_opencode(cfg, &catalog, &model, dry_run, extra_args),
-        "pi" => launch_pi(cfg, &catalog, &model, dry_run, extra_args),
+        "pi" => launch_pi(cfg, &model, dry_run, extra_args),
         "codex" => launch_codex(cfg, &model, dry_run, extra_args),
         "fx" => launch_fx(cfg, &model, dry_run, extra_args),
         other => {
@@ -265,90 +265,41 @@ fn launch_fx(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String]) ->
 // pi
 // ---------------------------------------------------------------------------
 
-fn launch_pi(
-    cfg: &Config,
-    catalog: &Catalog,
-    model: &str,
-    dry_run: bool,
-    extra_args: &[String],
-) -> Result<()> {
-    let models_path = crate::config::home_dir().join(".pi/agent/models.json");
-    merge_pi_models(cfg, catalog, &models_path, dry_run)?;
+fn launch_pi(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String]) -> Result<()> {
+    let ext_path = crate::config::home_dir().join(".pi/agent/extensions/pxy.ts");
+    install_pi_extension(cfg, &ext_path, dry_run)?;
 
     let mut cmd = Command::new("pi");
     cmd.arg("--provider").arg("pxy").arg("--model").arg(model);
     cmd.args(extra_args);
-    cmd.env("PXY_API_KEY", tagged_key(cfg, "pi"));
 
-    exec_or_print(
-        cmd,
-        dry_run,
-        &format!("pi provider merged into {}", models_path.display()),
-    )
+    exec_or_print(cmd, dry_run, &format!("pi provider registered by {}", ext_path.display()))
 }
 
-/// Idempotent additive merge: only the `providers.pxy` key is touched;
-/// everything else in the user's models.json is preserved.
-fn merge_pi_models(
-    cfg: &Config,
-    catalog: &Catalog,
-    path: &std::path::Path,
-    dry_run: bool,
-) -> Result<()> {
-    let mut root: Value = match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s)
-            .with_context(|| format!("{} is not valid JSON", path.display()))?,
-        Err(_) => json!({}),
-    };
-
-    let mut models: Vec<Value> = Vec::new();
-    for (name, group) in catalog.groups() {
-        let (ctx, max_out) = crate::catalog::chain_limits(&group.chain);
-        models.push(json!({
-            "id": name,
-            "name": group.label,
-            "reasoning": false,
-            "input": ["text"],
-            "contextWindow": ctx,
-            "maxTokens": max_out,
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        }));
-    }
-    for cand in catalog.models() {
-        models.push(json!({
-            "id": cand.full_id(),
-            "name": cand.model.name.clone().unwrap_or_else(|| cand.full_id()),
-            "reasoning": false,
-            "input": ["text"],
-            "contextWindow": cand.model.context_length,
-            "maxTokens": cand.model.max_output_tokens,
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        }));
-    }
-
-    let provider = json!({
-        "baseUrl": format!("{}/v1", cfg.base_url()),
-        "api": "openai-completions",
-        "apiKey": "$PXY_API_KEY",
-        "models": models,
-    });
-
-    if !root.is_object() {
-        root = json!({});
-    }
-    if !root["providers"].is_object() {
-        root["providers"] = json!({});
-    }
-    root["providers"]["pxy"] = provider;
+/// The extension is pi's whole view of pxy, so it is rewritten on every launch
+/// — an edit to the installed copy goes, and a moved port or a reinstalled
+/// binary heals by itself. Only this one file is touched: the catalog it
+/// registers is read live from `pxy models --json`, so nothing about the model
+/// list is baked in here and models.json stays the user's alone.
+///
+/// (An earlier version merged `providers.pxy` into ~/.pi/agent/models.json.
+/// Delete that key if it is still there: models.json overrides compose ABOVE
+/// registered providers, so a stale copy silently shadows this one.)
+fn install_pi_extension(cfg: &Config, path: &std::path::Path, dry_run: bool) -> Result<()> {
+    let pxy_bin = std::env::current_exe()
+        .context("locating the running pxy binary for the pi extension")?;
+    let source = include_str!("../contrib/pi-pxy.ts")
+        .replace("__PXY_BASE_URL__", &format!("{}/v1", cfg.base_url()))
+        .replace("__PXY_BIN__", &pxy_bin.to_string_lossy());
 
     if dry_run {
-        println!("would write providers.pxy into {}", path.display());
+        println!("would write {}", path.display());
         return Ok(());
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    crate::config::write_atomic(path, serde_json::to_string_pretty(&root)?.as_bytes())
+    crate::config::write_atomic(path, source.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

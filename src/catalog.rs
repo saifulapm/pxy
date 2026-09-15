@@ -262,6 +262,15 @@ pub fn chain_limits(chain: &[Candidate]) -> (u64, u64) {
     )
 }
 
+/// Whether a chain may be advertised as a thinking model: only when EVERY
+/// member is asserted to reason, for the same reason chain_limits takes a
+/// min() — any member may serve the request, and a client told to expect
+/// thinking from one that has none is a client shown a broken capability.
+/// An empty chain reasons about nothing.
+pub fn chain_reasoning(chain: &[Candidate]) -> bool {
+    !chain.is_empty() && chain.iter().all(|c| c.model.reasoning == Some(true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +371,43 @@ mod tests {
         assert_eq!(ctx_1m_marker("claude/claude-opus-5[1m]", 1_000_000), "");
         assert_eq!(ctx_1m_marker("claude/claude-opus-5", 1_000_000), "[1m]");
         assert_eq!(ctx_1m_marker("claude/claude-haiku-4-5", 200_000), "");
+    }
+
+    /// A group advertises thinking only when every member does. A client that
+    /// registers models up front (pi) offers the level for the group id, and
+    /// the group id is what an agent is normally launched with — so one silent
+    /// member is a thinking level offered for a turn that cannot think.
+    #[test]
+    fn a_group_reasons_only_when_every_member_does() {
+        let c: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.zai]
+            base_url = "https://z.example/chat"
+            models = [
+              { id = "thinker", reasoning = true },
+              { id = "quiet" },
+              { id = "denied", reasoning = false },
+            ]
+            [groups.all-think]
+            models = ["zai/thinker"]
+            [groups.one-unknown]
+            models = ["zai/thinker", "zai/quiet"]
+            [groups.one-denied]
+            models = ["zai/thinker", "zai/denied"]
+            "#,
+        )
+        .unwrap();
+        let cat = Catalog::from_config(&c);
+        let group = |name: &str| {
+            chain_reasoning(&cat.groups().find(|(n, _)| *n == name).unwrap().1.chain)
+        };
+        assert!(group("all-think"));
+        // Unset is not a quiet yes: nobody has verified this model thinks.
+        assert!(!group("one-unknown"));
+        assert!(!group("one-denied"));
+        // An empty chain reasons about nothing.
+        assert!(!chain_reasoning(&[]));
     }
 
     /// A mirrored id whose stripped base contains a slash but resolves to

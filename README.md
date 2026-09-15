@@ -8,7 +8,7 @@ replace a heavyweight Node router (OmniRoute) for personal/side-project use.
 pxy serve                  # the daemon (or: systemctl --user enable --now pxy)
 pxy launch claude          # Claude Code wired to pxy (env vars only)
 pxy launch opencode        # opencode via OPENCODE_CONFIG_CONTENT
-pxy launch pi              # pi via ~/.pi/agent/models.json merge
+pxy launch pi              # pi via a ~/.pi/agent/extensions provider
 pxy models                 # group names, then every provider/model (--json for details)
 pxy refresh --generate     # report every provider's live catalog into models.toml
 pxy status                 # per-provider usage vs limits

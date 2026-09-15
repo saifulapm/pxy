@@ -875,6 +875,12 @@ pub struct ModelSpec {
     /// DISPLAY METADATA — routing never reads it, so a wrong value costs a
     /// misleading picker row and nothing else. `None` = nobody knows.
     pub free: Option<bool>,
+    /// Asserted extended-thinking support, for clients that must declare a
+    /// model's capabilities up front (pi's provider registration). CAPABILITY
+    /// METADATA — routing never reads it, and pxy's own think translation is
+    /// unaffected either way. Set it only from a real verified call; `None` =
+    /// nobody knows, which every client reads as "no".
+    pub reasoning: Option<bool>,
     /// Always request streaming upstream, even for a non-streaming client
     /// call; pxy collects the stream and returns ordinary JSON. For upstreams
     /// that error or time out without `stream: true` on some models
@@ -906,6 +912,7 @@ impl ModelEntry {
                 format: None,
                 tool_call: None,
                 free: None,
+                reasoning: None,
                 force_stream: false,
                 drop_params: Vec::new(),
             },

@@ -46,6 +46,10 @@ api_key = "pxy-local"   # soft gate; server binds 127.0.0.1 only
 #   * /v1/models advertises the MINIMUM context over a chain, so one
 #     small-window model at the tail tells agents the whole group holds 32k
 #     and breaks their auto-compaction. Keep a chain inside one context class.
+#   * a group offers extended thinking only when EVERY member is marked
+#     `reasoning = true` — one unmarked member and clients that declare
+#     capabilities up front (pi) stop offering the thinking level for the whole
+#     group. Keep a chain inside one thinking class too, or accept the loss.
 # ---------------------------------------------------------------------------
 
 # Zero cost, renewable. The default for everyday agent traffic.
