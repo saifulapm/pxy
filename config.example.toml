@@ -144,6 +144,14 @@ small_model = "zai/glm-4.5-flash"
 # model because it can't see the real upstream behind the proxy. Set true only
 # for OpenAI/Azure, whose reasoning models need `developer` and
 # `max_completion_tokens` (and reject `max_tokens`).
+#
+# `requires_reasoning_replay = true` (default OFF) is for thinking-mode
+# providers that reject a tool turn whose assistant message omits the
+# reasoning that produced the call (DeepSeek: "...reasoning_content/thinking
+# must be passed back"). pxy preserves the client's reasoning and injects a
+# minimal placeholder when a tool turn has none. Set it on DeepSeek; do NOT
+# set it on real Anthropic, which validates thinking signatures and rejects
+# the placeholder.
 
 # Tencent Cloud TokenHub (international, Singapore node) — OpenAI-compatible
 # gateway. Key from the TokenHub console API Key page; each model must be
@@ -227,6 +235,7 @@ models = [
 # models_url = "https://api.deepseek.com/models"
 # balance_url = "https://api.deepseek.com/user/balance"
 # api_key = { pass = "AI/deepseek/main" }
+# requires_reasoning_replay = true
 # models = [
 #   # vision-exp is the ONLY one that takes images, and costs the same as flash;
 #   # the others answer 400 "This model does not support image".

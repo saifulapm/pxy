@@ -10,7 +10,7 @@ use super::TokenUsage;
 // Request: openai -> anthropic
 // ---------------------------------------------------------------------------
 
-pub fn request(openai: &Value, default_max_tokens: u64) -> Value {
+pub fn request(openai: &Value, default_max_tokens: u64, reasoning_replay: bool) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     let mut pending_tool_results: Vec<Value> = Vec::new();
@@ -37,6 +37,23 @@ pub fn request(openai: &Value, default_max_tokens: u64) -> Value {
             "assistant" => {
                 flush_tools(&mut pending_tool_results, &mut messages);
                 let mut blocks: Vec<Value> = Vec::new();
+                // Reasoning replay: DeepSeek's Anthropic endpoint rejects a
+                // tool turn whose thinking is missing, so when the provider
+                // requires it the reasoning the client sent comes back as a
+                // thinking block ahead of the text/tool_use. The choke point
+                // backfills a placeholder when the client dropped it. The
+                // signature is a placeholder — harmless to the providers that
+                // require replay, which do not verify it (real Anthropic,
+                // which does, is never a `requires_reasoning_replay` target).
+                if reasoning_replay
+                    && let Some(reason) = super::reasoning_text(msg)
+                {
+                    blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": reason,
+                        "signature": "pxy-replay",
+                    }));
+                }
                 let text = flatten_content(&msg["content"]);
                 if !text.is_empty() {
                     blocks.push(json!({"type": "text", "text": text}));
@@ -141,8 +158,12 @@ pub fn request(openai: &Value, default_max_tokens: u64) -> Value {
         out.remove("tool_choice");
     }
 
-    // reasoning_effort -> thinking budget (reverse of the OmniRoute buckets)
-    if let Some(effort) = openai["reasoning_effort"].as_str() {
+    // reasoning_effort -> thinking budget (reverse of the OmniRoute buckets).
+    // "none"/"off" is an explicit request to think less, and mapping it to
+    // the default 16384 arm would turn it into the LARGEST budget.
+    if let Some(effort) = openai["reasoning_effort"].as_str()
+        && !matches!(effort, "none" | "off" | "disabled")
+    {
         let budget: u64 = match effort {
             "low" | "minimal" => 1024,
             "medium" => 8192,
@@ -456,7 +477,7 @@ mod tests {
                 {"name": "Bash", "description": "d", "parameters": {"type": "object"}}}],
             "max_tokens": 500
         });
-        let out = request(&req, 8192);
+        let out = request(&req, 8192, false);
         assert_eq!(out["system"], "sys");
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "user");
@@ -469,8 +490,41 @@ mod tests {
 
     #[test]
     fn request_requires_max_tokens_default() {
-        let out = request(&json!({"messages": []}), 4096);
+        let out = request(&json!({"messages": []}), 4096, false);
         assert_eq!(out["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn reasoning_effort_none_disables_thinking() {
+        // "none" is an explicit request to think less; the default arm used to
+        // give it the LARGEST budget (16384).
+        let out = request(&json!({"messages": [], "reasoning_effort": "none"}), 4096, false);
+        assert!(out.get("thinking").is_none());
+        let out = request(&json!({"messages": [], "reasoning_effort": "medium"}), 4096, false);
+        assert_eq!(out["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn reasoning_replay_emits_thinking_before_the_tool_use() {
+        let req = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "reasoning_content": "I thought",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                 "function": {"name": "get", "arguments": "{}"}}]}
+            ]
+        });
+        let out = request(&req, 8192, true);
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "I thought");
+        assert!(content[0]["signature"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(content[1]["type"], "tool_use");
+        // Without the flag the reasoning is dropped: a fabricated signature
+        // would poison a real Anthropic upstream.
+        let out = request(&req, 8192, false);
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert!(content.iter().all(|b| b["type"] != "thinking"));
     }
 
     #[test]
@@ -480,7 +534,7 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "X", "parameters": {}}}],
             "tool_choice": "none"
         });
-        let out = request(&req, 100);
+        let out = request(&req, 100, false);
         assert!(out.get("tools").is_none());
         assert!(out.get("tool_choice").is_none());
     }

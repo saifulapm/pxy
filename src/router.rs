@@ -872,10 +872,14 @@ async fn try_candidate(
     let mut body = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => payload.clone(),
         (ClientFormat::Anthropic, WireFormat::Anthropic) => payload.clone(),
-        (ClientFormat::Anthropic, WireFormat::Openai) => anthropic_to_openai::request(payload),
-        (ClientFormat::Openai, WireFormat::Anthropic) => {
-            openai_to_anthropic::request(payload, cand.model.max_output_tokens)
+        (ClientFormat::Anthropic, WireFormat::Openai) => {
+            anthropic_to_openai::request(payload, provider_cfg.requires_reasoning_replay)
         }
+        (ClientFormat::Openai, WireFormat::Anthropic) => openai_to_anthropic::request(
+            payload,
+            cand.model.max_output_tokens,
+            provider_cfg.requires_reasoning_replay,
+        ),
     };
     // Anthropic validates history strictly (thinking signatures, tool
     // pairing, empty blocks) and the passthrough path replays whatever the
@@ -905,6 +909,12 @@ async fn try_candidate(
             crate::translate::developer_role_to_system(&mut body);
         }
         crate::translate::normalize_max_tokens_field(&mut body, provider_cfg.openai_native);
+        if provider_cfg.requires_reasoning_replay {
+            crate::translate::backfill_openai_reasoning(&mut body);
+        }
+    } else if provider_cfg.requires_reasoning_replay {
+        // After the sanitizer, so the placeholder is not stripped as unsigned.
+        crate::translate::backfill_anthropic_thinking(&mut body);
     }
 
     // The hosted web_search tool: pxy runs it for OpenAI upstreams, which have

@@ -443,6 +443,18 @@ pub struct ProviderConfig {
     /// Anthropic's `system` and `max_tokens`.
     #[serde(default)]
     pub openai_native: bool,
+    /// Does this upstream run in thinking mode and require the reasoning that
+    /// produced a tool call to be echoed back? DeepSeek is the canonical one:
+    /// both its OpenAI (`reasoning_content`) and Anthropic (`thinking` block)
+    /// endpoints reject a tool turn whose assistant message omits it — "...
+    /// must be passed back" — even though a plain text turn without it is
+    /// fine. pxy preserves reasoning the client supplies and, when a
+    /// tool-carrying assistant turn has none (clients behind a proxy cannot
+    /// detect the real upstream and often drop it), injects the minimum the
+    /// API accepts. OFF by default: a fabricated `thinking` block would 400 a
+    /// real Anthropic upstream with "Invalid signature".
+    #[serde(default)]
+    pub requires_reasoning_replay: bool,
     /// Body-matched error overrides (CLIProxyAPI's request-scoped errors):
     /// absorb aggregator/WAF error text without code changes. FIRST matching
     /// rule (case-insensitive substring on the error body) wins over the
@@ -611,6 +623,7 @@ impl ProviderConfig {
             parse_think_tags: default_true(),
             inject_cache_control: false,
             openai_native: false,
+            requires_reasoning_replay: false,
             drop_params: Vec::new(),
             errors: Vec::new(),
             accounts: Vec::new(),

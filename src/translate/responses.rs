@@ -340,14 +340,12 @@ pub fn response(chat: &Value, model_id: &str) -> Value {
     let message = &chat["choices"][0]["message"];
     let id = format!("resp_{}", chat["id"].as_str().unwrap_or("pxy"));
     let mut output: Vec<Value> = Vec::new();
-    if let Some(r) = message["reasoning_content"].as_str() {
-        if !r.is_empty() {
-            output.push(json!({
-                "id": format!("rs_{id}"),
-                "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": r}],
-            }));
-        }
+    if let Some(r) = super::reasoning_text(message) {
+        output.push(json!({
+            "id": format!("rs_{id}"),
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": r}],
+        }));
     }
     if let Some(text) = message["content"].as_str() {
         if !text.is_empty() {
@@ -522,10 +520,8 @@ impl StreamState {
         let choice = &choices[0];
         let delta = &choice["delta"];
 
-        if let Some(r) = delta["reasoning_content"].as_str() {
-            if !r.is_empty() {
-                out.push_str(&self.reasoning_delta(r));
-            }
+        if let Some(r) = super::reasoning_text(delta) {
+            out.push_str(&self.reasoning_delta(&r));
         }
 
         if let Some(text) = delta["content"].as_str() {

@@ -11,7 +11,7 @@ use super::TokenUsage;
 // Request: anthropic -> openai
 // ---------------------------------------------------------------------------
 
-pub fn request(anthropic: &Value) -> Value {
+pub fn request(anthropic: &Value, reasoning_replay: bool) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
     // system: string or array of text blocks -> one system message
@@ -40,7 +40,7 @@ pub fn request(anthropic: &Value) -> Value {
             }
             Value::Array(blocks) => {
                 if role == "assistant" {
-                    push_assistant_turn(&mut messages, blocks);
+                    push_assistant_turn(&mut messages, blocks, reasoning_replay);
                 } else {
                     push_user_turn(&mut messages, blocks);
                 }
@@ -217,8 +217,9 @@ fn push_user_turn(messages: &mut Vec<Value>, blocks: &[Value]) {
     }
 }
 
-fn push_assistant_turn(messages: &mut Vec<Value>, blocks: &[Value]) {
+fn push_assistant_turn(messages: &mut Vec<Value>, blocks: &[Value], reasoning_replay: bool) {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for block in blocks {
         match block["type"].as_str() {
@@ -249,7 +250,12 @@ fn push_assistant_turn(messages: &mut Vec<Value>, blocks: &[Value]) {
                     text.push_str(&line);
                 }
             }
-            // thinking / redacted_thinking: dropped for openai upstreams
+            // thinking / redacted_thinking: dropped for openai upstreams —
+            // except for a provider that requires replay (DeepSeek), where the
+            // reasoning must come back as `reasoning_content`.
+            Some("thinking") if reasoning_replay => {
+                reasoning.push_str(block["thinking"].as_str().unwrap_or(""));
+            }
             _ => {}
         }
     }
@@ -259,6 +265,9 @@ fn push_assistant_turn(messages: &mut Vec<Value>, blocks: &[Value]) {
         "content".into(),
         if text.is_empty() { Value::Null } else { Value::String(text) },
     );
+    if reasoning_replay && !reasoning.is_empty() {
+        msg.insert("reasoning_content".into(), json!(reasoning));
+    }
     if !tool_calls.is_empty() {
         msg.insert("tool_calls".into(), Value::Array(tool_calls));
     }
@@ -316,24 +325,12 @@ fn repair_tool_pairs(messages: &mut Vec<Value>) {
 // Non-streaming response: openai -> anthropic
 // ---------------------------------------------------------------------------
 
-/// Chain-of-thought text from a message or delta. OpenAI-compatible upstreams
-/// disagree on the field: most say `reasoning_content`, the z-ai/GLM family
-/// says `reasoning`. Reading only the first name drops the entire thinking
-/// phase — the client gets no bytes at all while the model reasons, and Claude
-/// Code calls 20s of silence a stalled stream.
-fn reasoning_text(v: &Value) -> Option<&str> {
-    ["reasoning_content", "reasoning"]
-        .into_iter()
-        .find_map(|k| v[k].as_str())
-        .filter(|s| !s.is_empty())
-}
-
 pub fn response(openai: &Value, model: &str) -> Value {
     let choice = &openai["choices"][0];
     let message = &choice["message"];
     let mut content: Vec<Value> = Vec::new();
 
-    if let Some(reason) = reasoning_text(message) {
+    if let Some(reason) = super::reasoning_text(message) {
         // No signature field: a fabricated `signature: ""` gets stored in
         // client history and poisons every later replay to a real
         // Anthropic upstream (400 invalid signature, forever).
@@ -455,8 +452,8 @@ impl StreamState {
         let choice = &chunk["choices"][0];
         let delta = &choice["delta"];
 
-        if let Some(reason) = reasoning_text(delta) {
-            out.push_str(&self.text_delta(reason, 1));
+        if let Some(reason) = super::reasoning_text(delta) {
+            out.push_str(&self.text_delta(&reason, 1));
         }
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
@@ -690,6 +687,22 @@ mod tests {
     /// mapped as a function it would reach the client as a call for a tool it
     /// never registered.
     #[test]
+    fn reasoning_replay_maps_thinking_to_reasoning_content() {
+        let req = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "ponder", "signature": "s"},
+                {"type": "tool_use", "id": "t1", "name": "get", "input": {}}
+            ]}
+        ]});
+        let out = request(&req, true);
+        assert_eq!(out["messages"][1]["reasoning_content"], "ponder");
+        // Not a replay provider: thinking is dropped, as before.
+        let out = request(&req, false);
+        assert!(out["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn server_tools_are_substituted_or_dropped() {
         let req = json!({
             "stream": true,
@@ -700,7 +713,7 @@ mod tests {
                 {"name": "Bash", "input_schema": {"type": "object", "properties": {}}},
             ],
         });
-        let out = request(&req);
+        let out = request(&req, false);
         let names: Vec<&str> = out["tools"]
             .as_array()
             .unwrap()
@@ -724,7 +737,7 @@ mod tests {
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
         });
         assert_eq!(
-            request(&req)["tools"][0]["function"]["name"],
+            request(&req, false)["tools"][0]["function"]["name"],
             web_search::TOOL_NAME
         );
     }
@@ -742,7 +755,7 @@ mod tests {
                 {"type": "text", "text": "Rust is a language."},
             ]}],
         });
-        let out = request(&req);
+        let out = request(&req, false);
         let content = out["messages"][0]["content"].as_str().unwrap();
         assert_eq!(
             content,
@@ -767,7 +780,7 @@ mod tests {
             ],
             "tools": [{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}]
         });
-        let out = request(&req);
+        let out = request(&req, false);
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["role"], "user");
@@ -797,7 +810,7 @@ mod tests {
                 ]}
             ]
         });
-        let out = request(&req);
+        let out = request(&req, false);
         let msgs = out["messages"].as_array().unwrap();
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
         let content = tool["content"].as_str().unwrap();
@@ -815,7 +828,7 @@ mod tests {
                 {"role": "user", "content": "continue"}
             ]
         });
-        let out = request(&req);
+        let out = request(&req, false);
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs[1]["role"], "tool");
         assert_eq!(msgs[1]["content"], "[No response received]");

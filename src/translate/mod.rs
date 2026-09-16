@@ -114,6 +114,92 @@ pub fn normalize_max_tokens_field(body: &mut serde_json::Value, use_max_completi
     }
 }
 
+/// Chain-of-thought text from a message or delta. OpenAI-compatible upstreams
+/// disagree on the field name — `reasoning_content` (most), `reasoning`
+/// (z-ai/GLM), `reasoning_text`, `thinking`, `thought` — and a client that does
+/// not recognize the spelling it receives replays nothing. Reading one name
+/// silently drops the whole thinking phase. `reasoning_details` is OpenAI's
+/// structured form; its text/summary parts are joined.
+pub fn reasoning_text(v: &serde_json::Value) -> Option<String> {
+    for key in [
+        "reasoning_content",
+        "reasoning",
+        "reasoning_text",
+        "thinking",
+        "thought",
+    ] {
+        if let Some(s) = v[key].as_str().filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+    }
+    let details = v["reasoning_details"].as_array()?;
+    let joined: String = details
+        .iter()
+        .filter_map(|d| {
+            d["text"]
+                .as_str()
+                .or_else(|| d["summary"].as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// DeepSeek-style thinking-mode providers 400 a tool turn whose assistant
+/// message omits the reasoning that produced the call ("The
+/// `reasoning_content` in the thinking mode must be passed back to the API").
+/// Clients behind a proxy usually drop it, so for a provider that requires
+/// replay pxy injects the minimum the API accepts — litellm's exact remedy (a
+/// single space). Only tool-carrying turns need it; a plain assistant turn is
+/// accepted without.
+pub fn backfill_openai_reasoning(body: &mut serde_json::Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for msg in messages {
+        if msg["role"] != "assistant" || !msg["tool_calls"].as_array().is_some_and(|c| !c.is_empty())
+        {
+            continue;
+        }
+        if reasoning_text(msg).is_none() {
+            msg["reasoning_content"] = serde_json::json!(" ");
+        }
+    }
+}
+
+/// The Anthropic half of `backfill_openai_reasoning`: DeepSeek's Anthropic
+/// endpoint rejects a `tool_use` whose turn lacks a `thinking` block ("The
+/// `content[].thinking` in the thinking mode must be passed back to the
+/// API"). The injected block carries a non-empty signature so the sanitizer
+/// (which strips unsigned thinking) keeps it; DeepSeek accepts any signature.
+pub fn backfill_anthropic_thinking(body: &mut serde_json::Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for msg in messages {
+        if msg["role"] != "assistant" {
+            continue;
+        }
+        let Some(blocks) = msg["content"].as_array_mut() else {
+            continue;
+        };
+        if !blocks.iter().any(|b| b["type"] == "tool_use") {
+            continue;
+        }
+        if blocks
+            .iter()
+            .any(|b| matches!(b["type"].as_str(), Some("thinking") | Some("redacted_thinking")))
+        {
+            continue;
+        }
+        blocks.insert(
+            0,
+            serde_json::json!({"type": "thinking", "thinking": " ", "signature": "pxy-replay"}),
+        );
+    }
+}
+
 #[cfg(test)]
 mod usage_tests {
     use super::{estimate_tokens, TokenUsage};
@@ -195,6 +281,61 @@ mod usage_tests {
         let mut body = json!({"messages": []});
         super::normalize_max_tokens_field(&mut body, false);
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn reasoning_text_reads_every_alias() {
+        for key in [
+            "reasoning_content",
+            "reasoning",
+            "reasoning_text",
+            "thinking",
+            "thought",
+        ] {
+            let mut v = json!({});
+            v[key] = json!("r");
+            assert_eq!(super::reasoning_text(&v).as_deref(), Some("r"), "{key}");
+        }
+        // Structured form: text and summary parts join.
+        let v = json!({"reasoning_details": [
+            {"type": "reasoning.text", "text": "a"},
+            {"type": "reasoning.summary", "summary": "b"},
+        ]});
+        assert_eq!(super::reasoning_text(&v).as_deref(), Some("a\nb"));
+        assert_eq!(super::reasoning_text(&json!({"reasoning_content": ""})), None);
+    }
+
+    #[test]
+    fn backfill_openai_reasoning_only_fills_tool_turns() {
+        let mut body = json!({"messages": [
+            {"role": "assistant", "content": "plain"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "t1"}]},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "t2"}],
+             "reasoning_content": "real"},
+        ]});
+        super::backfill_openai_reasoning(&mut body);
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(body["messages"][1]["reasoning_content"], " ");
+        assert_eq!(body["messages"][2]["reasoning_content"], "real");
+    }
+
+    #[test]
+    fn backfill_anthropic_thinking_only_fills_tool_turns() {
+        let mut body = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "plain"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "get", "input": {}}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "r", "signature": "s"},
+                {"type": "tool_use", "id": "t2", "name": "get", "input": {}}]},
+        ]});
+        super::backfill_anthropic_thinking(&mut body);
+        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 1);
+        let b = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(b[0]["type"], "thinking");
+        assert_eq!(b[0]["signature"], "pxy-replay");
+        assert_eq!(b[1]["type"], "tool_use");
+        assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(), 2);
     }
 
     /// CJK was the big chars/4 under-count: 400 CJK chars are ~400 tokens,
