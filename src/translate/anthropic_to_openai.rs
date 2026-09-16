@@ -325,7 +325,11 @@ fn repair_tool_pairs(messages: &mut Vec<Value>) {
 // Non-streaming response: openai -> anthropic
 // ---------------------------------------------------------------------------
 
-pub fn response(openai: &Value, model: &str) -> Value {
+pub fn response(
+    openai: &Value,
+    model: &str,
+    declared: Option<&std::collections::HashSet<String>>,
+) -> Value {
     let choice = &openai["choices"][0];
     let message = &choice["message"];
     let mut content: Vec<Value> = Vec::new();
@@ -348,7 +352,10 @@ pub fn response(openai: &Value, model: &str) -> Value {
             content.push(json!({
                 "type": "tool_use",
                 "id": call["id"],
-                "name": call["function"]["name"],
+                "name": super::restore_tool_name(
+                    call["function"]["name"].as_str().unwrap_or(""),
+                    declared,
+                ),
                 "input": input,
             }));
         }
@@ -392,6 +399,9 @@ pub struct StreamState {
     finish_reason: Option<String>,
     pub usage: TokenUsage,
     input_estimate: u64,
+    /// Tool names as the client declared them (lowercase -> declared), for
+    /// restoring the capitalization some upstreams flatten.
+    declared: Option<std::collections::HashSet<String>>,
 }
 
 struct ToolSlot {
@@ -403,11 +413,16 @@ struct ToolSlot {
 }
 
 impl StreamState {
-    pub fn new(model: &str, input_estimate: u64) -> Self {
+    pub fn new(
+        model: &str,
+        input_estimate: u64,
+        declared: Option<std::collections::HashSet<String>>,
+    ) -> Self {
         Self {
             model: model.to_string(),
             message_id: format!("msg_pxy_{}", std::process::id()),
             input_estimate,
+            declared,
             ..Default::default()
         }
     }
@@ -552,7 +567,7 @@ impl StreamState {
             } else {
                 self.tools[slot_pos].id.clone()
             };
-            let name = self.tools[slot_pos].name.clone();
+            let name = super::restore_tool_name(&self.tools[slot_pos].name, self.declared.as_ref());
             out.push_str(&format_event(
                 "content_block_start",
                 &json!({"type": "content_block_start", "index": idx, "content_block": {
@@ -703,6 +718,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_case_is_restored() {
+        use std::collections::HashSet;
+        let declared: HashSet<String> = ["Bash".to_string()].into_iter().collect();
+        let resp = json!({"choices": [{"index": 0, "message": {"role": "assistant",
+            "content": null, "tool_calls": [{"id": "t1", "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}}]}}]});
+        let out = response(&resp, "m", Some(&declared));
+        assert_eq!(out["content"][0]["name"], "Bash");
+        // Unknown names pass through untouched.
+        let out = response(&resp, "m", None);
+        assert_eq!(out["content"][0]["name"], "bash");
+    }
+
+    #[test]
     fn server_tools_are_substituted_or_dropped() {
         let req = json!({
             "stream": true,
@@ -837,7 +866,7 @@ mod tests {
 
     #[test]
     fn stream_defers_tool_start_until_name() {
-        let mut st = StreamState::new("m", 10);
+        let mut st = StreamState::new("m", 10, None);
         // first chunk: id only, no name
         let c1 = json!({"id": "x", "choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "call_1", "function": {"arguments": ""}}
@@ -856,7 +885,7 @@ mod tests {
 
     #[test]
     fn stream_snapshot_args_emit_suffix_only() {
-        let mut st = StreamState::new("m", 0);
+        let mut st = StreamState::new("m", 0, None);
         let c1 = json!({"choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "c1", "function": {"name": "T", "arguments": "{\"a\":"}}
         ]}}]});
@@ -870,7 +899,7 @@ mod tests {
 
     #[test]
     fn stream_text_then_finish() {
-        let mut st = StreamState::new("m", 5);
+        let mut st = StreamState::new("m", 5, None);
         let c = json!({"id": "r1", "choices": [{"delta": {"content": "hel"}}]});
         let out = st.on_data(&c.to_string());
         assert!(out.contains("message_start"));

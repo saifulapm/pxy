@@ -981,10 +981,13 @@ async fn try_candidate(
             Err(e) => return AttemptResult::Skip(format!("prepare failed: {e:#}")),
         };
 
+    // Tool names as the client declared them: some upstreams (Gemini, several
+    // gateways) lowercase them, and a client matches a call by name.
+    let declared_names = declared_tool_names(payload);
     // Textual tool-call extraction: OpenAI upstreams only, and only when the
     // request declared tools (otherwise the markup is content, not protocol).
     let tool_names = (upstream_format == WireFormat::Openai)
-        .then(|| declared_tool_names(payload))
+        .then(|| declared_names.clone())
         .flatten();
 
     // The total timeout must NOT apply to client-streaming requests: it
@@ -1147,6 +1150,7 @@ async fn try_candidate(
             resp,
             input_estimate,
             tool_names,
+            declared_names.clone(),
             search,
             // Cloned: the pre-first-event error path below still needs them to
             // relay `retry-after` on a stream that died before committing.
@@ -1268,10 +1272,10 @@ async fn try_candidate(
             }
             (ClientFormat::Anthropic, WireFormat::Anthropic) => upstream_body,
             (ClientFormat::Anthropic, WireFormat::Openai) => {
-                anthropic_to_openai::response(&upstream_body, &cand.full_id())
+                anthropic_to_openai::response(&upstream_body, &cand.full_id(), declared_names.as_ref())
             }
             (ClientFormat::Openai, WireFormat::Anthropic) => {
-                openai_to_anthropic::response(&upstream_body, &cand.full_id())
+                openai_to_anthropic::response(&upstream_body, &cand.full_id(), declared_names.as_ref())
             }
         };
         AttemptResult::Done(Outcome::Json {
@@ -2516,6 +2520,7 @@ async fn stream_outcome(
     resp: reqwest::Response,
     input_estimate: u64,
     tool_names: Option<std::collections::HashSet<String>>,
+    declared_names: Option<std::collections::HashSet<String>>,
     search: Option<SearchLoop>,
     fwd_headers: Headers,
 ) -> Result<Outcome, StreamFailure> {
@@ -2523,11 +2528,11 @@ async fn stream_outcome(
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
         (ClientFormat::Anthropic, WireFormat::Anthropic) => StreamKind::AnthropicPass,
         (ClientFormat::Anthropic, WireFormat::Openai) => StreamKind::ToAnthropic(
-            anthropic_to_openai::StreamState::new(&cand.full_id(), input_estimate),
+            anthropic_to_openai::StreamState::new(&cand.full_id(), input_estimate, declared_names),
         ),
-        (ClientFormat::Openai, WireFormat::Anthropic) => {
-            StreamKind::ToOpenai(openai_to_anthropic::StreamState::new(&cand.full_id()))
-        }
+        (ClientFormat::Openai, WireFormat::Anthropic) => StreamKind::ToOpenai(
+            openai_to_anthropic::StreamState::new(&cand.full_id(), declared_names),
+        ),
     };
 
     let parse_think = app

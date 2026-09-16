@@ -236,7 +236,11 @@ fn user_content(content: &Value) -> Value {
 // Non-streaming response: anthropic -> openai
 // ---------------------------------------------------------------------------
 
-pub fn response(anthropic: &Value, model: &str) -> Value {
+pub fn response(
+    anthropic: &Value,
+    model: &str,
+    declared: Option<&std::collections::HashSet<String>>,
+) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
@@ -248,7 +252,7 @@ pub fn response(anthropic: &Value, model: &str) -> Value {
                 "id": block["id"],
                 "type": "function",
                 "function": {
-                    "name": block["name"],
+                    "name": super::restore_tool_name(block["name"].as_str().unwrap_or(""), declared),
                     "arguments": serde_json::to_string(&block["input"]).unwrap_or_else(|_| "{}".into()),
                 }
             })),
@@ -316,13 +320,16 @@ pub struct StreamState {
     next_tool_index: u64,
     finished: bool,
     pub usage: TokenUsage,
+    /// Tool names as the client declared them, for restoring capitalization.
+    declared: Option<std::collections::HashSet<String>>,
 }
 
 impl StreamState {
-    pub fn new(model: &str) -> Self {
+    pub fn new(model: &str, declared: Option<std::collections::HashSet<String>>) -> Self {
         Self {
             model: model.to_string(),
             message_id: format!("chatcmpl_pxy_{}", std::process::id()),
+            declared,
             ..Default::default()
         }
     }
@@ -359,7 +366,7 @@ impl StreamState {
                             "index": t_idx,
                             "id": block["id"],
                             "type": "function",
-                            "function": {"name": block["name"], "arguments": ""},
+                            "function": {"name": super::restore_tool_name(block["name"].as_str().unwrap_or(""), self.declared.as_ref()), "arguments": ""},
                         }]}),
                         None,
                     )
@@ -528,6 +535,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_case_is_restored() {
+        use std::collections::HashSet;
+        let declared: HashSet<String> = ["Bash".to_string()].into_iter().collect();
+        let resp = json!({"content": [
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]});
+        let out = response(&resp, "m", Some(&declared));
+        assert_eq!(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "Bash"
+        );
+        let out = response(&resp, "m", None);
+        assert_eq!(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "bash"
+        );
+    }
+
+    #[test]
     fn tool_choice_none_drops_tools() {
         let req = json!({
             "messages": [],
@@ -541,7 +566,7 @@ mod tests {
 
     #[test]
     fn stream_translates_text_and_tools() {
-        let mut st = StreamState::new("m");
+        let mut st = StreamState::new("m", None);
         let start = json!({"type": "message_start", "message":
             {"id": "msg1", "usage": {"input_tokens": 9}}});
         st.on_event(Some("message_start"), &start.to_string());

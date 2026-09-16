@@ -146,6 +146,18 @@ pub fn reasoning_text(v: &serde_json::Value) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
+/// Restore a tool name's declared capitalization. Some providers (Gemini,
+/// several gateways) lowercase tool names, and a client that matches a tool
+/// call by name would see an unexecutable `bash` for its declared `Bash`.
+pub fn restore_tool_name(name: &str, declared: Option<&std::collections::HashSet<String>>) -> String {
+    if let Some(set) = declared
+        && let Some(d) = set.iter().find(|d| d.eq_ignore_ascii_case(name))
+    {
+        return d.clone();
+    }
+    name.to_string()
+}
+
 /// JSON-Schema annotation keywords some gateways reject. They carry no
 /// constraint, so removing them is lossless; `$defs`/`$ref` are structural
 /// and stay.
