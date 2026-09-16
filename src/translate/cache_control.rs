@@ -43,7 +43,7 @@ pub fn inject(body: &mut Value) {
     if mark_system(body) || mark_last_tool(body) {
         left -= 1;
     }
-    let Some(messages) = body["messages"].as_array_mut() else { return };
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else { return };
     let mut marked = 0;
     for msg in messages.iter_mut().rev() {
         if left == 0 || marked == 2 {
@@ -88,7 +88,7 @@ fn mark_system(body: &mut Value) -> bool {
         body["system"] = json!([{"type": "text", "text": s, "cache_control": marker()}]);
         return true;
     }
-    let Some(blocks) = body["system"].as_array_mut() else { return false };
+    let Some(blocks) = body.get_mut("system").and_then(|b| b.as_array_mut()) else { return false };
     let Some(last) = blocks.last_mut().filter(|b| b.is_object()) else { return false };
     last["cache_control"] = marker();
     true
@@ -98,7 +98,7 @@ fn mark_system(body: &mut Value) -> bool {
 /// prompt (tools precede system in the cached prefix, so a system marker
 /// already covers them).
 fn mark_last_tool(body: &mut Value) -> bool {
-    let Some(tools) = body["tools"].as_array_mut() else { return false };
+    let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) else { return false };
     let Some(last) = tools.last_mut().filter(|t| t.is_object()) else { return false };
     last["cache_control"] = marker();
     true
@@ -115,7 +115,7 @@ fn mark_message(msg: &mut Value) -> bool {
         msg["content"] = json!([{"type": "text", "text": s, "cache_control": marker()}]);
         return true;
     }
-    let Some(blocks) = msg["content"].as_array_mut() else { return false };
+    let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else { return false };
     let Some(last) = blocks.last_mut().filter(|b| b.is_object()) else { return false };
     if matches!(last["type"].as_str(), Some("thinking") | Some("redacted_thinking")) {
         return false;

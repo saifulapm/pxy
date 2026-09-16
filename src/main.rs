@@ -1,4 +1,5 @@
 mod catalog;
+mod capture;
 mod config;
 mod diagnose;
 mod launch;

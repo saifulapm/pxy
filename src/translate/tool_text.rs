@@ -195,7 +195,7 @@ fn parse_invoke_call(span: &str) -> Option<(String, String)> {
 /// Non-streaming: rewrite a complete OpenAI response body in place. Returns
 /// true when at least one call was extracted (finish_reason updated too).
 pub fn extract_from_response(body: &mut Value, names: &HashSet<String>) -> bool {
-    let Some(choices) = body["choices"].as_array_mut() else { return false };
+    let Some(choices) = body.get_mut("choices").and_then(|c| c.as_array_mut()) else { return false };
     let mut any = false;
     for choice in choices {
         let Some(text) = choice["message"]["content"].as_str().map(String::from) else { continue };

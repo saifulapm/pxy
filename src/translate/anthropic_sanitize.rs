@@ -19,7 +19,7 @@
 use serde_json::{json, Value};
 
 pub fn sanitize(body: &mut Value) {
-    let Some(messages) = body["messages"].as_array_mut() else { return };
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else { return };
     strip_invalid_blocks(messages);
     repair_tool_pairs(messages);
     ensure_first_user(messages);
@@ -34,7 +34,7 @@ pub fn sanitize(body: &mut Value) {
 /// that end up with no content at all.
 fn strip_invalid_blocks(messages: &mut Vec<Value>) {
     for msg in messages.iter_mut() {
-        let Some(blocks) = msg["content"].as_array_mut() else { continue };
+        let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else { continue };
         let keep = |b: &Value| match b["type"].as_str() {
             Some("thinking") => b["signature"].as_str().is_some_and(|s| !s.is_empty()),
             Some("redacted_thinking") => b["data"].as_str().is_some_and(|s| !s.is_empty()),
@@ -126,6 +126,12 @@ fn repair_tool_pairs(messages: &mut Vec<Value>) {
                         if let Some(s) = next["content"].as_str().map(String::from) {
                             next["content"] = json!([{"type": "text", "text": s}]);
                         }
+                        // An absent/non-array content becomes an empty array
+                        // here (never a spurious null), so the repairs land
+                        // in this user turn.
+                        if !next["content"].is_array() {
+                            next["content"] = json!([]);
+                        }
                         let arr = next["content"].as_array_mut().unwrap();
                         for (pos, r) in repairs.into_iter().enumerate() {
                             arr.insert(pos, r);
@@ -139,7 +145,7 @@ fn repair_tool_pairs(messages: &mut Vec<Value>) {
             "user" => {
                 // tool_results answering nothing become visible text so the
                 // model still sees the information (dropping loses data).
-                if let Some(blocks) = messages[i]["content"].as_array_mut() {
+                if let Some(blocks) = messages[i].get_mut("content").and_then(|c| c.as_array_mut()) {
                     for b in blocks.iter_mut() {
                         if b["type"] == "tool_result"
                             && !open_calls

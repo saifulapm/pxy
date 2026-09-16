@@ -83,6 +83,35 @@ pub struct Config {
     /// omits `model` or asks for "auto").
     #[serde(default)]
     pub media: MediaDefaults,
+    /// Opt-in request artifact capture (`[capture] enabled = true`). OFF by
+    /// default; nothing is written unless asked.
+    #[serde(default)]
+    pub capture: CaptureConfig,
+}
+
+/// Request artifact capture for translation debugging (docs/09 §7). Off by
+/// default. Bounded and secret-masked: values under credential-ish keys are
+/// replaced, and common token shapes inside strings are redacted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Where artifacts go. Default: `$XDG_DATA_HOME/pxy/captures`.
+    pub dir: Option<String>,
+    /// Per-artifact byte cap; the serialized JSON is truncated past it.
+    #[serde(default = "default_capture_bytes")]
+    pub max_bytes: u64,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self { enabled: false, dir: None, max_bytes: default_capture_bytes() }
+    }
+}
+
+fn default_capture_bytes() -> u64 {
+    256 * 1024
 }
 
 /// A non-model HTTP service pool (search, fetch). Array of tables so config
@@ -470,14 +499,6 @@ pub struct ProviderConfig {
     /// real Anthropic upstream with "Invalid signature".
     #[serde(default)]
     pub requires_reasoning_replay: bool,
-    /// Some OpenAI-compatible gateways deserialize a missing `tools` to null and
-    /// reject it (AMD's Radeon endpoint: "Expected array, received null, path:
-    /// ['tools']"). With this set pxy sends an empty array instead of omitting
-    /// the key. OFF by default: an absent `tools` is the normal OpenAI shape
-    /// and most providers treat `[]` and absent identically, but a few gateways
-    /// only accept one of the two.
-    #[serde(default)]
-    pub inject_empty_tools: bool,
     /// Body-matched error overrides (CLIProxyAPI's request-scoped errors):
     /// absorb aggregator/WAF error text without code changes. FIRST matching
     /// rule (case-insensitive substring on the error body) wins over the
@@ -647,7 +668,6 @@ impl ProviderConfig {
             inject_cache_control: false,
             openai_native: false,
             requires_reasoning_replay: false,
-            inject_empty_tools: false,
             drop_params: Vec::new(),
             errors: Vec::new(),
             accounts: Vec::new(),

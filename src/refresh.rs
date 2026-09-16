@@ -739,6 +739,7 @@ mod tests {
             search: Default::default(),
             fetch: Default::default(),
             media: Default::default(),
+            capture: Default::default(),
         };
         let discovered = BTreeMap::from([(
             "p".to_string(),

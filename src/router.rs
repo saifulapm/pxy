@@ -1101,11 +1101,6 @@ async fn try_candidate(
             crate::translate::backfill_openai_reasoning(&mut body);
         }
         crate::translate::sanitize_tool_schemas(&mut body, false);
-        // A missing `tools` deserializes to null on some gateways, which then
-        // reject it; send the empty array those endpoints expect.
-        if provider_cfg.inject_empty_tools && !body["tools"].is_array() {
-            body["tools"] = json!([]);
-        }
     } else if provider_cfg.requires_reasoning_replay {
         // After the sanitizer, so the placeholder is not stripped as unsigned.
         crate::translate::backfill_anthropic_thinking(&mut body);
@@ -1233,7 +1228,7 @@ async fn try_candidate(
         // Offering a function nobody will intercept hands the client a
         // tool_use for a tool it never declared, which wedges the turn.
         // Drop it and let the model answer without search.
-        if let Some(tools) = body["tools"].as_array_mut() {
+        if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
             tools.retain(|t| t["function"]["name"] != web_search::TOOL_NAME);
             if tools.is_empty() {
                 body.as_object_mut().map(|o| o.remove("tools"));
@@ -1250,6 +1245,16 @@ async fn try_candidate(
     // every request. An explicitly named model still gets the full timeout:
     // there is nothing to fail over to. Non-streaming is exempt because its
     // headers legitimately arrive only once the whole answer is generated.
+    // Opt-in artifact capture: the client request and the exact upstream
+    // request body, before the wire. Best-effort and gated on the flag.
+    if crate::capture::enabled(&app.cfg) {
+        crate::capture::record(&app.cfg, "client-request", payload);
+        crate::capture::record(
+            &app.cfg,
+            "upstream-request",
+            &json!({"candidate": cand.full_id(), "url": &prepared.url, "body": &body}),
+        );
+    }
     let send = req.json(&body).send();
     let resp = if multi && (stream || force_stream) {
         match tokio::time::timeout(HEADERS_DEADLINE, send).await {
@@ -1451,6 +1456,9 @@ async fn try_candidate(
         }
         if let Some(names) = &tool_names {
             crate::translate::tool_text::extract_from_response(&mut upstream_body, names);
+        }
+        if crate::capture::enabled(&app.cfg) {
+            crate::capture::record(&app.cfg, "upstream-response", &upstream_body);
         }
         let usage = match upstream_format {
             WireFormat::Openai => TokenUsage::from_openai(&upstream_body["usage"]),
@@ -2528,7 +2536,7 @@ impl StreamCtx {
         // are what they returned — one assistant message carrying ALL calls,
         // then one tool message per call (the shape parallel calls require).
         let search = self.search.as_mut()?;
-        if let Some(messages) = search.body["messages"].as_array_mut() {
+        if let Some(messages) = search.body.get_mut("messages").and_then(|m| m.as_array_mut()) {
             messages.push(json!({
                 "role": "assistant",
                 "content": Value::Null,
@@ -2868,7 +2876,7 @@ async fn collect_stream_json(outcome: Outcome, client_format: ClientFormat) -> O
 /// Non-streaming: move `<think>` spans in every choice's message.content
 /// into message.reasoning_content.
 fn extract_think_from_response(body: &mut Value) {
-    let Some(choices) = body["choices"].as_array_mut() else { return };
+    let Some(choices) = body.get_mut("choices").and_then(|c| c.as_array_mut()) else { return };
     for choice in choices {
         let message = &mut choice["message"];
         let Some(text) = message["content"].as_str() else { continue };
@@ -3772,7 +3780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inject_empty_tools_sends_the_array() {
+    async fn absent_tools_is_not_materialized_as_null() {
         use std::sync::Mutex;
         use axum::routing::post;
         let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
@@ -3797,16 +3805,15 @@ mod tests {
                 [server]
                 [providers.a]
                 base_url = "{base}/c"
-                inject_empty_tools = true
                 models = ["m"]
                 "#
             ),
-            "inject_tools",
+            "absent_tools",
         );
         let payload = json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]});
         let _ = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
         let body = seen.lock().unwrap().take().expect("upstream was called");
-        assert_eq!(body["tools"], json!([]));
+        assert!(body.get("tools").is_none(), "absent tools must stay absent: {body}");
     }
 
     #[test]

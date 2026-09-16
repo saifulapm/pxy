@@ -76,7 +76,7 @@ fn count_chars(v: &serde_json::Value, ascii: &mut usize, wide: &mut usize) {
 /// native dialect (`openai_native`). A no-op when there is no
 /// `messages` array or no `developer` entry, and content is left untouched.
 pub fn developer_role_to_system(body: &mut serde_json::Value) {
-    let Some(messages) = body["messages"].as_array_mut() else {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
     for msg in messages {
@@ -179,7 +179,7 @@ pub fn strip_schema_annotations(schema: &mut serde_json::Value) {
 /// Apply `strip_schema_annotations` to a request body's tool definitions, in
 /// whichever dialect the body speaks.
 pub fn sanitize_tool_schemas(body: &mut serde_json::Value, anthropic: bool) {
-    let Some(tools) = body["tools"].as_array_mut() else {
+    let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return;
     };
     for t in tools {
@@ -204,13 +204,13 @@ pub fn strip_foreign_response_fields(v: &mut serde_json::Value) {
     if let Some(o) = v.as_object_mut() {
         o.retain(|k, _| !is_foreign(k));
     }
-    if let Some(choices) = v["choices"].as_array_mut() {
+    if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
         for c in choices {
             if let Some(o) = c.as_object_mut() {
                 o.retain(|k, _| !is_foreign(k));
             }
             for slot in ["message", "delta"] {
-                if let Some(o) = c[slot].as_object_mut() {
+                if let Some(o) = c.get_mut(slot).and_then(|s| s.as_object_mut()) {
                     o.retain(|k, _| !is_foreign(k));
                 }
             }
@@ -226,7 +226,7 @@ pub fn strip_foreign_response_fields(v: &mut serde_json::Value) {
 /// single space). Only tool-carrying turns need it; a plain assistant turn is
 /// accepted without.
 pub fn backfill_openai_reasoning(body: &mut serde_json::Value) {
-    let Some(messages) = body["messages"].as_array_mut() else {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
     for msg in messages {
@@ -246,14 +246,14 @@ pub fn backfill_openai_reasoning(body: &mut serde_json::Value) {
 /// API"). The injected block carries a non-empty signature so the sanitizer
 /// (which strips unsigned thinking) keeps it; DeepSeek accepts any signature.
 pub fn backfill_anthropic_thinking(body: &mut serde_json::Value) {
-    let Some(messages) = body["messages"].as_array_mut() else {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
     for msg in messages {
         if msg["role"] != "assistant" {
             continue;
         }
-        let Some(blocks) = msg["content"].as_array_mut() else {
+        let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
             continue;
         };
         if !blocks.iter().any(|b| b["type"] == "tool_use") {
@@ -430,6 +430,11 @@ mod usage_tests {
         let mut body = json!({"tools": [{"name": "f", "input_schema": {"$id": "x", "type": "object"}}]});
         super::sanitize_tool_schemas(&mut body, true);
         assert!(body["tools"][0]["input_schema"].get("$id").is_none());
+        // serde_json's IndexMut materializes a missing key as Null; a body
+        // with no tools must come out with no tools, not `"tools": null`.
+        let mut body = json!({"messages": []});
+        super::sanitize_tool_schemas(&mut body, false);
+        assert!(body.get("tools").is_none(), "must not inject tools: {body}");
     }
 
     #[test]
@@ -447,6 +452,10 @@ mod usage_tests {
         assert!(v["choices"][0]["message"].get("x_groq").is_none());
         assert!(v["choices"][0]["delta"].get("x_extra").is_none());
         assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        // A response without choices must not gain `"choices": null`.
+        let mut v = json!({"id": "y"});
+        super::strip_foreign_response_fields(&mut v);
+        assert!(v.get("choices").is_none());
     }
 
     /// CJK was the big chars/4 under-count: 400 CJK chars are ~400 tokens,

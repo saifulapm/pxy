@@ -160,11 +160,6 @@ small_model = "zai/glm-4.5-flash"
 # `auto/free` is a virtual id: every model marked `free = true`, walked in
 # catalog order. The ordinary per-provider limits and cooldowns still apply.
 #
-# `inject_empty_tools = true` (OpenAI-format providers, default OFF) sends
-# `tools: []` when the client omitted the key. Some gateways deserialize a
-# missing `tools` to null and reject it (AMD Radeon: "Expected array, received
-# null").
-#
 # Two opt-in group policies:
 #   headroom = true                      rank the chain by remaining LOCAL
 #                                        allowance (rpm/daily/monthly counters),
@@ -1141,3 +1136,19 @@ name = "firecrawl"
 kind = "firecrawl-scrape"
 api_key = { pass = "AI/firecrawl/main" }
 monthly_requests = 200
+
+# ---------------------------------------------------------------------------
+# Request artifact capture (debugging)
+# ---------------------------------------------------------------------------
+
+# OFF by default. When enabled, pxy writes the client request and the exact
+# upstream request/response bodies as pretty JSON under the capture dir
+# ($XDG_DATA_HOME/pxy/captures unless `dir` says otherwise). Values under
+# credential-ish keys are redacted, and common token shapes (sk-…, Bearer …)
+# inside strings are masked before anything touches disk. Each artifact is
+# truncated past `max_bytes`.
+#
+# [capture]
+# enabled = true
+# dir = "/tmp/pxy-captures"     # optional; default is the pxy data dir
+# max_bytes = 262144
