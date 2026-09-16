@@ -273,10 +273,95 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// A reasoning override parsed off the model id: `no-think/<id>` and a
+/// trailing `-low`/`-medium`/`-high`/`-xhigh`/`-max`.
+#[derive(Debug, Clone, PartialEq)]
+enum ModelVariant {
+    NoThink,
+    Effort(String),
+}
+
+/// Split a requested id into its base plus an optional reasoning variant. A
+/// suffix is stripped only when the base actually resolves, so a real model id
+/// ending in `-max` (there are several) is never mangled — docs/09 §6's rule.
+fn split_model_variant(
+    catalog: &Catalog,
+    cfg: &Config,
+    requested: &str,
+) -> (String, Option<ModelVariant>) {
+    if let Some(base) = requested.strip_prefix("no-think/")
+        && resolves_id(catalog, cfg, base)
+    {
+        return (base.to_string(), Some(ModelVariant::NoThink));
+    }
+    // Longest suffixes first, so `…-xhigh` is not read as `…-high`.
+    for level in ["minimal", "xhigh", "medium", "high", "low", "max"] {
+        if let Some(base) = requested.strip_suffix(&format!("-{level}"))
+            && resolves_id(catalog, cfg, base)
+        {
+            return (base.to_string(), Some(ModelVariant::Effort(level.to_string())));
+        }
+    }
+    (requested.to_string(), None)
+}
+
+fn resolves_id(catalog: &Catalog, cfg: &Config, id: &str) -> bool {
+    if catalog.is_group(id) {
+        return true;
+    }
+    // For a provider-qualified id, `resolve` fabricates a spec for ANY model
+    // under a known provider — so a real `p/qwen3.8-max` would look like
+    // `p/qwen3.8` resolves and get mangled. The catalog list is the strict
+    // test. A bare id goes through `resolve`, which is already strict there.
+    if id.contains('/') {
+        return catalog.is_listed(id);
+    }
+    !catalog.resolve(cfg, id).is_empty()
+}
+
+/// Write a model-variant override into the request body. An OpenAI client
+/// carries it as `reasoning_effort`; an Anthropic client as `thinking` (which
+/// `anthropic_to_openai` maps back to effort for an OpenAI upstream). The
+/// field is only written in the client's OWN dialect — an `effort` key on an
+/// Anthropic payload would otherwise leak straight to an Anthropic upstream
+/// on the passthrough path.
+fn apply_model_variant(payload: &mut Value, client_format: ClientFormat, variant: &ModelVariant) {
+    let (effort, budget) = match variant {
+        ModelVariant::NoThink => ("none", None),
+        ModelVariant::Effort(level) => {
+            let budget = match level.as_str() {
+                "low" | "minimal" => 1024,
+                "medium" => 8192,
+                _ => 16384,
+            };
+            (level.as_str(), Some(budget))
+        }
+    };
+    if client_format == ClientFormat::Openai {
+        payload["reasoning_effort"] = json!(effort);
+        return;
+    }
+    match budget {
+        // No thinking: the field's absence is the portable "off".
+        None => {
+            if let Some(o) = payload.as_object_mut() {
+                o.remove("thinking");
+            }
+        }
+        Some(b) => {
+            payload["thinking"] = json!({"type": "enabled", "budget_tokens": b});
+            // Anthropic requires max_tokens > budget_tokens.
+            if payload["max_tokens"].as_u64().unwrap_or(0) <= b {
+                payload["max_tokens"] = json!(b + 4096);
+            }
+        }
+    }
+}
+
 pub async fn handle_chat(
     app: SharedApp,
     client_format: ClientFormat,
-    payload: Value,
+    mut payload: Value,
     ctx: ClientContext,
 ) -> Outcome {
     // axum's Json<Value> accepts any valid JSON, so `[]`, `"x"` and `5` all
@@ -296,6 +381,13 @@ pub async fn handle_chat(
         .filter(|m| !m.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| app.cfg.default_route());
+    // Model-variant grammar (`no-think/…`, `…-high`): resolved BEFORE candidate
+    // lookup, because the base id is what routes. The override is written back
+    // into the body so it survives translation in either direction.
+    let (requested, variant) = split_model_variant(&app.catalog, &app.cfg, &requested);
+    if let Some(v) = &variant {
+        apply_model_variant(&mut payload, client_format, v);
+    }
     let stream = payload["stream"].as_bool().unwrap_or(false);
 
     // In-band magic prompt: a last user message of exactly "@@usage" is
@@ -3358,6 +3450,80 @@ mod tests {
             http: reqwest::Client::new(),
             cfg,
         })
+    }
+
+    #[test]
+    fn model_variant_grammar_resolves_base_and_override() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/c"
+            models = ["m", "qwen3.8-max"]
+            [groups.g]
+            models = ["p/m"]
+            "#,
+            "variant",
+        );
+        let (cat, cfg) = (&app.catalog, &app.cfg);
+        assert_eq!(
+            split_model_variant(cat, cfg, "p/m-high"),
+            ("p/m".to_string(), Some(ModelVariant::Effort("high".into())))
+        );
+        assert_eq!(
+            split_model_variant(cat, cfg, "g-max"),
+            ("g".to_string(), Some(ModelVariant::Effort("max".into())))
+        );
+        assert_eq!(
+            split_model_variant(cat, cfg, "no-think/p/m"),
+            ("p/m".to_string(), Some(ModelVariant::NoThink))
+        );
+        // A listed id ending in -max is NOT mangled: its base is not listed.
+        assert_eq!(split_model_variant(cat, cfg, "p/qwen3.8-max"), ("p/qwen3.8-max".into(), None));
+        // Neither is an unknown base.
+        assert_eq!(split_model_variant(cat, cfg, "p/nope-high"), ("p/nope-high".into(), None));
+        assert_eq!(split_model_variant(cat, cfg, "p/m"), ("p/m".into(), None));
+    }
+
+    #[test]
+    fn apply_model_variant_writes_only_the_clients_dialect() {
+        let mut openai = json!({"messages": []});
+        apply_model_variant(&mut openai, ClientFormat::Openai, &ModelVariant::Effort("high".into()));
+        assert_eq!(openai["reasoning_effort"], "high");
+        assert!(openai.get("thinking").is_none(), "no Anthropic field leak");
+
+        let mut anthropic = json!({"messages": [], "max_tokens": 10});
+        apply_model_variant(&mut anthropic, ClientFormat::Anthropic, &ModelVariant::Effort("medium".into()));
+        assert_eq!(anthropic["thinking"]["budget_tokens"], 8192);
+        assert!(anthropic.get("reasoning_effort").is_none(), "no OpenAI field leak");
+        assert_eq!(anthropic["max_tokens"], 8192 + 4096, "max_tokens must exceed budget");
+
+        let mut anthropic = json!({"messages": [], "thinking": {"type": "enabled"}});
+        apply_model_variant(&mut anthropic, ClientFormat::Anthropic, &ModelVariant::NoThink);
+        assert!(anthropic.get("thinking").is_none());
+    }
+
+    #[test]
+    fn auto_free_is_every_marked_free_model() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.a]
+            base_url = "http://127.0.0.1:1/c"
+            models = [{ id = "free1", free = true }, "paid1"]
+            [providers.b]
+            base_url = "http://127.0.0.1:1/c"
+            models = [{ id = "free2", free = true }]
+            "#,
+            "auto_free",
+        );
+        let ids: Vec<String> = app
+            .catalog
+            .resolve(&app.cfg, "auto/free")
+            .iter()
+            .map(|c| c.full_id())
+            .collect();
+        assert_eq!(ids, vec!["a/free1", "b/free2"]);
     }
 
     #[test]

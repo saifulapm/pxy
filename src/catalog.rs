@@ -174,6 +174,18 @@ impl Catalog {
             .any(|c| c.full_id() == full_id)
     }
 
+    /// Every listed candidate whose spec is marked free, in catalog order:
+    /// the `auto/free` virtual id. The ordinary walk still applies per-provider
+    /// limits and cooldowns, so "free quota left" falls out of the existing
+    /// machinery rather than a second accounting path.
+    pub fn free_chain(&self) -> Vec<Candidate> {
+        self.models
+            .iter()
+            .filter(|c| c.model.free == Some(true))
+            .cloned()
+            .collect()
+    }
+
     /// Resolve a requested model id to an ordered candidate list.
     ///
     /// - a group name -> that group's chain (config order = priority)
@@ -188,6 +200,10 @@ impl Catalog {
     pub fn resolve(&self, cfg: &Config, requested: &str) -> Vec<Candidate> {
         if let Some(g) = self.groups.get(requested) {
             return g.chain.clone();
+        }
+        // Virtual id: any free model, across providers.
+        if requested == "auto/free" {
+            return self.free_chain();
         }
         // A trailing "[1m]" is pxy's own window marker (see claude_mirror_id):
         // the listing appends it to every >= 1M id — claude-containing ones
@@ -210,6 +226,9 @@ impl Catalog {
                 // An empty chain -> empty candidates -> clean local 404, same
                 // as the bare group name; never a literal group id upstream.
                 return g.chain.clone();
+            }
+            if rest == "auto/free" {
+                return self.free_chain();
             }
             if rest.contains('/') {
                 let stripped = self.resolve_concrete(cfg, rest);

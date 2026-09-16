@@ -152,6 +152,13 @@ small_model = "zai/glm-4.5-flash"
 # minimal placeholder when a tool turn has none. Set it on DeepSeek; do NOT
 # set it on real Anthropic, which validates thinking signatures and rejects
 # the placeholder.
+#
+# Model-id grammar (works for groups and provider/model ids, and only when
+# the stripped base actually resolves):
+#   no-think/<id>   ask for no thinking (reasoning_effort none / no thinking)
+#   <id>-low|-medium|-high|-xhigh|-max   set the reasoning level
+# `auto/free` is a virtual id: every model marked `free = true`, walked in
+# catalog order. The ordinary per-provider limits and cooldowns still apply.
 
 # Tencent Cloud TokenHub (international, Singapore node) — OpenAI-compatible
 # gateway. Key from the TokenHub console API Key page; each model must be
