@@ -146,6 +146,66 @@ pub fn reasoning_text(v: &serde_json::Value) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
+/// JSON-Schema annotation keywords some gateways reject. They carry no
+/// constraint, so removing them is lossless; `$defs`/`$ref` are structural
+/// and stay.
+pub fn strip_schema_annotations(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("$id");
+            map.remove("$comment");
+            for v in map.values_mut() {
+                strip_schema_annotations(v);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_schema_annotations),
+        _ => {}
+    }
+}
+
+/// Apply `strip_schema_annotations` to a request body's tool definitions, in
+/// whichever dialect the body speaks.
+pub fn sanitize_tool_schemas(body: &mut serde_json::Value, anthropic: bool) {
+    let Some(tools) = body["tools"].as_array_mut() else {
+        return;
+    };
+    for t in tools {
+        let slot = if anthropic {
+            &mut t["input_schema"]
+        } else {
+            &mut t["function"]["parameters"]
+        };
+        strip_schema_annotations(slot);
+    }
+}
+
+/// Provider-specific fields that leak through a passthrough response and break
+/// strict OpenAI clients (`x_groq`, for one, is not in the schema and Pydantic
+/// rejects unknown root fields). Only clearly foreign `x_`/`x-` keys go; the
+/// OpenAI response schema itself is untouched.
+pub fn strip_foreign_response_fields(v: &mut serde_json::Value) {
+    let is_foreign = |k: &str| {
+        let k = k.to_ascii_lowercase();
+        k.starts_with("x_") || k.starts_with("x-")
+    };
+    if let Some(o) = v.as_object_mut() {
+        o.retain(|k, _| !is_foreign(k));
+    }
+    if let Some(choices) = v["choices"].as_array_mut() {
+        for c in choices {
+            if let Some(o) = c.as_object_mut() {
+                o.retain(|k, _| !is_foreign(k));
+            }
+            for slot in ["message", "delta"] {
+                if let Some(o) = c[slot].as_object_mut() {
+                    o.retain(|k, _| !is_foreign(k));
+                }
+            }
+        }
+    }
+}
+
 /// DeepSeek-style thinking-mode providers 400 a tool turn whose assistant
 /// message omits the reasoning that produced the call ("The
 /// `reasoning_content` in the thinking mode must be passed back to the API").
@@ -336,6 +396,45 @@ mod usage_tests {
         assert_eq!(b[0]["signature"], "pxy-replay");
         assert_eq!(b[1]["type"], "tool_use");
         assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn schema_annotations_stripped_but_structure_kept() {
+        let mut body = json!({"tools": [{"function": {"name": "f", "parameters": {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"x": {"$comment": "c", "type": "string"}},
+            "$defs": {"D": {"type": "number"}},
+            "$ref": "#/$defs/D",
+        }}}]});
+        super::sanitize_tool_schemas(&mut body, false);
+        let p = &body["tools"][0]["function"]["parameters"];
+        assert!(p.get("$schema").is_none());
+        assert!(p["properties"]["x"].get("$comment").is_none());
+        assert_eq!(p["properties"]["x"]["type"], "string");
+        assert!(p["$defs"].is_object(), "$defs is structural");
+        assert_eq!(p["$ref"], "#/$defs/D");
+        // Anthropic dialect slot.
+        let mut body = json!({"tools": [{"name": "f", "input_schema": {"$id": "x", "type": "object"}}]});
+        super::sanitize_tool_schemas(&mut body, true);
+        assert!(body["tools"][0]["input_schema"].get("$id").is_none());
+    }
+
+    #[test]
+    fn foreign_response_fields_are_stripped() {
+        let mut v = json!({
+            "id": "x", "x_groq": {"id": "y"},
+            "choices": [{"index": 0, "x-request-id": "z",
+                "message": {"role": "assistant", "content": "hi", "x_groq": {"usage": 1}},
+                "delta": {"content": "hi", "x_extra": true}}],
+        });
+        super::strip_foreign_response_fields(&mut v);
+        assert!(v.get("x_groq").is_none());
+        assert_eq!(v["id"], "x");
+        assert!(v["choices"][0].get("x-request-id").is_none());
+        assert!(v["choices"][0]["message"].get("x_groq").is_none());
+        assert!(v["choices"][0]["delta"].get("x_extra").is_none());
+        assert_eq!(v["choices"][0]["message"]["content"], "hi");
     }
 
     /// CJK was the big chars/4 under-count: 400 CJK chars are ~400 tokens,

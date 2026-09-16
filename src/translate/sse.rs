@@ -49,7 +49,7 @@ impl SseParser {
         let mut events = Vec::new();
         // Events are separated by a blank line. Handle \r\n by trimming \r.
         while let Some(pos) = find_event_end(&self.text) {
-            let raw = self.text[..pos.start].to_string();
+            let raw = strip_ansi(&self.text[..pos.start]);
             self.text.drain(..pos.end);
             if let Some(ev) = parse_event(&raw) {
                 events.push(ev);
@@ -57,6 +57,53 @@ impl SseParser {
         }
         events
     }
+}
+
+/// Strip ANSI/VT100 escape sequences some CLIs (gemini-cli) prefix onto SSE
+/// frames. Left in place they sit in front of `data:` so the frame is never
+/// recognized and the stream stalls with no error. JSON payloads never
+/// legitimately carry ESC; the fast path is a single scan for a byte that is
+/// absent. Applied to a whole buffered event, so a sequence split across TCP
+/// chunks is still removed.
+fn strip_ansi(s: &str) -> String {
+    if !s.as_bytes().contains(&0x1b) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: parameter/intermediate bytes, ended by a final byte 0x40-0x7e.
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: ended by BEL or ST (ESC \).
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Lone ESC: drop it.
+            _ => {}
+        }
+    }
+    out
 }
 
 struct EventEnd {
@@ -165,5 +212,22 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].data, "\u{4f60}");
         assert_eq!(evs[1].data, "two");
+    }
+
+    /// gemini-cli prefixes frames with terminal-redraw escapes; left in place
+    /// they hide `data:` and the stream stalls. CSI, OSC and lone ESC all go.
+    #[test]
+    fn ansi_escapes_are_stripped_before_field_detection() {
+        let mut p = SseParser::new();
+        let evs = p.feed(b"\x1b[2K\x1b[1Gdata: {\"a\":1}\x1b[0m\n\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "{\"a\":1}");
+        // OSC sequence with BEL terminator, split across chunks.
+        let mut p = SseParser::new();
+        assert!(p.feed(b"\x1b]0;title\x07da").is_empty());
+        let evs = p.feed(b"ta: ok\n\n");
+        assert_eq!(evs[0].data, "ok");
+        // A payload that legitimately lacks ESC is returned unchanged.
+        assert_eq!(strip_ansi("data: plain"), "data: plain");
     }
 }

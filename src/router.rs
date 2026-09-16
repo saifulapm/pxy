@@ -912,6 +912,7 @@ async fn try_candidate(
         if provider_cfg.requires_reasoning_replay {
             crate::translate::backfill_openai_reasoning(&mut body);
         }
+        crate::translate::sanitize_tool_schemas(&mut body, false);
     } else if provider_cfg.requires_reasoning_replay {
         // After the sanitizer, so the placeholder is not stripped as unsigned.
         crate::translate::backfill_anthropic_thinking(&mut body);
@@ -1260,8 +1261,12 @@ async fn try_candidate(
         };
         record_tokens(app, agent, &cand.state_provider(), &cand.provider, &cand.model.id, usage);
         let client_body = match (client_format, upstream_format) {
-            (ClientFormat::Openai, WireFormat::Openai)
-            | (ClientFormat::Anthropic, WireFormat::Anthropic) => upstream_body,
+            (ClientFormat::Openai, WireFormat::Openai) => {
+                let mut b = upstream_body;
+                crate::translate::strip_foreign_response_fields(&mut b);
+                b
+            }
+            (ClientFormat::Anthropic, WireFormat::Anthropic) => upstream_body,
             (ClientFormat::Anthropic, WireFormat::Openai) => {
                 anthropic_to_openai::response(&upstream_body, &cand.full_id())
             }
