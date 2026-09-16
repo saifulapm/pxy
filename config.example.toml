@@ -134,6 +134,16 @@ small_model = "zai/glm-4.5-flash"
 # aggregator only after proving the marker is relayed upstream
 # (cache_read_input_tokens > 0 on turn 2 of a session); some gateways 400 on
 # the field. Clients that set their own markers are always left alone.
+#
+# `openai_native = true` (OpenAI-format providers, default OFF) tells pxy the
+# upstream is OpenAI/Azure itself, so it leaves the newest OpenAI dialect alone.
+# By default pxy normalizes the two spellings that compatible providers reject
+# or ignore: `developer` -> `system` (DeepSeek 400s with "unknown variant
+# `developer`") and `max_completion_tokens` -> `max_tokens` (opencode-go ignored
+# the former, so pi's output cap did nothing). pi emits both for any reasoning
+# model because it can't see the real upstream behind the proxy. Set true only
+# for OpenAI/Azure, whose reasoning models need `developer` and
+# `max_completion_tokens` (and reject `max_tokens`).
 
 # Tencent Cloud TokenHub (international, Singapore node) — OpenAI-compatible
 # gateway. Key from the TokenHub console API Key page; each model must be

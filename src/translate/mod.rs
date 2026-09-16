@@ -68,6 +68,52 @@ fn count_chars(v: &serde_json::Value, ascii: &mut usize, wide: &mut usize) {
     }
 }
 
+/// OpenAI's `developer` role is its `system` role under a newer name, and the
+/// OpenAI-compatible providers pxy fronts overwhelmingly reject the literal
+/// variant (`deepseek` 400s with "unknown variant `developer`"). pxy forwards
+/// an OpenAI-dialect body to an OpenAI upstream verbatim, so the role is
+/// rewritten here for every such provider except the ones that opted into the
+/// native dialect (`openai_native`). A no-op when there is no
+/// `messages` array or no `developer` entry, and content is left untouched.
+pub fn developer_role_to_system(body: &mut serde_json::Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for msg in messages {
+        if msg["role"] == "developer" {
+            msg["role"] = serde_json::json!("system");
+        }
+    }
+}
+
+/// OpenAI renamed `max_tokens` to `max_completion_tokens`, and its reasoning
+/// models now reject the old field. Third-party OpenAI-compatible providers
+/// are the opposite: they honor `max_tokens` and ignore or reject the new one
+/// (opencode-go accepted `max_completion_tokens: 1` and answered with 38
+/// completion tokens — the cap silently did nothing). pxy's passthrough
+/// forwards whichever field the client sent, so the body is normalized to the
+/// upstream's spelling here, in either direction. Exactly one of the two
+/// fields survives, so no later reader has to guess which cap is real.
+/// `use_max_completion_tokens` is the OpenAI/Azure-native case.
+pub fn normalize_max_tokens_field(body: &mut serde_json::Value, use_max_completion_tokens: bool) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let (keep, drop) = if use_max_completion_tokens {
+        ("max_completion_tokens", "max_tokens")
+    } else {
+        ("max_tokens", "max_completion_tokens")
+    };
+    // Move the client's value under the upstream's field name — unless the
+    // upstream's field is already there, in which case the explicit one wins
+    // and the alias is simply dropped.
+    if let Some(v) = obj.remove(drop)
+        && !obj.contains_key(keep)
+    {
+        obj.insert(keep.into(), v);
+    }
+}
+
 #[cfg(test)]
 mod usage_tests {
     use super::{estimate_tokens, TokenUsage};
@@ -86,6 +132,69 @@ mod usage_tests {
         // Absent cache fields (non-caching upstreams) change nothing.
         let plain = TokenUsage::from_anthropic(&json!({"input_tokens": 7, "output_tokens": 3}));
         assert_eq!(plain.input, 7);
+    }
+
+    #[test]
+    fn developer_role_is_rewritten_to_system() {
+        let mut body = json!({"messages": [
+            {"role": "developer", "content": "rules"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+        ]});
+        super::developer_role_to_system(&mut body);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "rules");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][2]["role"], "assistant");
+    }
+
+    #[test]
+    fn developer_role_rewrite_tolerates_other_shapes() {
+        // No messages array: nothing to do, and nothing may panic.
+        let mut body = json!({"input": "x"});
+        super::developer_role_to_system(&mut body);
+        assert_eq!(body["input"], "x");
+    }
+
+    #[test]
+    fn max_completion_tokens_becomes_max_tokens_for_compatible_upstreams() {
+        let mut body = json!({"max_completion_tokens": 42, "messages": []});
+        super::normalize_max_tokens_field(&mut body, false);
+        assert_eq!(body["max_tokens"], 42);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn max_tokens_becomes_max_completion_tokens_for_openai_native() {
+        let mut body = json!({"max_tokens": 7, "messages": []});
+        super::normalize_max_tokens_field(&mut body, true);
+        assert_eq!(body["max_completion_tokens"], 7);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn max_tokens_field_keeps_the_upstream_spelling_and_drops_the_alias() {
+        // Already the upstream's field: left alone.
+        let mut body = json!({"max_tokens": 7});
+        super::normalize_max_tokens_field(&mut body, false);
+        assert_eq!(body["max_tokens"], 7);
+        assert!(body.get("max_completion_tokens").is_none());
+
+        // Both present: the upstream's field wins, the alias is dropped.
+        let mut body = json!({"max_tokens": 1, "max_completion_tokens": 2});
+        super::normalize_max_tokens_field(&mut body, false);
+        assert_eq!(body["max_tokens"], 1, "explicit upstream field wins");
+        assert!(body.get("max_completion_tokens").is_none());
+
+        let mut body = json!({"max_tokens": 1, "max_completion_tokens": 2});
+        super::normalize_max_tokens_field(&mut body, true);
+        assert_eq!(body["max_completion_tokens"], 2);
+        assert!(body.get("max_tokens").is_none());
+
+        // Neither present: nothing invented.
+        let mut body = json!({"messages": []});
+        super::normalize_max_tokens_field(&mut body, false);
+        assert!(body.get("max_tokens").is_none());
     }
 
     /// CJK was the big chars/4 under-count: 400 CJK chars are ~400 tokens,

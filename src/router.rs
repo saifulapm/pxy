@@ -892,6 +892,21 @@ async fn try_candidate(
     }
     body["model"] = json!(cand.model.id);
 
+    // OpenAI's newest dialect differs from the compatible-provider majority in
+    // two request-body spellings, and the clients pxy fronts speak the newest
+    // one: pi sends `developer` and `max_completion_tokens` for any reasoning
+    // model because it cannot see the real upstream behind the proxy. The
+    // upstreams mostly want `system` and `max_tokens` (DeepSeek 400s on the
+    // `developer` variant; opencode-go ignored `max_completion_tokens`, so the
+    // client's output cap silently did nothing). Only OpenAI/Azure itself opts
+    // out with `openai_native`.
+    if upstream_format == WireFormat::Openai {
+        if !provider_cfg.openai_native {
+            crate::translate::developer_role_to_system(&mut body);
+        }
+        crate::translate::normalize_max_tokens_field(&mut body, provider_cfg.openai_native);
+    }
+
     // The hosted web_search tool: pxy runs it for OpenAI upstreams, which have
     // no hosted tools of their own. Whoever built the body decided that —
     // anthropic_to_openai for Claude Code's server tool, responses for
@@ -5109,6 +5124,116 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none(), "provider-level drop must strip");
         assert!(body.get("top_k").is_none(), "model-level drop must strip");
         assert_eq!(body["temperature"], 0.5, "unlisted params must survive");
+    }
+
+    /// pi's openai-completions client sends OpenAI's newest dialect for a
+    /// reasoning model when it cannot tell the real upstream behind pxy:
+    /// `developer` (DeepSeek 400s on the literal variant) and
+    /// `max_completion_tokens` (opencode-go ignored it, so the output cap did
+    /// nothing). The passthrough must rewrite both for a compatible upstream.
+    #[tokio::test]
+    async fn openai_dialect_is_normalized_before_the_wire() {
+        use std::sync::Mutex;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    axum::Json(json!({
+                        "id": "x",
+                        "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }))
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/c"
+                models = ["m"]
+                "#
+            ),
+            "openai_dialect",
+        );
+
+        let payload = json!({"model": "p/m", "max_completion_tokens": 4096, "messages": [
+            {"role": "developer", "content": "rules"},
+            {"role": "user", "content": "hi"},
+        ]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => assert_eq!(status, 200, "got {body}"),
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        let body = seen.lock().unwrap().take().expect("upstream was called");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "rules");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["max_tokens"], 4096, "cap must survive under the upstream's name");
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_native_keeps_its_own_dialect() {
+        use std::sync::Mutex;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    axum::Json(json!({
+                        "id": "x",
+                        "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }))
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.o]
+                base_url = "{base}/c"
+                openai_native = true
+                models = ["m"]
+                "#
+            ),
+            "openai_native",
+        );
+
+        // A Claude Code-shaped client sends `system` + `max_tokens`; an
+        // OpenAI-native reasoning upstream needs `developer` +
+        // `max_completion_tokens`.
+        let payload = json!({"model": "o/m", "max_tokens": 512, "messages": [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "hi"},
+        ]});
+        let out = handle_chat(app, ClientFormat::Anthropic, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Json { status, body, .. } => assert_eq!(status, 200, "got {body}"),
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        let body = seen.lock().unwrap().take().expect("upstream was called");
+        assert_eq!(body["max_completion_tokens"], 512);
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[tokio::test]

@@ -429,6 +429,20 @@ pub struct ProviderConfig {
     /// Clients that set their own markers are always left alone.
     #[serde(default)]
     pub inject_cache_control: bool,
+    /// Is this upstream OpenAI/Azure itself, speaking the newest OpenAI
+    /// dialect? OFF by default, which makes pxy normalize the two request-body
+    /// spellings where a client's OpenAI dialect differs from the
+    /// compatible-provider majority: `developer` messages become `system`, and
+    /// `max_completion_tokens` becomes `max_tokens`. Both defaults exist
+    /// because the gateways and providers pxy fronts reject or ignore the new
+    /// spellings — DeepSeek 400s on the `developer` variant, and opencode-go
+    /// silently ignored `max_completion_tokens`, so pi's output cap did
+    /// nothing. Set `true` only for OpenAI/Azure: their reasoning models
+    /// reject `system` and require `max_completion_tokens`. Irrelevant to
+    /// Anthropic-format upstreams, whose translator already folds both into
+    /// Anthropic's `system` and `max_tokens`.
+    #[serde(default)]
+    pub openai_native: bool,
     /// Body-matched error overrides (CLIProxyAPI's request-scoped errors):
     /// absorb aggregator/WAF error text without code changes. FIRST matching
     /// rule (case-insensitive substring on the error body) wins over the
@@ -596,6 +610,7 @@ impl ProviderConfig {
             timeout_secs: default_timeout(),
             parse_think_tags: default_true(),
             inject_cache_control: false,
+            openai_native: false,
             drop_params: Vec::new(),
             errors: Vec::new(),
             accounts: Vec::new(),
