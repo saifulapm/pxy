@@ -171,6 +171,20 @@ pub fn resolve_candidates(
             .collect();
     }
     let mut chain = catalog.resolve(cfg, requested);
+    // Headroom ranking (opt-in): more remaining LOCAL allowance first, ties in
+    // config order (stable sort). Applied to the chain only — a manual pin and
+    // session affinity still precede it.
+    if catalog
+        .group_config(cfg, requested)
+        .and_then(|g| g.headroom)
+        .unwrap_or(false)
+    {
+        chain.sort_by(|a, b| {
+            remaining_headroom(cfg, state, b)
+                .partial_cmp(&remaining_headroom(cfg, state, a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     // Manual pin: walked FIRST, ahead of session affinity — `pxy route` is an
     // explicit human decision.
     let mut pinned = None;
@@ -458,10 +472,27 @@ pub async fn handle_chat(
     // Newest real upstream error of the walk (status, body, candidate).
     let mut last_raw: Option<RawError> = None;
 
+    // Free-first chains: fall onto a paid step only when every prior failure
+    // was quota exhaustion (opt-in per group). "Paid" = the model is not
+    // marked `free = true`.
+    let fallback_only_quota = app
+        .catalog
+        .group_config(&app.cfg, &requested)
+        .and_then(|g| g.fallback_only_on_quota_exhaustion)
+        .unwrap_or(false);
+    let mut quota_only = true;
+
     for attempt in 0..=MAX_RETRIES {
         skipped.clear();
         let mut saw_rpm_limit = false;
         for cand in &candidates {
+            if fallback_only_quota && cand.model.free != Some(true) && !quota_only {
+                skipped.push(format!(
+                    "{}: paid reserve held (prior failure was not quota exhaustion)",
+                    cand.full_id()
+                ));
+                continue;
+            }
             if ctx_too_small.is_some_and(|c| cand.model.context_length <= c) {
                 skipped.push(format!("{}: context window too small", cand.full_id()));
                 continue;
@@ -482,6 +513,9 @@ pub async fn handle_chat(
                 server_tool_skips |= reason.starts_with("server tools");
                 other_failures |=
                     !(reason.starts_with("context") || reason.starts_with("server tools"));
+                if !is_quota_failure(None, &reason) {
+                    quota_only = false;
+                }
                 skipped.push(format!("{}: {reason}", cand.full_id()));
                 continue;
             }
@@ -501,6 +535,9 @@ pub async fn handle_chat(
                 AttemptResult::Skip(reason) => {
                     warn!(candidate = %cand.full_id(), %reason, "failover");
                     other_failures = true;
+                    if !is_quota_failure(None, &reason) {
+                        quota_only = false;
+                    }
                     // A real attempt failed: feed the failure-rate rule.
                     app.state.model_result(&cand.state_provider(), &cand.model.id, false);
                     skipped.push(format!("{}: {reason}", cand.full_id()));
@@ -508,6 +545,9 @@ pub async fn handle_chat(
                 AttemptResult::SkipRaw { reason, status, body, headers } => {
                     warn!(candidate = %cand.full_id(), %reason, "failover");
                     other_failures = true;
+                    if !is_quota_failure(Some(status), &body) {
+                        quota_only = false;
+                    }
                     app.state.model_result(&cand.state_provider(), &cand.model.id, false);
                     // Keep the newest upstream error: if the walk ends with
                     // nothing better, this is what the client should see.
@@ -519,6 +559,7 @@ pub async fn handle_chat(
                     // The real tokenizer overruled our estimate. No cooldown
                     // (a smaller request to this model would work fine).
                     warn!(candidate = %cand.full_id(), %reason, "failover (context window)");
+                    quota_only = false;
                     let c = ctx_too_small.get_or_insert(0);
                     *c = (*c).max(cand.model.context_length);
                     skipped.push(format!("{}: {reason}", cand.full_id()));
@@ -822,6 +863,61 @@ fn retry_wait(soonest: Option<Duration>, saw_rpm_limit: bool) -> Option<Duration
 
 /// Filter stage: cooldown, rpm, daily/monthly limits, context window,
 /// tool-calling capability.
+/// Remaining fraction of every local allowance this candidate has (1.0 =
+/// untouched), the MINIMUM across configured windows: the window closest to
+/// exhaustion is the one that will actually stop the next request. No
+/// configured limits means unconstrained -> 1.0.
+fn remaining_headroom(cfg: &Config, state: &State, cand: &Candidate) -> f64 {
+    let Some(limits) = cfg.providers.get(&cand.provider).and_then(|p| p.limits.as_ref()) else {
+        return 1.0;
+    };
+    let mut used: Vec<f64> = Vec::new();
+    if let Some(rpm) = limits.rpm.filter(|r| *r > 0) {
+        used.push(state.rpm_effective(&cand.state_provider()) / rpm as f64);
+    }
+    if let Ok(w) = current_windows(limits, Timestamp::now()) {
+        let day = state
+            .usage(&cand.state_provider(), "day", w.day_start)
+            .unwrap_or_default();
+        let month = state
+            .usage(&cand.state_provider(), "month", w.month_start)
+            .unwrap_or_default();
+        let mut frac = |v: u64, l: Option<u64>| {
+            if let Some(l) = l.filter(|l| *l > 0) {
+                used.push(v as f64 / l as f64);
+            }
+        };
+        frac(day.requests, limits.daily_requests);
+        frac(day.tokens, limits.daily_tokens);
+        frac(month.requests, limits.monthly_requests);
+        frac(month.tokens, limits.monthly_tokens);
+    }
+    if limits.total_requests.is_some() || limits.total_tokens.is_some() {
+        let total = state.usage_total(&cand.state_provider()).unwrap_or_default();
+        if let Some(l) = limits.total_requests.filter(|l| *l > 0) {
+            used.push(total.requests as f64 / l as f64);
+        }
+        if let Some(l) = limits.total_tokens.filter(|l| *l > 0) {
+            used.push(total.tokens as f64 / l as f64);
+        }
+    }
+    (1.0 - used.into_iter().fold(0.0_f64, f64::max)).clamp(0.0, 1.0)
+}
+
+/// Is this failure genuine quota exhaustion, as opposed to a transient error?
+/// `fallback_only_on_quota_exhaustion` uses it to decide whether a paid reserve
+/// may be touched. A 402, or a 429 whose body names a quota window or credits
+/// condition, is quota; an rpm throttle, a 5xx, a timeout or an auth error is
+/// not — those clear on their own and must not spend paid credit.
+fn is_quota_failure(status: Option<u16>, reason: &str) -> bool {
+    match status {
+        Some(402) => return true,
+        Some(s) if s != 429 => return false,
+        _ => {}
+    }
+    quota_window_cooldown(None, reason).is_some()
+}
+
 fn check_candidate(
     app: &App,
     cand: &Candidate,
@@ -1005,6 +1101,11 @@ async fn try_candidate(
             crate::translate::backfill_openai_reasoning(&mut body);
         }
         crate::translate::sanitize_tool_schemas(&mut body, false);
+        // A missing `tools` deserializes to null on some gateways, which then
+        // reject it; send the empty array those endpoints expect.
+        if provider_cfg.inject_empty_tools && !body["tools"].is_array() {
+            body["tools"] = json!([]);
+        }
     } else if provider_cfg.requires_reasoning_replay {
         // After the sanitizer, so the placeholder is not stripped as unsigned.
         crate::translate::backfill_anthropic_thinking(&mut body);
@@ -3524,6 +3625,188 @@ mod tests {
             .map(|c| c.full_id())
             .collect();
         assert_eq!(ids, vec!["a/free1", "b/free2"]);
+    }
+
+    #[test]
+    fn quota_failure_classification() {
+        assert!(is_quota_failure(Some(402), "insufficient credits"));
+        assert!(is_quota_failure(Some(429), "You have exceeded your daily quota"));
+        assert!(is_quota_failure(None, "daily request limit"));
+        assert!(is_quota_failure(None, "monthly token limit"));
+        // A bare rate limit / 5xx / auth error is transient, not exhaustion.
+        assert!(!is_quota_failure(Some(429), "rate limit exceeded"));
+        assert!(!is_quota_failure(Some(500), "boom"));
+        assert!(!is_quota_failure(Some(401), "invalid key"));
+        assert!(!is_quota_failure(None, "rpm limit"));
+        assert!(!is_quota_failure(None, "network error"));
+    }
+
+    #[test]
+    fn headroom_ranking_prefers_the_less_used_peer() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.a]
+            base_url = "http://127.0.0.1:1/c"
+            models = ["m"]
+            [providers.a.limits]
+            daily_requests = 1
+            [providers.b]
+            base_url = "http://127.0.0.1:1/c"
+            models = ["m"]
+            [providers.b.limits]
+            daily_requests = 1
+            [groups.g]
+            headroom = true
+            models = ["a/m", "b/m"]
+            [groups.h]
+            models = ["a/m", "b/m"]
+            "#,
+            "headroom",
+        );
+        let limits = app.cfg.providers.get("a").unwrap().limits.as_ref().unwrap();
+        let w = crate::usage::current_windows(limits, jiff::Timestamp::now()).unwrap();
+        app.state.record_usage("a", w.day_start, w.month_start, 0, 0).unwrap();
+        let ids = |group: &str| -> Vec<String> {
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, group, None)
+                .iter()
+                .map(|c| c.full_id())
+                .collect()
+        };
+        assert_eq!(ids("g"), vec!["b/m", "a/m"], "the untouched peer must lead");
+        assert_eq!(ids("h"), vec!["a/m", "b/m"], "without the flag, config order wins");
+        assert_eq!(
+            app.catalog.group_config(&app.cfg, "claude/g").unwrap().headroom,
+            Some(true),
+            "the claude/ mirror resolves the same group policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn paid_reserve_held_after_a_transient_failure() {
+        use std::sync::Mutex;
+        use axum::routing::post;
+        let paid_seen: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let cap = paid_seen.clone();
+        let router = axum::Router::new()
+            .route("/free", post(|| async {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#)
+            }))
+            .route(
+                "/paid",
+                post(move || {
+                    let cap = cap.clone();
+                    async move {
+                        *cap.lock().unwrap() = true;
+                        axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.f]
+                base_url = "{base}/free"
+                models = [{{ id = "m", free = true }}]
+                [providers.p]
+                base_url = "{base}/paid"
+                models = ["m"]
+                [groups.g]
+                fallback_only_on_quota_exhaustion = true
+                models = ["f/m", "p/m"]
+                "#
+            ),
+            "reserve_transient",
+        );
+        let payload = json!({"model": "g", "messages": [{"role": "user", "content": "hi"}]});
+        let _ = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        assert!(*paid_seen.lock().unwrap() == false, "a 500 must hold the paid reserve");
+    }
+
+    #[tokio::test]
+    async fn paid_reserve_used_after_quota_exhaustion() {
+        use axum::routing::post;
+        let router = axum::Router::new()
+            .route("/free", post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"message":"You have exceeded your daily quota"}}"#,
+                )
+            }))
+            .route("/paid", post(|| async {
+                axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+            }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.f]
+                base_url = "{base}/free"
+                models = [{{ id = "m", free = true }}]
+                [providers.p]
+                base_url = "{base}/paid"
+                models = ["m"]
+                [groups.g]
+                fallback_only_on_quota_exhaustion = true
+                models = ["f/m", "p/m"]
+                "#
+            ),
+            "reserve_quota",
+        );
+        let payload = json!({"model": "g", "messages": [{"role": "user", "content": "hi"}]});
+        match handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await {
+            Outcome::Json { provider, .. } => {
+                assert_eq!(provider.as_deref(), Some("p/m"), "quota exhaustion releases the reserve")
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_empty_tools_sends_the_array() {
+        use std::sync::Mutex;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/c"
+                inject_empty_tools = true
+                models = ["m"]
+                "#
+            ),
+            "inject_tools",
+        );
+        let payload = json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]});
+        let _ = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        let body = seen.lock().unwrap().take().expect("upstream was called");
+        assert_eq!(body["tools"], json!([]));
     }
 
     #[test]

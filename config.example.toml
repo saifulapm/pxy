@@ -159,6 +159,19 @@ small_model = "zai/glm-4.5-flash"
 #   <id>-low|-medium|-high|-xhigh|-max   set the reasoning level
 # `auto/free` is a virtual id: every model marked `free = true`, walked in
 # catalog order. The ordinary per-provider limits and cooldowns still apply.
+#
+# `inject_empty_tools = true` (OpenAI-format providers, default OFF) sends
+# `tools: []` when the client omitted the key. Some gateways deserialize a
+# missing `tools` to null and reject it (AMD Radeon: "Expected array, received
+# null").
+#
+# Two opt-in group policies:
+#   headroom = true                      rank the chain by remaining LOCAL
+#                                        allowance (rpm/daily/monthly counters),
+#                                        more headroom first, ties in config order
+#   fallback_only_on_quota_exhaustion = true   hold the paid steps of a
+#                                        free-first chain unless every prior
+#                                        failure was genuine quota exhaustion
 
 # Tencent Cloud TokenHub (international, Singapore node) — OpenAI-compatible
 # gateway. Key from the TokenHub console API Key page; each model must be

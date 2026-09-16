@@ -162,6 +162,19 @@ impl Catalog {
         self.groups.get(bare).is_some_and(|g| !g.chain.is_empty())
     }
 
+    /// The GroupConfig a requested id names, accepting the `claude/` mirror and
+    /// the `[1m]` window marker — the policy lookups (headroom, paid-reserve)
+    /// must see the same group `resolve` routed on.
+    pub fn group_config<'a>(
+        &self,
+        cfg: &'a Config,
+        requested: &str,
+    ) -> Option<&'a crate::config::GroupConfig> {
+        let bare = requested.strip_prefix("claude/").unwrap_or(requested);
+        let bare = bare.strip_suffix(CTX_1M_MARKER).unwrap_or(bare);
+        cfg.groups.get(bare)
+    }
+
     /// Whether this exact provider/model pair is actually cataloged — listed
     /// on its provider, or a member of some group. resolve() deliberately
     /// fabricates a spec for any id under a known provider (an explicit

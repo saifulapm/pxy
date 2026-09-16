@@ -172,6 +172,21 @@ pub struct GroupConfig {
     /// and whose upstream is down or out of budget, because there is no call
     /// to verify it with. Set this only when you know the chain thinks.
     pub reasoning: Option<bool>,
+    /// Free-first chains with a paid reserve: walk onto a paid step only when
+    /// every prior failure was genuine quota exhaustion. A transient error
+    /// (5xx, timeout, auth, an rpm throttle) holds the reserve instead of
+    /// spending it. A candidate is "paid" unless its model is marked
+    /// `free = true`. OFF by default.
+    #[serde(default)]
+    pub fallback_only_on_quota_exhaustion: Option<bool>,
+
+    /// Rank this chain by remaining LOCAL allowance before walking it: more
+    /// headroom first, ties keep config order. Uses pxy's own rpm/daily/monthly
+    /// counters, so it needs no network and no extra state. OFF by default:
+    /// config order is the documented priority and only an opt-in should
+    /// override it.
+    #[serde(default)]
+    pub headroom: Option<bool>,
 }
 
 impl GroupConfig {
@@ -455,6 +470,14 @@ pub struct ProviderConfig {
     /// real Anthropic upstream with "Invalid signature".
     #[serde(default)]
     pub requires_reasoning_replay: bool,
+    /// Some OpenAI-compatible gateways deserialize a missing `tools` to null and
+    /// reject it (AMD's Radeon endpoint: "Expected array, received null, path:
+    /// ['tools']"). With this set pxy sends an empty array instead of omitting
+    /// the key. OFF by default: an absent `tools` is the normal OpenAI shape
+    /// and most providers treat `[]` and absent identically, but a few gateways
+    /// only accept one of the two.
+    #[serde(default)]
+    pub inject_empty_tools: bool,
     /// Body-matched error overrides (CLIProxyAPI's request-scoped errors):
     /// absorb aggregator/WAF error text without code changes. FIRST matching
     /// rule (case-insensitive substring on the error body) wins over the
@@ -624,6 +647,7 @@ impl ProviderConfig {
             inject_cache_control: false,
             openai_native: false,
             requires_reasoning_replay: false,
+            inject_empty_tools: false,
             drop_params: Vec::new(),
             errors: Vec::new(),
             accounts: Vec::new(),
