@@ -97,21 +97,47 @@ pub struct Config {
 pub struct CaptureConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Write artifacts only for FAILED attempts (a skipped or fatal
+    /// candidate). This is the mode to leave on: volume tracks problems, not
+    /// traffic. OFF means every attempt is written.
+    #[serde(default)]
+    pub on_error: bool,
     /// Where artifacts go. Default: `$XDG_DATA_HOME/pxy/captures`.
     pub dir: Option<String>,
     /// Per-artifact byte cap; the serialized JSON is truncated past it.
     #[serde(default = "default_capture_bytes")]
     pub max_bytes: u64,
+    /// Retention: keep at most this many artifacts, oldest deleted first.
+    #[serde(default = "default_capture_files")]
+    pub max_files: u64,
+    /// Retention: delete artifacts older than this many seconds.
+    #[serde(default = "default_capture_age")]
+    pub max_age_secs: u64,
 }
 
 impl Default for CaptureConfig {
     fn default() -> Self {
-        Self { enabled: false, dir: None, max_bytes: default_capture_bytes() }
+        Self {
+            enabled: false,
+            on_error: false,
+            dir: None,
+            max_bytes: default_capture_bytes(),
+            max_files: default_capture_files(),
+            max_age_secs: default_capture_age(),
+        }
     }
 }
 
 fn default_capture_bytes() -> u64 {
     256 * 1024
+}
+
+fn default_capture_files() -> u64 {
+    500
+}
+
+fn default_capture_age() -> u64 {
+    24 * 3600
 }
 
 /// A non-model HTTP service pool (search, fetch). Array of tables so config

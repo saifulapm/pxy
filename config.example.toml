@@ -1146,9 +1146,17 @@ monthly_requests = 200
 # ($XDG_DATA_HOME/pxy/captures unless `dir` says otherwise). Values under
 # credential-ish keys are redacted, and common token shapes (sk-…, Bearer …)
 # inside strings are masked before anything touches disk. Each artifact is
-# truncated past `max_bytes`.
+# truncated past `max_bytes`; retention keeps at most `max_files` artifacts
+# and deletes anything older than `max_age_secs`.
+#
+# `on_error = true` is the mode to leave on: only FAILED attempts are written,
+# so volume tracks problems rather than traffic. All artifacts of one attempt
+# share a correlation id (the filename up to `__`).
 #
 # [capture]
 # enabled = true
-# dir = "/tmp/pxy-captures"     # optional; default is the pxy data dir
+# on_error = true             # recommended; omit to capture every attempt
+# dir = "/tmp/pxy-captures"   # optional; default is the pxy data dir
 # max_bytes = 262144
+# max_files = 500
+# max_age_secs = 86400

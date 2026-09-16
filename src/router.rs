@@ -1043,8 +1043,33 @@ enum AttemptResult {
     Fatal(Outcome),
 }
 
+/// Wrapper owning this attempt's capture transaction: artifacts share one id
+/// and, under `on_error`, are written only when the attempt fails.
 async fn try_candidate(
     app: &SharedApp,
+    cand: &Candidate,
+    client_format: ClientFormat,
+    payload: &Value,
+    stream: bool,
+    input_estimate: u64,
+    ctx: &ClientContext,
+    multi: bool,
+) -> AttemptResult {
+    let mut cap = crate::capture::Txn::new(&app.cfg);
+    let result = try_candidate_inner(
+        app, &mut cap, cand, client_format, payload, stream, input_estimate, ctx, multi,
+    )
+    .await;
+    cap.finish(matches!(result, AttemptResult::Done(_)));
+    result
+}
+
+// The 9th argument is this attempt's capture transaction; threading a context
+// struct through this ~600-line function would be churn for a lint.
+#[allow(clippy::too_many_arguments)]
+async fn try_candidate_inner(
+    app: &SharedApp,
+    cap: &mut crate::capture::Txn,
     cand: &Candidate,
     client_format: ClientFormat,
     payload: &Value,
@@ -1246,15 +1271,12 @@ async fn try_candidate(
     // there is nothing to fail over to. Non-streaming is exempt because its
     // headers legitimately arrive only once the whole answer is generated.
     // Opt-in artifact capture: the client request and the exact upstream
-    // request body, before the wire. Best-effort and gated on the flag.
-    if crate::capture::enabled(&app.cfg) {
-        crate::capture::record(&app.cfg, "client-request", payload);
-        crate::capture::record(
-            &app.cfg,
-            "upstream-request",
-            &json!({"candidate": cand.full_id(), "url": &prepared.url, "body": &body}),
-        );
-    }
+    // request body, before the wire.
+    cap.add("client-request", payload);
+    cap.add(
+        "upstream-request",
+        &json!({"candidate": cand.full_id(), "url": &prepared.url, "body": &body}),
+    );
     let send = req.json(&body).send();
     let resp = if multi && (stream || force_stream) {
         match tokio::time::timeout(HEADERS_DEADLINE, send).await {
@@ -1457,9 +1479,7 @@ async fn try_candidate(
         if let Some(names) = &tool_names {
             crate::translate::tool_text::extract_from_response(&mut upstream_body, names);
         }
-        if crate::capture::enabled(&app.cfg) {
-            crate::capture::record(&app.cfg, "upstream-response", &upstream_body);
-        }
+        cap.add("upstream-response", &upstream_body);
         let usage = match upstream_format {
             WireFormat::Openai => TokenUsage::from_openai(&upstream_body["usage"]),
             WireFormat::Anthropic => TokenUsage::from_anthropic(&upstream_body["usage"]),

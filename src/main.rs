@@ -148,6 +148,15 @@ enum Command {
         #[arg(long, short)]
         model: Option<String>,
     },
+    /// Show request-artifact captures (and how much space they use)
+    Captures {
+        /// Delete every capture instead of listing
+        #[arg(long)]
+        clean: bool,
+        /// Emit one JSON object
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -239,7 +248,74 @@ fn main() -> Result<()> {
             let cfg = config::Config::load(&cfg_path)?;
             block_on_current(media::cli::video(&cfg, &prompt, model.as_deref(), &output))
         }
+        Command::Captures { clean, json } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            captures(&cfg, clean, json)
+        }
     }
+}
+
+/// `pxy captures [--clean] [--json]` — inspect or clear the capture dir.
+fn captures(cfg: &config::Config, clean: bool, json: bool) -> Result<()> {
+    let dir = capture::capture_dir(&cfg.capture);
+    let entries: Vec<(std::time::SystemTime, u64)> = std::fs::read_dir(&dir)
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| {
+                    if !e.file_name().to_string_lossy().ends_with(".json") {
+                        return None;
+                    }
+                    let md = e.metadata().ok()?;
+                    Some((md.modified().ok()?, md.len()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let bytes: u64 = entries.iter().map(|(_, n)| *n).sum();
+
+    if clean {
+        let mut removed = 0u64;
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().ends_with(".json")
+                && std::fs::remove_file(e.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"dir": dir.display().to_string(), "removed": removed})
+            );
+        } else {
+            println!("removed {removed} capture(s) from {}", dir.display());
+        }
+        return Ok(());
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dir": dir.display().to_string(),
+                "enabled": cfg.capture.enabled,
+                "onError": cfg.capture.on_error,
+                "count": entries.len(),
+                "bytes": bytes,
+                "maxFiles": cfg.capture.max_files,
+                "maxAgeSecs": cfg.capture.max_age_secs,
+            })
+        );
+    } else {
+        println!("capture dir: {}", dir.display());
+        println!(
+            "enabled: {}   mode: {}",
+            cfg.capture.enabled,
+            if cfg.capture.on_error { "errors only" } else { "every attempt" }
+        );
+        println!("artifacts: {} ({bytes} bytes)", entries.len());
+    }
+    Ok(())
 }
 
 /// `pxy models [--json]` — group names first, then every "provider/model". The
