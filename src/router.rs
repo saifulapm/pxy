@@ -57,6 +57,10 @@ pub struct ClientContext {
     /// [`ClientFormat::Openai`], but only the Responses dialect understands
     /// pxy's served-tool marker chunk, so only it may receive one.
     pub responses: bool,
+    /// How many sub-requests deep this turn is: 0 for a client request, 1 for a
+    /// meta-tool's sub-request. At 1 or more the meta-tools are stripped, so
+    /// recursion stops at one level.
+    pub tool_depth: u8,
 }
 
 /// Outcome handed to the HTTP layer.
@@ -1170,6 +1174,9 @@ async fn try_candidate_inner(
             .iter()
             .copied()
             .filter(|t| t.served_on(client_format) && t.servable(app))
+            // A sub-request may not re-enter a meta-tool: at depth 1 the
+            // advisor and subagent are dropped like a tool pxy cannot serve.
+            .filter(|t| !(ctx.tool_depth >= 1 && t.is_meta()))
             .collect()
     } else {
         Vec::new()
@@ -3514,12 +3521,12 @@ mod tests {
         let payload = json!({"tools": [
             {"type": "web_search_20250305", "name": "web_search"},
             {"type": "openrouter:web_search"},
-            {"type": "openrouter:advisor"},
+            {"type": "openrouter:fusion"},
         ]});
         let default = ServerToolsConfig::default();
         assert_eq!(
             openai_unservable_server_tools(&payload, &default),
-            vec!["openrouter:advisor"]
+            vec!["openrouter:fusion"]
         );
         let none = ServerToolsConfig { enabled: vec![], ..default };
         assert_eq!(
@@ -3527,7 +3534,7 @@ mod tests {
             vec![
                 "web_search",
                 "openrouter:web_search",
-                "openrouter:advisor"
+                "openrouter:fusion"
             ]
         );
     }
@@ -6016,6 +6023,89 @@ mod tests {
     /// refused on a single OpenAI candidate rather than silently dropped from
     /// the body, and skipped on a walk so an Anthropic peer can take it. A
     /// spelling the registry maps is servable, so the translator injects it.
+    /// A meta-tool may not recurse. `tool_depth` is 0 for a client request and
+    /// 1 for a meta-tool's sub-request; at 1 the declaration is stripped, so
+    /// the upstream is never offered the advisor and the loop can never serve
+    /// it. At depth 0 the same declaration becomes the reserved function.
+    #[tokio::test]
+    async fn depth_one_sub_request_strips_the_meta_tools() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    let wants_stream = body["stream"] == true;
+                    capture.lock().unwrap().push(body);
+                    // A served tool forces the upstream stream, and a
+                    // sub-request with none stays plain JSON.
+                    if wants_stream {
+                        let sse = concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        );
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .unwrap()
+                            .into_response()
+                    } else {
+                        axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/c"
+                models = ["m"]
+                "#
+            ),
+            "tool_depth",
+        );
+        let payload = json!({
+            "model": "a/m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "pxy:advisor"}],
+            "stream": false,
+        });
+        let advisor = server_tools::function_name(server_tools::Tool::Advisor);
+        let offers_advisor = |b: &Value| {
+            b["tools"].as_array().is_some_and(|ts| {
+                ts.iter().any(|t| t["function"]["name"] == advisor.as_str())
+            })
+        };
+
+        let _ =
+            handle_chat(app.clone(), ClientFormat::Openai, payload.clone(), ClientContext::default())
+                .await;
+        let _ = handle_chat(
+            app.clone(),
+            ClientFormat::Openai,
+            payload.clone(),
+            ClientContext { tool_depth: 1, ..ClientContext::default() },
+        )
+        .await;
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "both requests must reach the upstream");
+        assert!(offers_advisor(&bodies[0]), "depth 0 offers the advisor: {}", bodies[0]);
+        assert!(!offers_advisor(&bodies[1]), "depth 1 must strip it: {}", bodies[1]);
+    }
+
     #[tokio::test]
     async fn server_tool_servability_follows_the_registry() {
         use axum::routing::post;
@@ -6075,7 +6165,7 @@ mod tests {
 
         // Alone on an OpenAI candidate there is no peer to hand a spelling pxy
         // cannot inject to: 400, with no upstream call spent.
-        for ty in ["openrouter:advisor"] {
+        for ty in ["openrouter:fusion"] {
             let payload = json!({
                 "model": "free/small", "max_tokens": 100,
                 "messages": [{"role": "user", "content": "x"}],
@@ -6095,7 +6185,7 @@ mod tests {
         let payload = json!({
             "model": "auto", "max_tokens": 100,
             "messages": [{"role": "user", "content": "fetch"}],
-            "tools": [{"type": "openrouter:advisor"}],
+            "tools": [{"type": "openrouter:fusion"}],
         });
         let out =
             handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
@@ -6108,7 +6198,7 @@ mod tests {
         assert!(
             bodies[0]["tools"]
                 .as_array()
-                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "openrouter:advisor")),
+                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "openrouter:fusion")),
             "the unservable tool must reach the Anthropic peer intact: {:?}",
             bodies[0]["tools"]
         );

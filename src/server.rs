@@ -97,6 +97,8 @@ fn client_ctx(headers: &HeaderMap) -> ClientContext {
             .map(|s| s.trim().to_string()),
         // Set by the /v1/responses handler; every other route is not Responses.
         responses: false,
+        // Every request the client opens is a fresh turn, not a sub-request.
+        tool_depth: 0,
     }
 }
 

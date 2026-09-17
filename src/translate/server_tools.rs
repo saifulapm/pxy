@@ -23,6 +23,8 @@ pub enum Tool {
     Datetime,
     SearchModels,
     ImageGeneration,
+    Advisor,
+    Subagent,
 }
 
 impl Tool {
@@ -36,6 +38,8 @@ impl Tool {
             Tool::Datetime,
             Tool::SearchModels,
             Tool::ImageGeneration,
+            Tool::Advisor,
+            Tool::Subagent,
         ]
     }
 
@@ -48,7 +52,16 @@ impl Tool {
             Tool::Datetime => "datetime",
             Tool::SearchModels => "search_models",
             Tool::ImageGeneration => "image_generation",
+            Tool::Advisor => "advisor",
+            Tool::Subagent => "subagent",
         }
+    }
+
+    /// Whether this tool's executor issues a sub-request through pxy's own
+    /// router. A meta-tool is stripped from a sub-request, so recursion stops
+    /// at one level.
+    pub fn is_meta(self) -> bool {
+        matches!(self, Tool::Advisor | Tool::Subagent)
     }
 
     /// Run one call for this tool. `Err` means the call could not be served at
@@ -62,6 +75,9 @@ impl Tool {
             Tool::Datetime => run_datetime(ctx, args),
             Tool::SearchModels => run_search_models(ctx, args),
             Tool::ImageGeneration => run_image_generation(ctx, args).await,
+            // The meta-tools' executors land in their own tasks; until then a
+            // call is unserved rather than mis-served.
+            Tool::Advisor | Tool::Subagent => Err("meta-tool executor not wired yet".into()),
         }
     }
 
@@ -84,6 +100,8 @@ impl Tool {
             Tool::Datetime => true,
             Tool::SearchModels => true,
             Tool::ImageGeneration => crate::media::image_chain_can_return_urls(&app.cfg),
+            // A meta-tool needs only the router it is already in.
+            Tool::Advisor | Tool::Subagent => true,
         }
     }
 
@@ -172,7 +190,8 @@ pub async fn run_internal_chat(
             }
         }
     }
-    match handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await {
+    let ctx = ClientContext { tool_depth: 1, ..ClientContext::default() };
+    match handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await {
         Outcome::Json { status, body, .. } if status < 400 => body["choices"][0]["message"]
             ["content"]
             .as_str()
@@ -212,6 +231,8 @@ pub fn from_type(ty: &str) -> Option<Tool> {
             Some(Tool::SearchModels)
         }
         "openrouter:image_generation" | "pxy:image_generation" => Some(Tool::ImageGeneration),
+        "openrouter:advisor" | "pxy:advisor" => Some(Tool::Advisor),
+        "openrouter:subagent" | "pxy:subagent" => Some(Tool::Subagent),
         t if t.starts_with("web_search") => Some(Tool::WebSearch),
         _ => None,
     }
@@ -318,6 +339,24 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                     },
                     "required": ["prompt"],
                 },
+            },
+        }),
+        // The meta-tools' arguments arrive with their specs; the def exists so
+        // the reserved function can be injected and then depth-stripped.
+        Tool::Advisor => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::Advisor),
+                "description": "Consult a stronger model for guidance.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }),
+        Tool::Subagent => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::Subagent),
+                "description": "Delegate a self-contained task to a cheaper model.",
+                "parameters": {"type": "object", "properties": {}},
             },
         }),
     }
