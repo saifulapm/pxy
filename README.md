@@ -1,95 +1,87 @@
 # pxy
 
-Tiny Rust proxy that puts all your LLM providers behind one local endpoint, with named
-**groups** that route by priority + limits and fall over automatically. Built to
-replace a heavyweight Node router (OmniRoute) for personal/side-project use.
-
-```
-pxy serve                  # the daemon (or: systemctl --user enable --now pxy)
-pxy launch claude          # Claude Code wired to pxy (env vars only)
-pxy launch opencode        # opencode via OPENCODE_CONFIG_CONTENT
-pxy launch pi              # pi via a ~/.pi/agent/extensions provider
-pxy models                 # group names, then every provider/model (--json for details)
-pxy refresh --generate     # report every provider's live catalog into models.toml
-pxy status                 # per-provider usage vs limits
-```
-
-## Setup
+One local endpoint in front of every LLM provider I use. Ask for a group name
+like `daily`; pxy walks that chain, skips anything cooling down or out of
+quota, and fails over until a provider answers. It replaced OmniRoute, a Node
+router that ran to hundreds of megabytes. pxy is one binary and one sqlite
+file.
 
 ```sh
 cargo build --release
-cp target/release/pxy ~/.local/bin/
-mkdir -p ~/.config/pxy && cp config.example.toml ~/.config/pxy/config.toml  # then edit
-cp contrib/pxy.service ~/.config/systemd/user/
+install -Dm755 target/release/pxy ~/.local/bin/pxy
+mkdir -p ~/.config/pxy && cp config.example.toml ~/.config/pxy/config.toml
+$EDITOR ~/.config/pxy/config.toml
+install -Dm644 contrib/pxy.service ~/.config/systemd/user/pxy.service
 systemctl --user daemon-reload && systemctl --user enable --now pxy
 ```
 
-Secrets never live in the config — they're `pass` references:
+`config.example.toml` documents every key. The short version:
 
 ```toml
-[providers.openrouter]
-base_url = "https://openrouter.ai/api/v1/chat/completions"   # COMPLETE endpoint URL
-api_key = { pass = "AI/openrouter/main" }                     # or {env=...}, {cmd=...}, literal
-models = ["z-ai/glm-5.2:free"]
+[server]
+port = 4100
 
-[providers.openrouter.limits]
+[providers.example]
+base_url = "https://api.example.com/v1/chat/completions"  # the whole endpoint, not a host
+api_key = { pass = "AI/example/main" }
+models = ["large", "small"]
+
+[providers.example.limits]
 rpm = 20
-daily_requests = 1000        # daily window anchored at reset/reset_tz
-daily_tokens = 2000000
+daily_requests = 1000
 reset = "00:00"
 reset_tz = "UTC"
+
+[groups.daily]
+models = ["example/large", "other/large"]
 ```
+
+Secrets stay in `pass`, or in an environment variable or a command. pxy reads
+them and never writes back, so restart the daemon after you change one.
 
 ## Groups
 
-A group is a named failover chain, and its name is itself a model id:
+A group name is itself a model id. `pxy launch claude --model daily` hands the
+group to Claude Code, and every request for `daily` walks its chain in order. A
+provider in cooldown, over a limit window, or with too small a context is
+skipped. Real token counts from response bodies land in sqlite, so limits
+survive a restart, and `x-pxy-provider` on the response says who served it.
 
-```toml
-[groups.free]
-models = ["zai/glm-4.7-flash", "openrouter/minimax/minimax-m3:free"]
+`pxy route <provider/model>` pins one model to the front of every group walk,
+with the chain still behind it as fallback. `pxy route --clear` undoes it.
 
-[groups.subscription]
-models = ["opencode-go-github/hy3", "claude/claude-opus-5"]
+`config.toml` is the whole catalog: a model is served when a provider lists it,
+and not otherwise. `models.toml` is a report that `pxy refresh --generate`
+writes and pxy never reads. Copy rows out of it by hand. Nothing is added or
+removed automatically, because anything that spends money stays a decision.
+
+## Launch
+
+```sh
+pxy launch claude      # ANTHROPIC_* env vars
+pxy launch opencode    # OPENCODE_CONFIG_CONTENT
+pxy launch codex       # -c model_providers overrides
+pxy launch pi          # writes ~/.pi/agent/extensions/pxy.ts
+pxy launch fx          # FX_GATEWAY_* env vars
 ```
 
-A request for model `free` walks that list: skip providers in cooldown / over any limit
-window / too small a context; first survivor gets the request; retryable failures
-(429/5xx/timeouts, auth errors) cool the provider down and move to the next. `Retry-After`
-is honored. Usage (requests + real token counts from responses) persists in sqlite across
-restarts; `x-pxy-provider` on every response tells you who served it.
+Every agent sees the whole catalog, so in-session model switching works.
 
-`pxy route <provider/model>` pins one model ahead of every group's chain (the chain stays
-as fallback) — that's how you switch model mid-session in an agent launched with a fixed
-group id. `pxy route --clear` (or `pxy route <group>`) unpins.
+## Endpoints
 
-**config.toml is the whole catalog.** A model is served exactly when config.toml declares
-it, under the provider that declares it — providers, credentials, limits, model lists and
-the group chains all live there, and pxy reads no other file.
+Chat in both dialects, streaming included, at `POST /v1/chat/completions` and
+`POST /v1/messages` (plus `count_tokens`). `POST /v1/responses` serves codex and
+`POST /v3/ai/language-model` serves fx. Embeddings have their own passthrough.
+`GET /v1/models` and `/healthz` round it out.
 
-**models.toml** is a report, not config: `pxy refresh --generate` writes every model each
-provider's `/models` currently lists — free and paid, with context window, tool-calling
-support and price class — and **pxy never reads it**. Copy the rows you want into a
-provider's `models = [...]` in config.toml and restart. Nothing is auto-added and nothing
-is auto-removed: what spends money stays a decision, not a heuristic.
+Non-chat work runs through `pxy search`, `fetch`, `transcribe`, `say`, `image`
+and `video`, or the matching `/v1/...` endpoints. Media usage is counted on its
+own, so it never eats a chat budget.
 
-`providers_whitelist` (top-level, above `[server]`) is an allowlist: non-empty, and only
-those providers exist at all — for the pickers, for the group chains, and for routing.
-Entries match by exact name or family prefix (`opencode-go` covers `opencode-go-github`).
+Web search works on models that never learned it. pxy offers the model a plain
+function, runs the call through the search providers you configure, and feeds
+the results back into the same streamed turn. Claude Code gets the
+`server_tool_use` blocks it expects.
 
-## Endpoints (v1)
-
-- `POST /v1/chat/completions` (OpenAI) and `POST /v1/messages` + `count_tokens`
-  (Anthropic) — both translate to whatever each upstream speaks, streaming included.
-- `GET /v1/models`, `GET /healthz`.
-- Providers: any OpenAI- or Anthropic-compatible endpoint via config, plus GitHub
-  Copilot (built-in two-stage token mint). More OAuth providers land one by one.
-
-Hosted **web search** works on models that have never heard of it — Anthropic's
-`web_search` server tool (Claude Code's WebSearch) and the Responses API's
-(`codex --search`). An OpenAI upstream is offered a plain function instead; pxy
-intercepts the call, runs it through `[[search.providers]]`, feeds the results back to
-the model, and continues the same streamed turn. Claude clients get the
-`server_tool_use` + `web_search_tool_result` blocks they expect.
-
-Design history and research notes are in the git log. The living spec is this
-project's mem wiki: `mem wiki` lists the pages.
+The living spec is this project's mem wiki (`mem wiki` lists the pages). Design
+history is in the git log.
