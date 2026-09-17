@@ -3333,17 +3333,21 @@ mod tests {
         let payload = json!({"tools": [
             {"type": "web_search_20250305", "name": "web_search"},
             {"type": "openrouter:web_search"},
-            {"type": "openrouter:web_fetch"},
+            {"type": "openrouter:image_generation"},
         ]});
         let default = ServerToolsConfig::default();
         assert_eq!(
             openai_unservable_server_tools(&payload, &default),
-            vec!["openrouter:web_fetch"]
+            vec!["openrouter:image_generation"]
         );
         let none = ServerToolsConfig { enabled: vec![], ..default };
         assert_eq!(
             openai_unservable_server_tools(&payload, &none),
-            vec!["web_search", "openrouter:web_search", "openrouter:web_fetch"]
+            vec![
+                "web_search",
+                "openrouter:web_search",
+                "openrouter:image_generation"
+            ]
         );
     }
 
@@ -5319,10 +5323,11 @@ mod tests {
     }
 
     /// `[server_tools] enabled` and the registry decide which declared server
-    /// tools pxy can serve: an `openrouter:web_fetch` (no registry entry) is
-    /// refused on a single OpenAI candidate rather than silently dropped from
-    /// the body, and skipped on a walk so an Anthropic peer can take it. A
-    /// spelling the registry maps is servable, so the translator injects it.
+    /// tools pxy can serve: an `openrouter:image_generation` (no registry
+    /// entry) is refused on a single OpenAI candidate rather than silently
+    /// dropped from the body, and skipped on a walk so an Anthropic peer can
+    /// take it. A spelling the registry maps is servable, so the translator
+    /// injects it.
     #[tokio::test]
     async fn server_tool_servability_follows_the_registry() {
         use axum::routing::post;
@@ -5382,7 +5387,7 @@ mod tests {
 
         // Alone on an OpenAI candidate there is no peer to hand a spelling pxy
         // cannot inject to: 400, with no upstream call spent.
-        for ty in ["openrouter:web_fetch"] {
+        for ty in ["openrouter:image_generation"] {
             let payload = json!({
                 "model": "free/small", "max_tokens": 100,
                 "messages": [{"role": "user", "content": "x"}],
@@ -5402,7 +5407,7 @@ mod tests {
         let payload = json!({
             "model": "auto", "max_tokens": 100,
             "messages": [{"role": "user", "content": "fetch"}],
-            "tools": [{"type": "openrouter:web_fetch"}],
+            "tools": [{"type": "openrouter:image_generation"}],
         });
         let out =
             handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
@@ -5415,7 +5420,7 @@ mod tests {
         assert!(
             bodies[0]["tools"]
                 .as_array()
-                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "openrouter:web_fetch")),
+                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "openrouter:image_generation")),
             "the unservable tool must reach the Anthropic peer intact: {:?}",
             bodies[0]["tools"]
         );

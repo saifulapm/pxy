@@ -110,9 +110,10 @@ async fn search_one(
     let timeout = std::time::Duration::from_secs(20);
     let body: Value = match p.kind {
         ServiceKind::Brave => {
+            let endpoint = p.base_url.as_deref().unwrap_or(BRAVE_URL);
             let resp = app
                 .http
-                .get(format!("{BRAVE_URL}?q={}&count={n}", urlencode(query)))
+                .get(format!("{endpoint}?q={}&count={n}", urlencode(query)))
                 .timeout(timeout)
                 .header("accept", "application/json")
                 .header("x-subscription-token", api_key)
@@ -124,7 +125,7 @@ async fn search_one(
         ServiceKind::Jina => {
             let resp = app
                 .http
-                .post(JINA_SEARCH_URL)
+                .post(p.base_url.as_deref().unwrap_or(JINA_SEARCH_URL))
                 .timeout(timeout)
                 .header("accept", "application/json")
                 .bearer_auth(api_key)
@@ -137,7 +138,7 @@ async fn search_one(
         ServiceKind::FirecrawlSearch => {
             let resp = app
                 .http
-                .post(FIRECRAWL_SEARCH_URL)
+                .post(p.base_url.as_deref().unwrap_or(FIRECRAWL_SEARCH_URL))
                 .timeout(timeout)
                 .bearer_auth(api_key)
                 .json(&json!({"query": query, "limit": n}))
@@ -261,9 +262,10 @@ async fn fetch_one(app: &App, p: &ServiceProvider, url: &str) -> anyhow::Result<
     let timeout = std::time::Duration::from_secs(60);
     match p.kind {
         ServiceKind::JinaReader => {
+            let endpoint = p.base_url.as_deref().unwrap_or(JINA_READER_URL);
             let resp = app
                 .http
-                .get(format!("{JINA_READER_URL}{url}"))
+                .get(format!("{endpoint}{url}"))
                 .timeout(timeout)
                 .bearer_auth(api_key)
                 .header("x-return-format", "markdown")
@@ -275,7 +277,7 @@ async fn fetch_one(app: &App, p: &ServiceProvider, url: &str) -> anyhow::Result<
         ServiceKind::FirecrawlScrape => {
             let resp = app
                 .http
-                .post(FIRECRAWL_SCRAPE_URL)
+                .post(p.base_url.as_deref().unwrap_or(FIRECRAWL_SCRAPE_URL))
                 .timeout(timeout)
                 .bearer_auth(api_key)
                 .json(&json!({"url": url, "formats": ["markdown"]}))

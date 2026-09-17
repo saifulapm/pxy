@@ -197,6 +197,10 @@ pub struct ServiceProvider {
     pub name: String,
     pub kind: ServiceKind,
     pub api_key: SecretRef,
+    /// Endpoint override. When set, every request for this provider goes here
+    /// instead of the kind's hardcoded URL — for a self-hosted reader, or a
+    /// mock in a test.
+    pub base_url: Option<String>,
     /// Free-quota guards, enforced locally against pxy's own counters.
     pub daily_requests: Option<u64>,
     pub monthly_requests: Option<u64>,
