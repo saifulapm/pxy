@@ -174,7 +174,22 @@ pub fn request(payload: &Value) -> Value {
     out.insert("messages".into(), json!(messages));
 
     if let Some(tools) = payload["tools"].as_array() {
-        let converted: Vec<Value> = tools.iter().filter_map(convert_tool).collect();
+        // One reserved function per served tool, however many spellings
+        // declared it: a second identical def risks an upstream 400 and hands
+        // the model two indistinguishable functions to choose from.
+        let mut served: Vec<server_tools::Tool> = Vec::new();
+        let converted: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                if let Some(tool) = server_tools::from_type(t["type"].as_str().unwrap_or("")) {
+                    if served.contains(&tool) {
+                        return None;
+                    }
+                    served.push(tool);
+                }
+                convert_tool(t)
+            })
+            .collect();
         if !converted.is_empty() {
             out.insert("tools".into(), json!(converted));
         }
@@ -900,14 +915,32 @@ mod tests {
         assert_eq!(msgs[3]["content"], "result"); // envelope unwrapped
         assert_eq!(msgs[4]["role"], "assistant");
         let tools = chat["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0]["function"]["name"], "get");
         assert_eq!(tools[1]["function"]["name"], "shell");
         // hosted web_search -> the function pxy answers itself, whatever
         // spelling the client declared
         let reserved = server_tools::function_name(server_tools::Tool::WebSearch);
         assert_eq!(tools[2]["function"]["name"], reserved);
-        assert_eq!(tools[3]["function"]["name"], reserved);
+    }
+
+    /// One served tool is one OpenAI function, however many spellings declared
+    /// it. Forwarding the reserved def twice risks an upstream 400 and leaves
+    /// the model a choice between two identical functions.
+    #[test]
+    fn duplicate_server_tool_spellings_inject_one_function() {
+        let chat = request(&json!({
+            "input": [],
+            "tools": [
+                {"type": "web_search"},
+                {"type": "openrouter:web_search", "max_uses": 1},
+                {"type": "pxy:web_search"},
+            ],
+        }));
+        let reserved = server_tools::function_name(server_tools::Tool::WebSearch);
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "{chat}");
+        assert_eq!(tools[0]["function"]["name"], reserved);
     }
 
     /// image_generation and friends still have no equivalent, and a hosted

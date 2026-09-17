@@ -16,17 +16,22 @@
 
 use serde_json::{Value, json};
 
+use super::server_tools;
+
 /// The function pxy substitutes for the server tool. Prefixed so it can never
 /// collide with a client tool named `web_search` (Claude Code's own client
 /// tools are what the rest of the `tools` array carries).
 pub const TOOL_NAME: &str = "pxy_web_search";
 
-/// Anthropic ships dated variants (`web_search_20250305`, `_20260209`, …), so
-/// match on the prefix. A `function` field means it's an ordinary function tool
-/// that merely happens to be named that, and is left alone.
+/// Is this declaration the served web_search tool? The registry owns the
+/// spellings, so `openrouter:web_search`, `pxy:web_search` and the native
+/// Anthropic/Responses names all match, exactly as the translator injects.
+/// A `function` field means it's an ordinary function tool that merely happens
+/// to be named that, and is left alone.
 fn is_server_tool(tool: &Value) -> bool {
-    tool["type"].as_str().is_some_and(|t| t.starts_with("web_search"))
-        && tool.get("function").is_none()
+    tool.get("function").is_none()
+        && tool["type"].as_str().and_then(server_tools::from_type)
+            == Some(server_tools::Tool::WebSearch)
 }
 
 /// How many searches this request allows, when it asked for search at all.
@@ -183,6 +188,20 @@ mod tests {
             {"type": "function", "function": {"name": "web_search_helper"}},
         ]});
         assert!(plan(&payload).is_none());
+    }
+
+    /// The registry maps `openrouter:`/`pxy:` spellings to the same tool, so
+    /// their `max_uses` must be read like the native one: otherwise a served
+    /// request silently falls back to the default budget.
+    #[test]
+    fn plan_reads_registry_spellings_max_uses() {
+        let p = plan(&json!({"tools": [{"type": "openrouter:web_search", "max_uses": 1}]})).unwrap();
+        assert_eq!(p.max_uses, 1);
+        let p = plan(&json!({"tools": [{"type": "pxy:web_search", "max_uses": 7}]})).unwrap();
+        assert_eq!(p.max_uses, 7);
+        // A bare Responses spelling still matches too.
+        let p = plan(&json!({"tools": [{"type": "web_search", "max_uses": 2}]})).unwrap();
+        assert_eq!(p.max_uses, 2);
     }
 
     #[test]
