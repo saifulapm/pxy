@@ -76,9 +76,7 @@ impl Tool {
             Tool::SearchModels => run_search_models(ctx, args),
             Tool::ImageGeneration => run_image_generation(ctx, args).await,
             Tool::Advisor => run_advisor(ctx, args).await,
-            // The subagent's spec lands in its own task; until then a call is
-            // unserved rather than mis-served.
-            Tool::Subagent => Err("meta-tool executor not wired yet".into()),
+            Tool::Subagent => run_subagent(ctx, args).await,
         }
     }
 
@@ -374,8 +372,25 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
             "type": "function",
             "function": {
                 "name": function_name(Tool::Subagent),
-                "description": "Delegate a self-contained task to a cheaper model.",
-                "parameters": {"type": "object", "properties": {}},
+                "description": "Delegate a self-contained task to a cheaper worker \
+                    model and get its result back. The worker sees only the task \
+                    description, so include all relevant context and the expected \
+                    output format.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_name": {
+                            "type": "string",
+                            "description": "A short identifier for the delegated task."
+                        },
+                        "task_description": {
+                            "type": "string",
+                            "description": "Everything the worker needs: context, inputs, \
+                                constraints, and the expected output format."
+                        },
+                    },
+                    "required": ["task_name", "task_description"],
+                },
             },
         }),
     }
@@ -656,6 +671,71 @@ async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         Err(e) => {
             warn!(%model, error = %e, "advisor failed");
             Ok(failed(e))
+        }
+    }
+}
+
+/// Run one subagent call: a self-contained task goes to the worker as a user
+/// turn, the declaration's `instructions` as the system turn, and the worker's
+/// final text comes back as the outcome. The worker never sees the parent
+/// conversation. A served tool the declaration lists runs inside the worker's
+/// own sub-request, through the same loop the outer turn uses.
+async fn run_subagent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let task_name =
+        args["task_name"].as_str().filter(|s| !s.is_empty()).ok_or("missing task_name")?;
+    let task = args["task_description"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("missing task_description")?;
+    // The worker is fixed by the declaration; the model does not choose it.
+    let model = ctx.params["model"].as_str().filter(|m| !m.is_empty()).ok_or("no subagent model")?;
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(instructions) = ctx.params["instructions"].as_str().filter(|s| !s.is_empty()) {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    messages.push(json!({"role": "user", "content": task}));
+    let mut params = json!({});
+    // The worker's own served tools ride the sub-request: the loop injects and
+    // serves them there, exactly as it does for a client turn. `tool_depth` 1
+    // strips any meta-tool, so a worker can never re-enter one.
+    if let Some(tools) = ctx.params["tools"].as_array().filter(|t| !t.is_empty()) {
+        params["tools"] = Value::Array(tools.clone());
+    }
+    for key in ["max_tool_calls", "max_completion_tokens", "temperature", "reasoning"] {
+        if !ctx.params[key].is_null() {
+            params[key] = ctx.params[key].clone();
+        }
+    }
+    match run_internal_chat(ctx.app, model, messages, params).await {
+        Ok(outcome) => {
+            info!(%model, %task_name, "subagent served");
+            Ok(Ran {
+                model_output: json!({
+                    "status": "ok", "model": model, "task_name": task_name, "outcome": outcome,
+                })
+                .to_string(),
+                client: ClientRender {
+                    blocks: Vec::new(),
+                    marker: json!({
+                        "id": ctx.call_id, "model": model, "task_name": task_name,
+                        "outcome": outcome,
+                    }),
+                },
+            })
+        }
+        Err(e) => {
+            warn!(%model, %task_name, error = %e, "subagent failed");
+            Ok(Ran {
+                model_output: json!({
+                    "status": "error", "task_name": task_name,
+                    "error": format!("Subagent call failed: {e}"),
+                })
+                .to_string(),
+                client: ClientRender {
+                    blocks: Vec::new(),
+                    marker: json!({"id": ctx.call_id, "model": model, "task_name": task_name}),
+                },
+            })
         }
     }
 }
@@ -1154,6 +1234,88 @@ mod tests {
         .unwrap();
         assert_eq!(text, "advisor says hi");
         assert_eq!(app.state.usage_total("p").unwrap().requests, 1);
+    }
+
+    /// The worker sees only the task description, never the parent
+    /// conversation, and a served tool the declaration listed is offered to
+    /// it. The nested tool is injected as the reserved function so the loop
+    /// would serve it inside the worker's own sub-request.
+    #[tokio::test]
+    async fn subagent_sees_only_the_task_and_its_declared_tools() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let worker: std::sync::Arc<Mutex<Vec<Value>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = worker.clone();
+        let router = axum::Router::new().route(
+            "/worker",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    let sse = concat!(
+                        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"worker outcome\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.worker]
+                base_url = "http://{addr}/worker"
+                models = ["w"]
+                [[search.providers]]
+                name = "s"
+                kind = "brave"
+                api_key = "k"
+                base_url = "http://{addr}/search"
+                "#
+            ),
+            "subagent_tools",
+        );
+        let ctx = ToolCtx {
+            app: &app,
+            call_id: "call_1",
+            params: json!({
+                "model": "worker/w",
+                "tools": [{"type": "openrouter:web_search"}],
+            }),
+            now: jiff::Timestamp::now(),
+        };
+        let ran = Tool::Subagent
+            .execute(
+                &ctx,
+                &json!({"task_name": "t", "task_description": "summarize rust"}),
+            )
+            .await
+            .unwrap();
+        assert!(ran.model_output.contains("worker outcome"), "{}", ran.model_output);
+        assert!(ran.model_output.contains("t"), "the task name rides the result: {}", ran.model_output);
+
+        let bodies = worker.lock().unwrap();
+        let first = &bodies[0];
+        let messages = first["messages"].as_array().expect("the worker got messages");
+        assert_eq!(messages.len(), 1, "only the task description: {first}");
+        assert_eq!(messages[0]["role"], "user", "{first}");
+        assert_eq!(messages[0]["content"], "summarize rust", "{first}");
+        assert!(
+            first["tools"].as_array().is_some_and(|ts| {
+                ts.iter().any(|t| t["function"]["name"] == "pxy_web_search")
+            }),
+            "the declared served tool must be offered: {first}"
+        );
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
