@@ -1,5 +1,5 @@
 //! `pxy launch <agent>` — wire a coding agent to the local proxy.
-//! Mechanisms verified per agent in docs/02-agent-wiring.md:
+//! Mechanisms verified per agent (wiki:launch):
 //! claude = env vars only; opencode = OPENCODE_CONFIG_CONTENT inline JSON;
 //! pi = an extension in ~/.pi/agent/extensions that registers the provider.
 

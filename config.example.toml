@@ -1,5 +1,5 @@
 # pxy example config — copy to ~/.config/pxy/config.toml and edit.
-# Secrets come from `pass` (entries under AI/, see docs/01-provider-inventory.md).
+# Secrets come from `pass` (entries under AI/).
 # Model ids below are real (sampled from the OmniRoute catalog, 2026-08-24) —
 # trim/extend per provider as you like. `pxy models` lists what's exposed.
 # THIS FILE IS THE WHOLE CATALOG: a model is served only if a provider's
@@ -118,7 +118,7 @@ model = "free"
 small_model = "zai/glm-4.5-flash"
 
 # ---------------------------------------------------------------------------
-# API-key providers (base URLs from OmniRoute registry, docs/06)
+# API-key providers (base URLs from the OmniRoute registry)
 # ---------------------------------------------------------------------------
 
 # Note: `parse_think_tags` is ON by default (OpenAI-format upstreams only) —
@@ -605,7 +605,7 @@ embedding_models = ["accounts/fireworks/models/qwen3-embedding-8b"]
 [providers.fireworks.limits]
 rpm = 10
 
-# agentrouter speaks Anthropic messages natively (docs/06). Its WAF rejects
+# agentrouter speaks Anthropic messages natively. Its WAF rejects
 # unknown clients ("unauthorized client detected") — a claude-cli User-Agent
 # is the minimal passing fingerprint (probed 2026-08-24; re-probed 2026-08-31:
 # an honest pxy UA is still rejected, so the override stays — the last one
@@ -823,9 +823,9 @@ rpm = 8
 # models = ["v0-1.5-md", "v0-1.5-lg"]
 
 # ---------------------------------------------------------------------------
-# STAGED — free-tier providers researched 2026-08-24 (docs/08). Each needs a
+# STAGED — free-tier providers researched 2026-08-24. Each needs a
 # signup + `pass insert -m -f AI/<id>/main`, then uncomment and restart pxy.
-# Ranked by value; see docs/08 for quotas, gotchas and ToS notes.
+# Ranked by value; quotas, gotchas and ToS notes were researched 2026-08-24.
 # ---------------------------------------------------------------------------
 
 # 1) Z.AI — permanently FREE glm-4.7-flash (59.2 SWE-bench, agentic-coding tuned).
@@ -952,7 +952,7 @@ models = [
 [providers.kilocode.limits]
 rpm = 15
 
-# Google AI Studio (Gemini API) — free tier, ACTIVE 2026-08-25. docs/08 said
+# Google AI Studio (Gemini API) — free tier, ACTIVE 2026-08-25. The first
 # this needs a Gemini translator: WRONG (3rd correction) — Google's OpenAI
 # compatibility layer (/v1beta/openai/) does chat + tool calling fine.
 # Free tier = no billing on the project -> hard 429 stop past quota, no
@@ -1001,7 +1001,7 @@ transcription_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
 # reset = "02:00"
 # reset_tz = "Asia/Shanghai"
 
-# 7) Scaleway — DISABLED 2026-08-25, docs/08 was WRONG: the account has ZERO
+# 7) Scaleway — DISABLED 2026-08-25, the research note was WRONG: the account has ZERO
 #    billing discounts (verified via billing API) — there is NO 1M free-token
 #    tier, and a card IS on file, so every call bills real money. Key verified
 #    working (secret key = Bearer, access key id line 2 of pass entry; 4 chat

@@ -2,7 +2,7 @@
 //! agent binaries), and `pxy explain <model>` — why each candidate of a model
 //! id would or wouldn't be routed to right now.
 //!
-//! Doctor's rule (docs/09 §6.2): prove a credential by RESOLVING it (a real
+//! Doctor's rule: prove a credential by RESOLVING it (a real
 //! `pass show`), not by checking that a key is configured. No live provider
 //! calls — probes must not burn quota or mutate routing state.
 

@@ -354,7 +354,7 @@ impl State {
 
     // ---- cooldowns (lazy expiry on read) ----
     //
-    // Two scopes, keyed in one map (docs/03: OmniRoute's provider-cooldown vs
+    // Two scopes, keyed in one map (OmniRoute's provider-cooldown vs
     // model-lockout separation). Auth/credit failures are account-wide, so they
     // cool the whole provider; rate limits and upstream errors are usually
     // per-model on aggregators, so they cool only "provider/model" — otherwise

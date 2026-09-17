@@ -1,5 +1,5 @@
 //! Inject prompt-cache breakpoints into an Anthropic-bound request that has
-//! none (docs/11 §4.1).
+//! none (wiki:translation).
 //!
 //! On the paid Anthropic-format reserves the dominant input cost is the
 //! transcript replayed every turn; a cache hit prices that prefix at ~10% and

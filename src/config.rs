@@ -89,7 +89,7 @@ pub struct Config {
     pub capture: CaptureConfig,
 }
 
-/// Request artifact capture for translation debugging (docs/09 §7). Off by
+/// Request artifact capture for translation debugging (wiki:overview). Off by
 /// default. Bounded and secret-masked: values under credential-ish keys are
 /// replaced, and common token shapes inside strings are redacted.
 #[derive(Debug, Clone, Deserialize)]
@@ -416,7 +416,7 @@ pub struct ServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
     /// Informational only — pxy is deliberately loopback-only and NO endpoint
-    /// checks this today (single-user design, HANDOFF "no multi-tenant"). It
+    /// checks this today (single-user design, wiki:design-decisions). It
     /// rides `pxy launch` / media CLI auth headers and is what `@@usage`
     /// agent-tagging parses; it does not gate anything.
     #[serde(default = "default_api_key")]

@@ -502,9 +502,9 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
 /// Claude Code drives auto-compaction off this number, so it is answered by
 /// the real tokenizer whenever the routed upstream has one: when the first
 /// viable candidate speaks the Anthropic protocol, the request is forwarded
-/// to its `…/count_tokens` endpoint (docs/11 §3.4). OpenAI-format upstreams
+/// to its `…/count_tokens` endpoint (wiki:server). OpenAI-format upstreams
 /// have no such endpoint, so they keep the local estimate over EVERY block
-/// type (docs/04: counting only text broke Claude Code auto-compaction).
+/// type: counting only text broke Claude Code auto-compaction).
 async fn count_tokens(
     State(app): State<SharedApp>,
     headers: HeaderMap,
@@ -661,7 +661,7 @@ fn codex_models(app: &SharedApp) -> Json<Value> {
     Json(json!({"models": models}))
 }
 
-/// An Anthropic-dialect client (docs/11 §3.4): Claude Code sends its
+/// An Anthropic-dialect client (wiki:server): Claude Code sends its
 /// `anthropic-version` header on discovery, and its UA names the CLI. Both
 /// references negotiate on exactly these two signals.
 fn is_anthropic_client(headers: &HeaderMap) -> bool {
@@ -1549,7 +1549,7 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// docs/11 §3.4: count_tokens forwards to an Anthropic-format upstream's
+    /// count_tokens forwards to an Anthropic-format upstream's
     /// real tokenizer (Claude Code drives auto-compaction off this number) and
     /// keeps the local estimate for OpenAI-format targets and on any failure.
     #[tokio::test]
@@ -1598,7 +1598,7 @@ mod tests {
         assert!(v["input_tokens"].as_u64().is_some_and(|n| n > 0 && n < 100), "{v}");
     }
 
-    /// docs/11 §3.4: /v1/models negotiates on the caller's dialect. An
+    /// /v1/models negotiates on the caller's dialect. An
     /// Anthropic client (anthropic-version header or claude-cli UA) gets the
     /// Anthropic list shape; everyone else keeps the OpenAI list.
     #[tokio::test]

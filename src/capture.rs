@@ -1,4 +1,4 @@
-//! Opt-in request artifact capture (docs/09 §7): the client request and the
+//! Opt-in request artifact capture: the client request and the
 //! upstream request/response bodies, written to disk for translation
 //! debugging. Off unless `[capture] enabled = true`.
 //!

@@ -1,3 +1,8 @@
 /target
 /references
 /.claude/
+/.pi/
+
+# Runtime pid files must never be committed.
+/catch.pid
+/serve.pid

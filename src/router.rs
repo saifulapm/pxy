@@ -1,6 +1,6 @@
 //! The routing engine: candidate filtering, fallback walk, error
 //! classification, usage recording. Synthesis of the OmniRoute + litellm
-//! research (docs/03, docs/05).
+//! research.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -297,7 +297,7 @@ enum ModelVariant {
 
 /// Split a requested id into its base plus an optional reasoning variant. A
 /// suffix is stripped only when the base actually resolves, so a real model id
-/// ending in `-max` (there are several) is never mangled — docs/09 §6's rule.
+/// ending in `-max` (there are several) is never mangled.
 fn split_model_variant(
     catalog: &Catalog,
     cfg: &Config,
@@ -625,7 +625,7 @@ pub async fn handle_chat(
     if !multi && let Some(e) = last_raw {
         return passthrough_json(client_format, e.status, &e.body, &e.candidate, e.headers);
     }
-    // Structured, not just prose (docs/11 §3.5): when the earliest recovery
+    // Structured, not just prose : when the earliest recovery
     // is known — a cooldown that will expire — the client gets `Retry-After`
     // plus machine-readable reset fields, so its own backoff can wait exactly
     // that long instead of guessing. A harness can act on a number; it cannot
@@ -941,7 +941,7 @@ fn check_candidate(
     }
 
     // Declared server tools pxy cannot fulfil on an OpenAI upstream are a
-    // deterministic no there too (docs/11 §2.3): the translator would drop
+    // deterministic no there too (wiki:routing): the translator would drop
     // them SILENTLY, which is worse than skipping the candidate — the model
     // would answer without capabilities the harness is built around. Unlike
     // the tool_call rule, single-candidate is NOT exempt (handle_chat 400s it
@@ -1100,7 +1100,7 @@ async fn try_candidate_inner(
     if upstream_format == WireFormat::Anthropic {
         crate::translate::anthropic_sanitize::sanitize(&mut body);
         // Prompt-cache breakpoints for clients whose dialect can't set them
-        // (docs/11 §4.1) — after the sanitizer so markers land on blocks
+        // after the sanitizer so markers land on blocks
         // that will actually be sent. Opt-in per provider: some gateways
         // 400 on the field, and relay must be proven before it is enabled.
         if provider_cfg.inject_cache_control {
@@ -1141,7 +1141,7 @@ async fn try_candidate_inner(
     // lives entirely in StreamCtx, so it needs an OpenAI upstream and a
     // configured search provider. A non-streaming client is served by
     // streaming upstream anyway (force_stream below) and re-assembling its
-    // JSON from the translated stream — docs/11 §2.2, a non-streaming turn
+    // JSON from the translated stream: a non-streaming turn
     // must not silently lose the search it asked for.
     let has_search_tool = body["tools"]
         .as_array()
@@ -4573,7 +4573,7 @@ mod tests {
     /// Multi-account: the candidate walk IS the account walk. Account "gh"
     /// 401s (auth = account-wide cooldown under `sub#gh`), so account "g"
     /// serves; the bare provider name still reports `sub/m` for the panels.
-    /// docs/11 §3.2: `Outcome` had no header field at all, so it was
+    /// `Outcome` had no header field at all, so it was
     /// structurally impossible for an upstream header to reach the client —
     /// `retry-after` and the rate-limit families included, which is what a
     /// harness's own backoff reads. They must now be relayed, minus the
@@ -4650,7 +4650,7 @@ mod tests {
         }
     }
 
-    /// The docs/10 "worst bug": a single-candidate walk replaced the upstream's
+    /// The single-candidate bug: a single-candidate walk replaced the upstream's
     /// real error with a synthetic 429 overloaded_error, so Claude Code's
     /// "usage limit reached, resets at ..." UI never saw the body it reads.
     /// The in-request retry must survive (a transient 429 with a near
@@ -4870,7 +4870,7 @@ mod tests {
         );
     }
 
-    /// docs/11 §2.2: a NON-streaming turn that asks for web search must not
+    /// A NON-streaming turn that asks for web search must not
     /// silently lose it. With a search provider configured, pxy streams
     /// upstream anyway (the interception lives in the stream machinery) and
     /// re-assembles the client dialect's JSON — so the upstream must see
@@ -5011,7 +5011,7 @@ mod tests {
         assert!(tools.iter().any(|t| t["function"]["name"] == "Read"));
     }
 
-    /// docs/11 §2.3: declared server tools pxy can't translate (code_execution
+    /// Declared server tools pxy can't translate (code_execution
     /// et al) must never be silently dropped. On a multi-candidate walk the
     /// OpenAI-format candidate is skipped WITHOUT an upstream call, and the
     /// Anthropic-format peer receives the tools intact.
@@ -5158,7 +5158,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 0, "no upstream call may be spent on it");
     }
 
-    /// docs/11 §3.5: when every candidate is cooling, the terminal 429 must
+    /// When every candidate is cooling, the terminal 429 must
     /// carry machine-readable recovery info — Retry-After plus reset fields —
     /// not just prose. A harness can act on a number, not on a sentence.
     /// Non-retryable cooldowns count too: a drained daily tier expires at
@@ -5200,7 +5200,7 @@ mod tests {
         assert_eq!(ra.1, secs.to_string());
     }
 
-    /// docs/11 §4.1: an OpenAI-dialect client (codex/opencode/fx) routed to an
+    /// An OpenAI-dialect client (codex/opencode/fx) routed to an
     /// Anthropic-format provider with `inject_cache_control` gets the standard
     /// breakpoints — its own protocol has no way to set them. Off by default,
     /// and a client-set marker (Anthropic dialect) always wins.

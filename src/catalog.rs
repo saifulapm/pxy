@@ -206,7 +206,7 @@ impl Catalog {
     ///   shows ids starting "claude"/"anthropic", so /v1/models mirrors every
     ///   id under a "claude/" prefix. Stripped here — but only when the
     ///   stripped base actually resolves, so models on the real `claude`
-    ///   provider keep working (never strip blindly: docs/09 §5.1 rule).
+    ///   provider keep working (never strip blindly).
     /// - "provider/model" -> that pair (split on FIRST slash; model ids may
     ///   contain slashes themselves, e.g. openrouter's vendor-prefixed ids)
     /// - bare id -> first provider (BTreeMap = alphabetical) listing that model

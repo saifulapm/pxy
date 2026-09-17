@@ -43,7 +43,7 @@ fn strip_invalid_blocks(messages: &mut Vec<Value>) {
         };
         // A dropped block may carry the client's cache_control breakpoint;
         // losing the marker silently un-caches the whole prefix on every
-        // later turn (docs/10 §2.4). The previous kept block covers the same
+        // later turn. The previous kept block covers the same
         // prefix — the dropped block contributed no content — so the marker
         // moves there (or to the next kept block when nothing precedes it).
         // Every mutable index below needs an object target: the keep closure
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(m[1]["content"].as_array().unwrap().len(), 1);
     }
 
-    /// docs/10 §2.4: an empty text block that carries the client's
+    /// An empty text block that carries the client's
     /// cache_control breakpoint must not take the marker down with it — the
     /// previous block covers the identical prefix, so it moves there (or to
     /// the next block when the empty one led the message).

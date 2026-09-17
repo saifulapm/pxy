@@ -91,4 +91,5 @@ intercepts the call, runs it through `[[search.providers]]`, feeds the results b
 the model, and continues the same streamed turn. Claude clients get the
 `server_tool_use` + `web_search_tool_result` blocks they expect.
 
-Design/research notes live in `docs/` (start with `docs/07-pxy-design.md`).
+Design history and research notes are in the git log. The living spec is this
+project's mem wiki: `mem wiki` lists the pages.
