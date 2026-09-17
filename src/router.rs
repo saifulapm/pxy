@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use jiff::Timestamp;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -2104,6 +2105,9 @@ struct SearchCallFilter {
     /// only rides the first chunk of a call, so later chunks are matched on
     /// the index instead.
     ours: std::collections::HashMap<u64, (String, String)>,
+    /// openai tool_call index -> the reserved function name, captured from
+    /// the first chunk so the continuation can pick the tool's spec.
+    names: std::collections::HashMap<u64, String>,
     /// A client tool was called in the same turn. Anthropic's API doesn't run
     /// the search then either — it hands the client tools back first and
     /// searches on the next turn — so pxy leaves the turn alone.
@@ -2122,12 +2126,12 @@ struct SearchLoop {
 }
 
 impl SearchLoop {
-    /// Every captured search call this turn, lowest tool-call index first: a
+    /// Every captured server call this turn, lowest tool-call index first: a
     /// model may issue SEVERAL in one turn (parallel calls), and running only
     /// an arbitrary one silently lost the model's other queries. Capped by
     /// the remaining search budget; empty when another tool call shared the
     /// turn (the continuation can't fake that one) or the budget is spent.
-    fn pending(&self) -> Vec<(String, String)> {
+    fn pending_calls(&self) -> Vec<ServerCall> {
         if self.filter.saw_other || self.uses_left == 0 {
             return Vec::new();
         }
@@ -2135,9 +2139,157 @@ impl SearchLoop {
         keys.sort_unstable();
         keys.into_iter()
             .take(self.uses_left as usize)
-            .filter_map(|k| self.filter.ours.get(&k).cloned())
+            .filter_map(|k| {
+                let (id, args) = self.filter.ours.get(&k)?;
+                Some(ServerCall {
+                    name: self.filter.names.get(&k).cloned().unwrap_or_default(),
+                    id: id.clone(),
+                    args: args.clone(),
+                })
+            })
             .collect()
     }
+
+    /// The captured calls as (id, arguments), for telling whether one is
+    /// queued; the continuation uses [`pending_calls`](Self::pending_calls)
+    /// so it also knows which tool each call belongs to.
+    fn pending(&self) -> Vec<(String, String)> {
+        self.pending_calls().into_iter().map(|c| (c.id, c.args)).collect()
+    }
+}
+
+/// One reserved server call captured from the upstream stream: the function
+/// the model called, its id, and the arguments seen so far.
+struct ServerCall {
+    name: String,
+    id: String,
+    args: String,
+}
+
+/// What running one served call produced: the text the model is shown as the
+/// tool's return and the material the client's transcript records.
+struct Ran {
+    model_output: String,
+    client: ClientRender,
+}
+
+/// The client-facing half of a served call. The loop emits it in the client's
+/// dialect without knowing which tool produced it: an Anthropic stream gets
+/// the blocks, an OpenAI / Responses client gets the marker payload under the
+/// tool's reserved function name.
+struct ClientRender {
+    /// Blocks spliced into an Anthropic stream, in order.
+    blocks: Vec<Value>,
+    /// Payload of the empty-choices marker chunk a Responses client reads.
+    marker: Value,
+}
+
+/// Runs one served call. Boxed so a spec can sit in a list beside the ones a
+/// later tool adds; `None` means the call was malformed and is left unserved,
+/// so the replay only carries the calls pxy actually answered.
+type RunTool = for<'a> fn(&'a App, &'a str, &'a Value) -> BoxFuture<'a, Option<Ran>>;
+
+/// One served tool as the continuation uses it: the reserved function name the
+/// upstream calls and the code that answers one call. web_search is the only
+/// spec today; a second tool is another registry entry and another
+/// [`run_web_search`] arm, not a branch in the continuation.
+struct ToolSpec {
+    name: String,
+    run: RunTool,
+}
+
+/// The served tools this build runs, one spec each.
+fn server_tool_specs() -> Vec<ToolSpec> {
+    vec![ToolSpec {
+        name: server_tools::function_name(server_tools::Tool::WebSearch),
+        run: web_search_run,
+    }]
+}
+
+/// Box `run_web_search` into the spec's function type.
+fn web_search_run<'a>(
+    app: &'a App,
+    call_id: &'a str,
+    args: &'a Value,
+) -> BoxFuture<'a, Option<Ran>> {
+    Box::pin(run_web_search(app, call_id, args))
+}
+
+/// Run one web_search call through the provider walk. Missing or empty query
+/// arguments make it unserved; a provider failure is reported to the model,
+/// the way the real API does.
+async fn run_web_search(app: &App, call_id: &str, args: &Value) -> Option<Ran> {
+    let query = args["query"].as_str().filter(|q| !q.is_empty())?.to_string();
+    let found = crate::media::search::run_search(app, &query, 5, None).await;
+    Some(match &found {
+        Ok((provider, results)) => {
+            info!(%query, %provider, hits = results.len(), "web_search served");
+            Ran {
+                model_output: web_search::results_for_model(results),
+                client: ClientRender {
+                    blocks: vec![
+                        web_search::server_tool_use_block(call_id, &query),
+                        web_search::result_block(call_id, results),
+                    ],
+                    marker: json!({"id": call_id, "query": &query}),
+                },
+            }
+        }
+        Err(e) => {
+            warn!(%query, error = %e, "web_search failed");
+            Ran {
+                model_output: format!("Search failed: {e}"),
+                client: ClientRender {
+                    blocks: vec![
+                        web_search::server_tool_use_block(call_id, &query),
+                        web_search::error_block(call_id),
+                    ],
+                    marker: json!({"id": call_id, "query": &query}),
+                },
+            }
+        }
+    })
+}
+
+/// The replay material one continuation step assembles from the calls it
+/// served: the assistant message's tool_calls, the tool results, and each
+/// call's client render paired with the reserved name the loop emits it
+/// under.
+struct Served {
+    tool_calls: Vec<Value>,
+    tool_results: Vec<Value>,
+    renders: Vec<(String, ClientRender)>,
+}
+
+/// Run every captured call through its spec, lowest first. A call no spec
+/// answers, or one whose arguments will not parse, is skipped: the assistant
+/// message carries only the calls pxy actually served, so the replay stays
+/// valid. Returns None when nothing was served.
+async fn serve_calls(specs: &[ToolSpec], app: &App, calls: Vec<ServerCall>) -> Option<Served> {
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut tool_results: Vec<Value> = Vec::new();
+    let mut renders: Vec<(String, ClientRender)> = Vec::new();
+    for call in calls {
+        let Some(spec) = specs.iter().find(|s| s.name == call.name) else {
+            continue;
+        };
+        let Ok(args) = serde_json::from_str::<Value>(&call.args) else {
+            continue;
+        };
+        let Some(ran) = (spec.run)(app, &call.id, &args).await else {
+            continue;
+        };
+        tool_calls.push(json!({
+            "id": &call.id,
+            "type": "function",
+            "function": {"name": &call.name, "arguments": &call.args},
+        }));
+        tool_results.push(json!({
+            "role": "tool", "tool_call_id": &call.id, "content": ran.model_output,
+        }));
+        renders.push((spec.name.clone(), ran.client));
+    }
+    (!tool_calls.is_empty()).then_some(Served { tool_calls, tool_results, renders })
 }
 
 /// The prefix pxy reserves for the OpenAI functions it injects for served
@@ -2179,6 +2331,9 @@ fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
                 continue;
             }
             changed = true;
+            if !name.is_empty() {
+                f.names.insert(idx, name.to_string());
+            }
             let entry = f.ours.entry(idx).or_default();
             if let Some(id) = call["id"].as_str().filter(|s| !s.is_empty()) {
                 entry.0 = id.to_string();
@@ -2521,78 +2676,43 @@ impl StreamCtx {
     }
 
     /// End-of-stream flush (upstream may end without a terminal marker).
-    /// The upstream call ended on a `web_search` call. Run the search, splice
-    /// the protocol blocks into the client's stream, and re-issue the request
-    /// with the results appended so the model answers from them — all inside
-    /// the one message the client is already reading.
+    /// The upstream call ended on a reserved server-tool call. Run each call
+    /// through its spec, splice the protocol blocks into the client's stream,
+    /// and re-issue the request with the results appended so the model answers
+    /// from them — all inside the one message the client is already reading.
     ///
-    /// Returns the bytes to emit, or None when there was nothing to search
-    /// (then the turn closes normally). A failure to reach a search provider
-    /// is reported to the model AND to the client rather than aborting: an
-    /// error block is what the real API sends too.
+    /// Returns the bytes to emit, or None when there was nothing to serve
+    /// (then the turn closes normally). A tool failure is reported to the
+    /// model AND to the client rather than aborting: an error block is what
+    /// the real API sends too.
     async fn continue_after_search(&mut self) -> Option<Bytes> {
-        let calls = self.search.as_ref()?.pending();
+        let calls = self.search.as_ref()?.pending_calls();
         if calls.is_empty() {
             return None;
         }
-        let search = self.search.as_mut()?;
-        search.uses_left -= calls.len() as u64;
-        search.filter = SearchCallFilter::default();
+        let queued = calls.len() as u64;
 
-        // Run every well-formed call, accumulating its client-side block and
-        // model-side tool output. A malformed call (unparseable arguments) is
-        // skipped: the synthesized assistant message below carries only the
-        // calls that were actually served, so the protocol stays valid.
-        let mut client_blocks: Vec<(String, String, Value)> = Vec::new();
-        let mut tool_calls: Vec<Value> = Vec::new();
-        let mut tool_results: Vec<Value> = Vec::new();
-        for (call_id, args) in calls {
-            let Some(query) = serde_json::from_str::<Value>(&args)
-                .ok()
-                .and_then(|a| a["query"].as_str().map(String::from))
-                .filter(|q| !q.is_empty())
-            else {
-                continue;
-            };
-            let found = crate::media::search::run_search(&self.app, &query, 5, None).await;
-            let (block, tool_output) = match &found {
-                Ok((provider, results)) => {
-                    info!(%query, %provider, hits = results.len(), "web_search served");
-                    (
-                        web_search::result_block(&call_id, results),
-                        web_search::results_for_model(results),
-                    )
-                }
-                Err(e) => {
-                    warn!(%query, error = %e, "web_search failed");
-                    (web_search::error_block(&call_id), format!("Search failed: {e}"))
-                }
-            };
-            client_blocks.push((call_id.clone(), query, block));
-            tool_calls.push(json!({
-                "id": &call_id,
-                "type": "function",
-                "function": {"name": web_search::TOOL_NAME, "arguments": &args},
-            }));
-            tool_results.push(json!({
-                "role": "tool", "tool_call_id": &call_id, "content": tool_output,
-            }));
-        }
-        if tool_calls.is_empty() {
-            return None;
-        }
+        // Run every call through its tool's spec, accumulating the client-side
+        // render and the model-side tool output. A malformed call, or one no
+        // spec answers, is skipped: the synthesized assistant message below
+        // carries only the calls that were actually served, so the protocol
+        // stays valid.
+        let served = serve_calls(&server_tool_specs(), &self.app, calls).await?;
+
+        let search = self.search.as_mut()?;
+        search.uses_left -= queued;
+        search.filter = SearchCallFilter::default();
 
         // The model's own view of the turn: it called the functions, these
         // are what they returned — one assistant message carrying ALL calls,
         // then one tool message per call (the shape parallel calls require).
-        let search = self.search.as_mut()?;
         if let Some(messages) = search.body.get_mut("messages").and_then(|m| m.as_array_mut()) {
             messages.push(json!({
                 "role": "assistant",
                 "content": Value::Null,
-                "tool_calls": tool_calls,
+                "tool_calls": served.tool_calls,
             }));
-            messages.extend(tool_results);
+            messages.extend(served.tool_results);
         }
 
         let mut req = self
@@ -2609,7 +2729,7 @@ impl StreamCtx {
             // No second call means no answer, so the turn ends here rather
             // than hanging: the client still gets the results it can read.
             other => {
-                warn!(status = ?other.map(|r| r.status().as_u16()), "web_search continuation failed");
+                warn!(status = ?other.map(|r| r.status().as_u16()), "server tool continuation failed");
                 self.search = None;
                 return None;
             }
@@ -2627,12 +2747,11 @@ impl StreamCtx {
                 // The call that asked for the search finished with `tool_calls`;
                 // the turn hasn't, and the continuation sets its own reason.
                 state.clear_finish_reason();
-                // One server_tool_use + result pair per search the model asked for.
-                for (call_id, query, block) in &client_blocks {
-                    out.push_str(
-                        &state.emit_block(web_search::server_tool_use_block(call_id, query)),
-                    );
-                    out.push_str(&state.emit_block(block.clone()));
+                // One server_tool_use + result pair per call the model made.
+                for (_, render) in &served.renders {
+                    for block in &render.blocks {
+                        out.push_str(&state.emit_block(block.clone()));
+                    }
                 }
             }
             // Passthrough — codex, through /v1/responses. Chat completions has
@@ -2646,15 +2765,13 @@ impl StreamCtx {
             _ => {
                 let spent = std::mem::take(&mut self.usage);
                 record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, spent);
-                for (call_id, query, _) in &client_blocks {
-                    out.push_str(&format!(
-                        "data: {}\n\n",
-                        json!({
-                            "object": "chat.completion.chunk",
-                            "choices": [],
-                            "pxy_web_search": {"id": call_id, "query": query},
-                        })
-                    ));
+                for (name, render) in &served.renders {
+                    let mut chunk = json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [],
+                    });
+                    chunk[name.as_str()] = render.marker.clone();
+                    out.push_str(&format!("data: {chunk}\n\n"));
                 }
             }
         }
@@ -3196,6 +3313,54 @@ mod tests {
         // A client tool sharing the turn still suppresses every search.
         loop_.filter.saw_other = true;
         assert!(loop_.pending().is_empty());
+    }
+
+    /// The continuation dispatches a captured call to its spec by reserved
+    /// function name, so a second tool runs through the same path with no
+    /// change to the loop. web_search is the only spec today, so this stands
+    /// in for the tool that lands next.
+    #[tokio::test]
+    async fn serve_calls_dispatches_a_second_tool_through_its_spec() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://unused.example/m"
+            models = ["m"]
+            "#,
+            "spec_dispatch",
+        );
+        let specs = [ToolSpec { name: "pxy_web_fetch".to_string(), run: fetch_run }];
+        let calls = vec![ServerCall {
+            name: "pxy_web_fetch".to_string(),
+            id: "call_1".to_string(),
+            args: r#"{"url":"https://example.com"}"#.to_string(),
+        }];
+        let served = serve_calls(&specs, &app, calls).await.expect("the spec runs");
+        assert_eq!(served.tool_calls.len(), 1);
+        assert_eq!(served.tool_calls[0]["function"]["name"], "pxy_web_fetch");
+        assert_eq!(served.tool_results[0]["content"], "fetched https://example.com");
+        assert_eq!(served.renders[0].0, "pxy_web_fetch");
+        assert_eq!(served.renders[0].1.marker["url"], "https://example.com");
+    }
+
+    /// A stand-in for the next served tool: it answers one call without an
+    /// upstream, so the dispatch can be exercised in a unit test.
+    fn fetch_run<'a>(
+        _app: &'a App,
+        _call_id: &'a str,
+        args: &'a Value,
+    ) -> BoxFuture<'a, Option<Ran>> {
+        Box::pin(async move {
+            let url = args["url"].as_str().unwrap_or("");
+            Some(Ran {
+                model_output: format!("fetched {url}"),
+                client: ClientRender {
+                    blocks: vec![json!({"type": "server_tool_use", "id": "call_1"})],
+                    marker: json!({"url": url}),
+                },
+            })
+        })
     }
 
     /// The upstream closes a tool turn with a bare `finish_reason` chunk that
