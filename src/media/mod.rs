@@ -107,6 +107,16 @@ pub fn resolve_chain<'a>(
     resolve_one(cfg, capability, requested)
 }
 
+/// Whether the configured image chain has a candidate that can hand back a
+/// URL. Cloudflare-style providers answer with base64 or raw bytes, which the
+/// text-only server-tool result cannot carry, so a chain of only those is not
+/// offered to the `image_generation` tool. An empty chain answers false too.
+pub fn image_chain_can_return_urls(cfg: &Config) -> bool {
+    resolve_chain(cfg, Capability::Image, "")
+        .iter()
+        .any(|r| r.media.kind != crate::config::MediaKind::Cloudflare)
+}
+
 /// Resolve one requested id. Accepts `provider/model` (first-slash split —
 /// cloudflare ids contain slashes) or a bare id matched against every
 /// provider's list.

@@ -83,9 +83,7 @@ impl Tool {
             Tool::WebFetch => !app.cfg.fetch.providers.is_empty(),
             Tool::Datetime => true,
             Tool::SearchModels => true,
-            Tool::ImageGeneration => {
-                app.cfg.media.image.as_ref().is_some_and(|c| !c.as_slice().is_empty())
-            }
+            Tool::ImageGeneration => crate::media::image_chain_can_return_urls(&app.cfg),
         }
     }
 
@@ -446,9 +444,9 @@ fn matching_models(catalog: &Catalog, args: &Value) -> Vec<Value> {
         .filter(|c| query.is_empty() || c.full_id().to_ascii_lowercase().contains(&query))
         .filter(|c| min_context.is_none_or(|n| c.model.context_length >= n))
         .filter(|c| provider.is_none_or(|p| c.provider == p))
-        .filter(|c| tool_call.is_none_or(|b| c.model.tool_call == Some(b)))
-        .filter(|c| reasoning.is_none_or(|b| c.model.reasoning == Some(b)))
-        .filter(|c| free.is_none_or(|b| c.model.free == Some(b)))
+        .filter(|c| tool_call.is_none_or(|b| matches_flag(c.model.tool_call, b)))
+        .filter(|c| reasoning.is_none_or(|b| matches_flag(c.model.reasoning, b)))
+        .filter(|c| free.is_none_or(|b| matches_flag(c.model.free, b)))
         .map(|c| {
             let id = c.full_id();
             let groups: Vec<String> = catalog
@@ -466,6 +464,12 @@ fn matching_models(catalog: &Catalog, args: &Value) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// A capability filter: `true` demands an asserted yes; `false` demands
+/// anything but an asserted yes, because an unasserted capability is not a no.
+fn matches_flag(asserted: Option<bool>, want: bool) -> bool {
+    if want { asserted == Some(true) } else { asserted != Some(true) }
 }
 
 /// The model-facing report for a search_models call: one line per match, then
@@ -515,17 +519,26 @@ async fn run_image_generation(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, St
     match crate::media::images::run_generate(ctx.app, model, &json!({"prompt": prompt})).await {
         Ok((body, provider)) => {
             let url = body["data"][0]["url"].as_str().map(String::from);
+            let b64_bytes = body["data"][0]["b64_json"].as_str().map(str::len);
             info!(%provider, "image_generation served");
-            Ok(Ran {
-                model_output: match &url {
-                    Some(url) => format!("Generated image: {url}"),
-                    None => "Generated an image, but the provider returned no URL.".into(),
-                },
-                client: ClientRender {
-                    blocks: Vec::new(),
-                    marker: json!({"id": ctx.call_id, "provider": provider, "url": url}),
-                },
-            })
+            let (output, marker) = match (&url, b64_bytes) {
+                (Some(url), _) => (
+                    format!("Generated image: {url}"),
+                    json!({"id": ctx.call_id, "provider": provider, "url": url}),
+                ),
+                // A base64 image is not a URL a text tool result can carry; say
+                // so instead of reporting a success with nothing usable.
+                (None, Some(n)) => (
+                    "Image generation returned base64 image data; this tool can only hand back a URL."
+                        .to_string(),
+                    json!({"id": ctx.call_id, "provider": provider, "b64_bytes": n}),
+                ),
+                (None, None) => (
+                    "Generated an image, but the provider returned no URL.".to_string(),
+                    json!({"id": ctx.call_id, "provider": provider}),
+                ),
+            };
+            Ok(Ran { model_output: output, client: ClientRender { blocks: Vec::new(), marker } })
         }
         Err(resp) => {
             let status = resp.status();
@@ -678,6 +691,38 @@ mod tests {
         assert!(Tool::Datetime.servable(&none), "datetime needs nothing");
         assert!(!Tool::ImageGeneration.servable(&none), "no image chain");
 
+        let cloudflare = mock_app(
+            r#"
+            [server]
+            [providers.cf]
+            [providers.cf.media]
+            kind = "cloudflare"
+            images_url = "https://cf.example/img"
+            image_models = ["m"]
+            [media]
+            image = ["cf/m"]
+            "#,
+            "servable_cloudflare",
+        );
+        assert!(
+            !Tool::ImageGeneration.servable(&cloudflare),
+            "a base64-only chain cannot feed a text tool result"
+        );
+
+        let image_url = mock_app(
+            r#"
+            [server]
+            [providers.o]
+            [providers.o.media]
+            images_url = "https://o.example/img"
+            image_models = ["m"]
+            [media]
+            image = ["o/m"]
+            "#,
+            "servable_image_url",
+        );
+        assert!(Tool::ImageGeneration.servable(&image_url), "an OpenAI image chain serves a URL");
+
         let search = mock_app(
             r#"
             [server]
@@ -829,6 +874,18 @@ mod tests {
         assert!(!ran.model_output.contains("alpha/small"), "{}", ran.model_output);
         assert!(!ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
 
+        // `free: false` excludes only asserted-free models; an unasserted
+        // capability is not a no, so the two unknowns match.
+        let ran = Tool::SearchModels.execute(&ctx, &json!({"free": false})).await.unwrap();
+        assert!(ran.model_output.contains("2 of 3"), "{}", ran.model_output);
+        assert!(ran.model_output.contains("alpha/big"), "{}", ran.model_output);
+        assert!(ran.model_output.contains("alpha/small"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
+
+        let ran = Tool::SearchModels.execute(&ctx, &json!({"free": true})).await.unwrap();
+        assert!(ran.model_output.contains("1 of 3"), "{}", ran.model_output);
+        assert!(ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
+
         // No match is a report, not an unserved call.
         let ran = Tool::SearchModels.execute(&ctx, &json!({"query": "nope"})).await.unwrap();
         assert!(ran.model_output.contains("0 of 3"), "{}", ran.model_output);
@@ -870,6 +927,42 @@ mod tests {
             .expect("a configured image chain serves the call");
         assert!(ran.model_output.contains("https://x/y.png"), "{}", ran.model_output);
         assert!(ran.client.blocks.is_empty(), "no Anthropic block for image_generation");
+    }
+
+    /// A walk that answers base64 says so: a text tool result cannot carry the
+    /// bytes, so the model is told instead of handed a hollow success.
+    #[tokio::test]
+    async fn image_generation_reports_a_base64_answer() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/img",
+            post(|| async { axum::Json(json!({"result": {"image": "aGk="}, "success": true})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.cf]
+                [providers.cf.media]
+                kind = "cloudflare"
+                images_url = "http://{addr}/img"
+                image_models = ["m"]
+                [media]
+                image = ["cf/m"]
+                "#
+            ),
+            "image_generation_b64",
+        );
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::ImageGeneration
+            .execute(&ctx, &json!({"prompt": "a cat"}))
+            .await
+            .unwrap();
+        assert!(ran.model_output.contains("base64"), "{}", ran.model_output);
+        assert_eq!(ran.client.marker["b64_bytes"], 4, "{}", ran.client.marker);
     }
 
     /// A prompt-less call is malformed, not a failure to report back.
