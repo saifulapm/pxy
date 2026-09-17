@@ -380,7 +380,21 @@ fn apply_model_variant(payload: &mut Value, client_format: ClientFormat, variant
     }
 }
 
-pub async fn handle_chat(
+/// Route one chat request. Boxed because a meta-tool's executor issues its
+/// sub-request through this same function from inside the router's stream
+/// future: an unboxed call would make the two futures' types cyclic and the
+/// compiler could not prove either `Send`. Recursion itself is stopped by
+/// `ClientContext::tool_depth`.
+pub fn handle_chat(
+    app: SharedApp,
+    client_format: ClientFormat,
+    payload: Value,
+    ctx: ClientContext,
+) -> futures_util::future::BoxFuture<'static, Outcome> {
+    Box::pin(handle_chat_inner(app, client_format, payload, ctx))
+}
+
+async fn handle_chat_inner(
     app: SharedApp,
     client_format: ClientFormat,
     mut payload: Value,
@@ -1318,6 +1332,12 @@ async fn try_candidate_inner(
             .iter()
             .map(|t| (server_tools::function_name(*t), t.max_uses(payload)))
             .collect(),
+        params: servable
+            .iter()
+            .map(|t| {
+                (server_tools::function_name(*t), server_tools::declared_parameters(payload, *t))
+            })
+            .collect(),
         url: prepared.url.clone(),
         headers: prepared.headers.clone(),
         body: body.clone(),
@@ -2187,6 +2207,9 @@ struct ServerToolLoop {
     uses_left: u64,
     /// Calls left per reserved function name, from each tool's own `max_uses`.
     per_tool: std::collections::HashMap<String, u64>,
+    /// Each served tool's declaration `parameters`, keyed by reserved function
+    /// name. The meta-tools read their model and instructions from here.
+    params: std::collections::HashMap<String, Value>,
     url: String,
     headers: Vec<(String, String)>,
     body: Value,
@@ -2270,7 +2293,11 @@ struct Served {
 /// executor refuses it is skipped: the assistant message carries only the
 /// calls pxy actually served, so the replay stays valid. Returns None when
 /// nothing was served.
-async fn serve_calls(app: &App, calls: Vec<ServerCall>) -> Option<Served> {
+async fn serve_calls(
+    app: &SharedApp,
+    calls: Vec<ServerCall>,
+    params: &std::collections::HashMap<String, Value>,
+) -> Option<Served> {
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
     let mut renders: Vec<(String, server_tools::ClientRender)> = Vec::new();
@@ -2281,7 +2308,8 @@ async fn serve_calls(app: &App, calls: Vec<ServerCall>) -> Option<Served> {
         let Ok(args) = serde_json::from_str::<Value>(&call.args) else {
             continue;
         };
-        let ctx = server_tools::ToolCtx::new(app, &call.id);
+        let mut ctx = server_tools::ToolCtx::new(app, &call.id);
+        ctx.params = params.get(&call.name).cloned().unwrap_or(Value::Null);
         let Ok(ran) = tool.execute(&ctx, &args).await else {
             continue;
         };
@@ -2737,13 +2765,14 @@ impl StreamCtx {
         if calls.is_empty() {
             return None;
         }
+        let params = self.search.as_ref()?.params.clone();
 
         // Run every call through its tool, accumulating the client-side
         // render and the model-side tool output. A malformed call, or one the
         // registry does not implement, is skipped: the synthesized assistant
         // message below carries only the calls that were actually served, so
         // the protocol stays valid.
-        let served = serve_calls(&self.app, calls).await?;
+        let served = serve_calls(&self.app, calls, &params).await?;
 
         let search = self.search.as_mut()?;
         search.commit(&served.renders);
@@ -3324,6 +3353,7 @@ mod tests {
             filter: f,
             uses_left: 5,
             per_tool: std::collections::HashMap::from([(ws, 5)]),
+            params: std::collections::HashMap::new(),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -3347,6 +3377,7 @@ mod tests {
             filter: ServerCallFilter::default(),
             uses_left: 5,
             per_tool: std::collections::HashMap::from([(ws.clone(), 3)]),
+            params: std::collections::HashMap::new(),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -3386,6 +3417,7 @@ mod tests {
             filter: f,
             uses_left: 3,
             per_tool: std::collections::HashMap::from([(ws.clone(), 3)]),
+            params: std::collections::HashMap::new(),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -3448,7 +3480,7 @@ mod tests {
             },
         ];
         assert!(
-            serve_calls(&app, calls).await.is_none(),
+            serve_calls(&app, calls, &std::collections::HashMap::new()).await.is_none(),
             "nothing served, so the turn must close normally"
         );
     }
@@ -3503,6 +3535,7 @@ mod tests {
             filter,
             uses_left: 1,
             per_tool: std::collections::HashMap::from([(ws, 1)]),
+            params: std::collections::HashMap::new(),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -6104,6 +6137,96 @@ mod tests {
         assert_eq!(bodies.len(), 2, "both requests must reach the upstream");
         assert!(offers_advisor(&bodies[0]), "depth 0 offers the advisor: {}", bodies[0]);
         assert!(!offers_advisor(&bodies[1]), "depth 1 must strip it: {}", bodies[1]);
+    }
+
+    /// The advisor consults the model its declaration pinned, and the
+    /// declaration's `instructions` are the advisor's system turn. The advisor
+    /// sees only the prompt: pxy keeps no conversation, so there is nothing
+    /// else to forward.
+    #[tokio::test]
+    async fn advisor_uses_the_declared_model_and_instructions() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let strong: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = strong.clone();
+        let router = axum::Router::new()
+            .route(
+                "/outer",
+                post(move |axum::Json(body): axum::Json<Value>| async move {
+                    let sse = if body["messages"].to_string().contains("advice text") {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_advisor\",\"arguments\":\"{\\\"prompt\\\":\\\"how?\\\"}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }),
+            )
+            .route(
+                "/strong",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "advice text"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2}}))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.outer]
+                base_url = "{base}/outer"
+                models = ["m"]
+                [providers.strong]
+                base_url = "{base}/strong"
+                models = ["s"]
+                "#
+            ),
+            "advisor_spec",
+        );
+        let payload = json!({
+            "model": "outer/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "build a pool"}],
+            "tools": [{
+                "type": "pxy:advisor",
+                "parameters": {"model": "strong/s", "instructions": "be terse"},
+            }],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("final answer"), "{text}");
+        assert!(!text.contains("pxy_"), "no reserved name may reach the client: {text}");
+
+        let bodies = strong.lock().unwrap();
+        let sub = bodies.first().expect("the advisor sub-request must reach the strong provider");
+        assert_eq!(sub["model"], "s", "the declared model, not the outer one: {sub}");
+        assert_eq!(sub["messages"][0]["role"], "system", "{sub}");
+        assert_eq!(sub["messages"][0]["content"], "be terse", "{sub}");
+        assert_eq!(sub["messages"][1]["content"], "how?", "{sub}");
     }
 
     #[tokio::test]

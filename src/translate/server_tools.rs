@@ -75,9 +75,10 @@ impl Tool {
             Tool::Datetime => run_datetime(ctx, args),
             Tool::SearchModels => run_search_models(ctx, args),
             Tool::ImageGeneration => run_image_generation(ctx, args).await,
-            // The meta-tools' executors land in their own tasks; until then a
-            // call is unserved rather than mis-served.
-            Tool::Advisor | Tool::Subagent => Err("meta-tool executor not wired yet".into()),
+            Tool::Advisor => run_advisor(ctx, args).await,
+            // The subagent's spec lands in its own task; until then a call is
+            // unserved rather than mis-served.
+            Tool::Subagent => Err("meta-tool executor not wired yet".into()),
         }
     }
 
@@ -154,16 +155,19 @@ pub struct ClientRender {
 /// Everything an executor needs besides the call's own arguments: the app, for
 /// providers, state and secrets, and the call id the client transcript keys on.
 pub struct ToolCtx<'a> {
-    pub app: &'a App,
+    pub app: &'a SharedApp,
     pub call_id: &'a str,
+    /// The declaration's own `parameters` object, when the request carried
+    /// one. The meta-tools read their configured model and instructions here.
+    pub params: Value,
     /// The wall clock the tool sees. `new` reads the real clock; a test builds
     /// the struct directly to fix it.
     pub now: jiff::Timestamp,
 }
 
 impl<'a> ToolCtx<'a> {
-    pub fn new(app: &'a App, call_id: &'a str) -> Self {
-        Self { app, call_id, now: jiff::Timestamp::now() }
+    pub fn new(app: &'a SharedApp, call_id: &'a str) -> Self {
+        Self { app, call_id, params: Value::Null, now: jiff::Timestamp::now() }
     }
 }
 
@@ -190,8 +194,10 @@ pub async fn run_internal_chat(
             }
         }
     }
+    // handle_chat is already boxed to break the meta-tool recursion cycle.
     let ctx = ClientContext { tool_depth: 1, ..ClientContext::default() };
-    match handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await {
+    let outcome = handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await;
+    match outcome {
         Outcome::Json { status, body, .. } if status < 400 => body["choices"][0]["message"]
             ["content"]
             .as_str()
@@ -341,14 +347,27 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                 },
             },
         }),
-        // The meta-tools' arguments arrive with their specs; the def exists so
-        // the reserved function can be injected and then depth-stripped.
         Tool::Advisor => json!({
             "type": "function",
             "function": {
                 "name": function_name(Tool::Advisor),
-                "description": "Consult a stronger model for guidance.",
-                "parameters": {"type": "object", "properties": {}},
+                "description": "Consult a stronger model for guidance before committing to \
+                    an approach, when stuck, or before declaring a task done.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "What to get advice on."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Advisor model to use; only honored when the \
+                                declaration did not pin one."
+                        },
+                    },
+                    "required": ["prompt"],
+                },
             },
         }),
         Tool::Subagent => json!({
@@ -585,6 +604,62 @@ fn models_for_model(matches: &[Value], total: usize) -> String {
     out.trim_end().to_string()
 }
 
+/// The declaration's own `parameters` object for a tool, when the request
+/// carries one. The loop hands it to the executor through [`ToolCtx::params`],
+/// where the meta-tools read their configured model and instructions.
+pub fn declared_parameters(payload: &Value, tool: Tool) -> Value {
+    declaration(payload, tool)
+        .and_then(|t| t.get("parameters"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Run one advisor call: the model's `prompt` goes to the advisor as a user
+/// turn, the declaration's `instructions` as the system turn, and the
+/// advisor's answer comes back as the tool result. The advisor sees only that
+/// — pxy keeps no conversation, so cross-request memory is out of scope. A
+/// failure is reported to the outer model, which continues without the advice.
+async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let prompt = args["prompt"].as_str().filter(|p| !p.is_empty()).ok_or("missing prompt")?;
+    // The declaration's model wins; the call's own is honoured only when the
+    // declaration pins none.
+    let model = ctx.params["model"]
+        .as_str()
+        .or_else(|| args["model"].as_str())
+        .filter(|m| !m.is_empty())
+        .ok_or("no advisor model")?;
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(instructions) = ctx.params["instructions"].as_str().filter(|s| !s.is_empty()) {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    messages.push(json!({"role": "user", "content": prompt}));
+    let failed = |e: String| Ran {
+        model_output: json!({"status": "error", "error": format!("Advisor call failed: {e}")})
+            .to_string(),
+        client: ClientRender {
+            blocks: Vec::new(),
+            marker: json!({"id": ctx.call_id, "model": model, "prompt": prompt}),
+        },
+    };
+    match run_internal_chat(ctx.app, model, messages, json!({})).await {
+        Ok(advice) => {
+            info!(%model, "advisor served");
+            Ok(Ran {
+                model_output: json!({"status": "ok", "model": model, "advice": advice})
+                    .to_string(),
+                client: ClientRender {
+                    blocks: Vec::new(),
+                    marker: json!({"id": ctx.call_id, "model": model, "advice": advice}),
+                },
+            })
+        }
+        Err(e) => {
+            warn!(%model, error = %e, "advisor failed");
+            Ok(failed(e))
+        }
+    }
+}
+
 /// Run one image_generation call through the image media walk — the same walk
 /// `/v1/images/generations` runs, so the media quota and failover are shared.
 /// A missing prompt makes the call unserved; a provider failure is reported
@@ -688,7 +763,7 @@ mod tests {
     async fn datetime_defaults_to_utc_and_accepts_an_iana_zone() {
         let app = mock_app("[server]", "datetime_clock");
         let now: jiff::Timestamp = "2025-07-15T18:30:00Z".parse().unwrap();
-        let ctx = ToolCtx { app: &app, call_id: "call_1", now };
+        let ctx = ToolCtx { app: &app, call_id: "call_1", params: Value::Null, now };
 
         let utc = Tool::Datetime.execute(&ctx, &json!({})).await.unwrap();
         assert_eq!(utc.model_output, "2025-07-15T18:30:00+00:00 (UTC)");
@@ -706,7 +781,7 @@ mod tests {
     async fn datetime_reports_an_unknown_zone() {
         let app = mock_app("[server]", "datetime_bad_zone");
         let now: jiff::Timestamp = "2025-07-15T18:30:00Z".parse().unwrap();
-        let ctx = ToolCtx { app: &app, call_id: "call_1", now };
+        let ctx = ToolCtx { app: &app, call_id: "call_1", params: Value::Null, now };
         let ran = Tool::Datetime
             .execute(&ctx, &json!({"timezone": "Mars/Olympus"}))
             .await
