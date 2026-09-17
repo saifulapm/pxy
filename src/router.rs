@@ -5711,6 +5711,93 @@ mod tests {
         assert!(names.contains(&"pxy_image_generation"), "{names:?}");
     }
 
+    /// An image_generation served inside a chat turn is a media cost: the
+    /// walk counts against `p#media`, the chat counters count only the chat
+    /// calls. Nothing about the image eats the model's request budget.
+    #[tokio::test]
+    async fn image_generation_records_media_usage_not_chat() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = n.clone();
+        let router = axum::Router::new()
+            .route(
+                "/m",
+                post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        let i = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let sse = if i == 0 {
+                            concat!(
+                                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                                "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                                "\"function\":{\"name\":\"pxy_image_generation\",\"arguments\":\"{\\\"prompt\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                                "data: [DONE]\n\n",
+                            )
+                        } else {
+                            concat!(
+                                "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                                "data: [DONE]\n\n",
+                            )
+                        };
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .unwrap()
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/img",
+                post(|| async {
+                    axum::Json(json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [providers.p.media]
+                images_url = "{base}/img"
+                image_models = ["im"]
+                [media]
+                image = ["p/im"]
+                [groups.free]
+                models = ["p/m"]
+                "#
+            ),
+            "image_generation_usage",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "draw"}],
+            "tools": [{"type": "pxy:image_generation"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+
+        assert_eq!(
+            crate::media::used_requests(&app, "p#media", "day"),
+            1,
+            "the image walk counts once against the media pool"
+        );
+        assert_eq!(
+            crate::media::used_requests(&app, "p", "day"),
+            2,
+            "only the two chat calls count against the chat budget"
+        );
+    }
+
     /// web_fetch is offered only where pxy can run it: a fetch provider is
     /// configured. Without one the injected function is dropped rather than
     /// handed to the model to call into nothing.
