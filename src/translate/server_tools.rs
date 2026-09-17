@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::web_search;
+use crate::catalog::Catalog;
 use crate::router::{App, ClientFormat};
 
 /// A tool pxy can serve.
@@ -20,6 +21,7 @@ pub enum Tool {
     WebSearch,
     WebFetch,
     Datetime,
+    SearchModels,
 }
 
 impl Tool {
@@ -27,7 +29,7 @@ impl Tool {
     /// enabled` list, so a tool added here is enabled unless config says
     /// otherwise.
     pub fn implemented() -> &'static [Tool] {
-        &[Tool::WebSearch, Tool::WebFetch, Tool::Datetime]
+        &[Tool::WebSearch, Tool::WebFetch, Tool::Datetime, Tool::SearchModels]
     }
 
     /// The tool's canonical name: the spelling `[server_tools] enabled` lists,
@@ -37,6 +39,7 @@ impl Tool {
             Tool::WebSearch => "web_search",
             Tool::WebFetch => "web_fetch",
             Tool::Datetime => "datetime",
+            Tool::SearchModels => "search_models",
         }
     }
 
@@ -49,6 +52,7 @@ impl Tool {
             Tool::WebSearch => run_web_search(ctx, args).await,
             Tool::WebFetch => run_web_fetch(ctx, args).await,
             Tool::Datetime => run_datetime(ctx, args),
+            Tool::SearchModels => run_search_models(ctx, args),
         }
     }
 
@@ -69,6 +73,7 @@ impl Tool {
             Tool::WebSearch => !app.cfg.search.providers.is_empty(),
             Tool::WebFetch => !app.cfg.fetch.providers.is_empty(),
             Tool::Datetime => true,
+            Tool::SearchModels => true,
         }
     }
 
@@ -156,6 +161,9 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "openrouter:web_search" | "pxy:web_search" => Some(Tool::WebSearch),
         "openrouter:web_fetch" | "pxy:web_fetch" => Some(Tool::WebFetch),
         "openrouter:datetime" | "pxy:datetime" => Some(Tool::Datetime),
+        "openrouter:experimental__search_models" | "pxy:search_models" => {
+            Some(Tool::SearchModels)
+        }
         t if t.starts_with("web_search") => Some(Tool::WebSearch),
         _ => None,
     }
@@ -201,6 +209,44 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                             "type": "string",
                             "description": "IANA timezone name, e.g. America/New_York. Default UTC."
                         }
+                    },
+                },
+            },
+        }),
+        Tool::SearchModels => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::SearchModels),
+                "description": "Search pxy's own model catalog for an id to call. \
+                    Every filter is optional; use it to find a model with the \
+                    context window, provider or capabilities the task needs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Free-text match against provider/model ids."
+                        },
+                        "min_context_length": {
+                            "type": "integer",
+                            "description": "Only models with at least this many tokens of context."
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Only models served by this provider."
+                        },
+                        "tool_call": {
+                            "type": "boolean",
+                            "description": "Only models known to support tool calling."
+                        },
+                        "reasoning": {
+                            "type": "boolean",
+                            "description": "Only models known to support extended thinking."
+                        },
+                        "free": {
+                            "type": "boolean",
+                            "description": "true for free models only, false to exclude them."
+                        },
                     },
                 },
             },
@@ -331,6 +377,100 @@ fn run_datetime(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     })
 }
 
+/// Run one search_models call against pxy's own catalog. Every argument is
+/// optional and a missing one filters nothing. The model is told each
+/// matching `provider/model`, the facts it routes on, and the group aliases
+/// that reach it.
+fn run_search_models(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let matches = matching_models(&ctx.app.catalog, args);
+    let total = ctx.app.catalog.models().len();
+    let output = models_for_model(&matches, total);
+    Ok(Ran {
+        model_output: output,
+        client: ClientRender {
+            blocks: Vec::new(),
+            marker: json!({"id": ctx.call_id, "matches": matches, "total": total}),
+        },
+    })
+}
+
+/// The catalog entries a search_models call matches, in catalog order, each as
+/// the JSON object the model is told about. A filter that is absent filters
+/// nothing; one that names a capability only matches a model asserted to have
+/// it, so an unknown capability is not a match.
+fn matching_models(catalog: &Catalog, args: &Value) -> Vec<Value> {
+    let query = args["query"].as_str().unwrap_or("").to_ascii_lowercase();
+    let min_context = args["min_context_length"].as_u64();
+    let provider = args["provider"].as_str();
+    let tool_call = args["tool_call"].as_bool();
+    let reasoning = args["reasoning"].as_bool();
+    let free = args["free"].as_bool();
+
+    catalog
+        .models()
+        .iter()
+        .filter(|c| query.is_empty() || c.full_id().to_ascii_lowercase().contains(&query))
+        .filter(|c| min_context.is_none_or(|n| c.model.context_length >= n))
+        .filter(|c| provider.is_none_or(|p| c.provider == p))
+        .filter(|c| tool_call.is_none_or(|b| c.model.tool_call == Some(b)))
+        .filter(|c| reasoning.is_none_or(|b| c.model.reasoning == Some(b)))
+        .filter(|c| free.is_none_or(|b| c.model.free == Some(b)))
+        .map(|c| {
+            let id = c.full_id();
+            let groups: Vec<String> = catalog
+                .groups()
+                .filter(|(_, g)| g.chain.iter().any(|m| m.full_id() == id))
+                .map(|(name, _)| name.clone())
+                .collect();
+            json!({
+                "id": id,
+                "context_length": c.model.context_length,
+                "tool_call": c.model.tool_call,
+                "reasoning": c.model.reasoning,
+                "free": c.model.free,
+                "groups": groups,
+            })
+        })
+        .collect()
+}
+
+/// The model-facing report for a search_models call: one line per match, then
+/// how many of the catalog it is. No matches is an answer, not an error.
+fn models_for_model(matches: &[Value], total: usize) -> String {
+    if matches.is_empty() {
+        return format!("0 of {total} models matched.");
+    }
+    let mut out = format!("{} of {total} models:\n", matches.len());
+    for m in matches {
+        let mut facts =
+            vec![format!("context {}", m["context_length"].as_u64().unwrap_or(0))];
+        if m["tool_call"] == true {
+            facts.push("tools".into());
+        }
+        if m["reasoning"] == true {
+            facts.push("reasoning".into());
+        }
+        if m["free"] == true {
+            facts.push("free".into());
+        }
+        let groups: Vec<&str> = m["groups"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|g| g.as_str()).collect())
+            .unwrap_or_default();
+        let suffix = if groups.is_empty() {
+            String::new()
+        } else {
+            format!(" [groups: {}]", groups.join(", "))
+        };
+        out.push_str(&format!(
+            "- {} ({}){suffix}\n",
+            m["id"].as_str().unwrap_or(""),
+            facts.join(", ")
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +526,7 @@ mod tests {
         assert_eq!(Tool::WebSearch.name(), "web_search");
         assert_eq!(Tool::WebFetch.name(), "web_fetch");
         assert_eq!(Tool::Datetime.name(), "datetime");
+        assert_eq!(Tool::SearchModels.name(), "search_models");
     }
 
     /// datetime is clock- and zone-only: the same fixed instant read as UTC
@@ -570,6 +711,52 @@ mod tests {
         assert!(out.ends_with("[truncated]"), "the model must be told");
         assert!(out.contains(&"x".repeat(FETCH_CONTENT_CHARS)));
         assert!(!out.contains(&"x".repeat(FETCH_CONTENT_CHARS + 1)));
+    }
+
+    /// search_models answers from pxy's own catalog: every filter is optional,
+    /// the report names only the entries that match, and it says how many of
+    /// the catalog they are. The group a model is reachable through rides
+    /// along, because that alias is usually the id to call.
+    #[tokio::test]
+    async fn search_models_filters_the_catalog_and_reports_a_total() {
+        let app = mock_app(
+            r#"
+            [server]
+            [providers.alpha]
+            base_url = "https://alpha.example/chat"
+            models = [
+                { id = "big", context_length = 200000, tool_call = true, reasoning = true },
+                { id = "small", context_length = 8000 },
+            ]
+            [providers.beta]
+            base_url = "https://beta.example/chat"
+            models = [{ id = "tiny", context_length = 1000, free = true }]
+            [groups.aaa]
+            models = ["alpha/big", "beta/tiny"]
+            "#,
+            "search_models",
+        );
+        let ctx = ToolCtx::new(&app, "c");
+
+        let ran = Tool::SearchModels
+            .execute(&ctx, &json!({"query": "big", "min_context_length": 100000}))
+            .await
+            .unwrap();
+        assert!(ran.model_output.contains("alpha/big"), "{}", ran.model_output);
+        assert!(ran.model_output.contains("1 of 3"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("alpha/small"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
+        assert!(ran.model_output.contains("aaa"), "the group alias: {}", ran.model_output);
+
+        // A capability filter reads the catalog's asserted metadata.
+        let ran = Tool::SearchModels.execute(&ctx, &json!({"tool_call": true})).await.unwrap();
+        assert!(ran.model_output.contains("alpha/big"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("alpha/small"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
+
+        // No match is a report, not an unserved call.
+        let ran = Tool::SearchModels.execute(&ctx, &json!({"query": "nope"})).await.unwrap();
+        assert!(ran.model_output.contains("0 of 3"), "{}", ran.model_output);
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
