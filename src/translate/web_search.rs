@@ -16,40 +16,14 @@
 
 use serde_json::{Value, json};
 
-use super::server_tools;
-
 /// The function pxy substitutes for the server tool. Prefixed so it can never
 /// collide with a client tool named `web_search` (Claude Code's own client
 /// tools are what the rest of the `tools` array carries).
 pub const TOOL_NAME: &str = "pxy_web_search";
 
-/// Is this declaration the served web_search tool? The registry owns the
-/// spellings, so `openrouter:web_search`, `pxy:web_search` and the native
-/// Anthropic/Responses names all match, exactly as the translator injects.
-/// A `function` field means it's an ordinary function tool that merely happens
-/// to be named that, and is left alone.
-fn is_server_tool(tool: &Value) -> bool {
-    tool.get("function").is_none()
-        && tool["type"].as_str().and_then(server_tools::from_type)
-            == Some(server_tools::Tool::WebSearch)
-}
-
-/// How many searches this request allows, when it asked for search at all.
-/// `max_uses` is optional in the tool definition; [`DEFAULT_MAX_USES`] stands
-/// in for an absent one so a model that loops can't spend the search quota.
-pub struct Plan {
-    pub max_uses: u64,
-}
-
+/// The per-tool call cap an absent `max_uses` falls back to. The registry's
+/// `Tool::max_uses` reads the declarations; this is only the default.
 pub const DEFAULT_MAX_USES: u64 = 5;
-
-pub fn plan(payload: &Value) -> Option<Plan> {
-    let tools = payload["tools"].as_array()?;
-    let tool = tools.iter().find(|t| is_server_tool(t))?;
-    Some(Plan {
-        max_uses: tool["max_uses"].as_u64().unwrap_or(DEFAULT_MAX_USES).clamp(1, 20),
-    })
-}
 
 /// The OpenAI function tool that replaces the server tool. Only `query` is
 /// modelled: pxy's search providers take a query and a count, and every extra
@@ -174,43 +148,6 @@ pub fn flatten_history_block(block: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_dated_server_tool_and_ignores_functions() {
-        let payload = json!({"tools": [
-            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
-            {"name": "Bash", "input_schema": {"type": "object"}},
-        ]});
-        assert_eq!(plan(&payload).unwrap().max_uses, 3);
-
-        // A custom function that merely shares the name is not the server tool.
-        let payload = json!({"tools": [
-            {"type": "function", "function": {"name": "web_search_helper"}},
-        ]});
-        assert!(plan(&payload).is_none());
-    }
-
-    /// The registry maps `openrouter:`/`pxy:` spellings to the same tool, so
-    /// their `max_uses` must be read like the native one: otherwise a served
-    /// request silently falls back to the default budget.
-    #[test]
-    fn plan_reads_registry_spellings_max_uses() {
-        let p = plan(&json!({"tools": [{"type": "openrouter:web_search", "max_uses": 1}]})).unwrap();
-        assert_eq!(p.max_uses, 1);
-        let p = plan(&json!({"tools": [{"type": "pxy:web_search", "max_uses": 7}]})).unwrap();
-        assert_eq!(p.max_uses, 7);
-        // A bare Responses spelling still matches too.
-        let p = plan(&json!({"tools": [{"type": "web_search", "max_uses": 2}]})).unwrap();
-        assert_eq!(p.max_uses, 2);
-    }
-
-    #[test]
-    fn max_uses_defaults_and_clamps() {
-        let p = plan(&json!({"tools": [{"type": "web_search_20250305"}]})).unwrap();
-        assert_eq!(p.max_uses, DEFAULT_MAX_USES);
-        let p = plan(&json!({"tools": [{"type": "web_search_20250305", "max_uses": 900}]})).unwrap();
-        assert_eq!(p.max_uses, 20);
-    }
 
     #[test]
     fn history_blocks_flatten_to_prose() {

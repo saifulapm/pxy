@@ -19,7 +19,6 @@ use crate::translate::server_tools;
 use crate::translate::sse::SseParser;
 use crate::translate::think::ThinkFilter;
 use crate::translate::tool_text::ToolTextFilter;
-use crate::translate::web_search;
 use crate::translate::{anthropic_to_openai, estimate_tokens, openai_to_anthropic, TokenUsage};
 use crate::usage::current_windows;
 
@@ -1132,25 +1131,68 @@ async fn try_candidate_inner(
         crate::translate::backfill_anthropic_thinking(&mut body);
     }
 
-    // The hosted web_search tool: pxy runs it for OpenAI upstreams, which have
-    // no hosted tools of their own. Whoever built the body decided that —
-    // anthropic_to_openai for Claude Code's server tool, responses for
-    // `codex --search` — so the marker is the injected function itself.
+    // A Chat Completions client has no translator pair (OpenAI -> OpenAI is
+    // payload.clone()), so its body still carries a declared server tool as a
+    // hosted entry (`{"type":"openrouter:web_search"}`). Swap each for the
+    // reserved function pxy intercepts, as the Anthropic and Responses
+    // translators already did for their bodies.
+    if upstream_format == WireFormat::Openai {
+        swap_declared_served_tools(&mut body);
+    }
+
+    // Hosted server tools pxy runs itself. An OpenAI upstream has no hosted
+    // tools of its own, so whoever built the body — anthropic_to_openai for
+    // Claude Code's server tool, responses for `codex --search` — injected a
+    // reserved pxy_* function for each declared tool.
     //
     // Those translators inject on their own dialect's evidence; only here is
     // it known whether pxy can actually SERVE the call: the interception
-    // lives entirely in StreamCtx, so it needs an OpenAI upstream and a
-    // configured search provider. A non-streaming client is served by
-    // streaming upstream anyway (force_stream below) and re-assembling its
-    // JSON from the translated stream: a non-streaming turn
-    // must not silently lose the search it asked for.
-    let server_function = server_tools::function_name(server_tools::Tool::WebSearch);
-    let has_search_tool = body["tools"]
-        .as_array()
-        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == server_function.as_str()));
-    let search_served = has_search_tool
-        && upstream_format == WireFormat::Openai
-        && !app.cfg.search.providers.is_empty();
+    // lives in StreamCtx, so it needs an OpenAI upstream, the tool offered on
+    // this dialect, and whatever executor the tool needs. A non-streaming
+    // client is served by streaming upstream anyway (force_stream below) and
+    // re-assembling its JSON from the translated stream: a non-streaming turn
+    // must not silently lose a tool it asked for.
+    let injected: Vec<server_tools::Tool> = server_tools::Tool::implemented()
+        .iter()
+        .copied()
+        .filter(|t| reserved_function_in_body(&body, *t))
+        .collect();
+    let servable: Vec<server_tools::Tool> = if upstream_format == WireFormat::Openai {
+        injected
+            .iter()
+            .copied()
+            .filter(|t| t.served_on(client_format) && t.servable(app))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let search_served = !servable.is_empty();
+    if !injected.is_empty() {
+        // Offering a function nobody will intercept hands the client a
+        // tool_use for a tool it never declared, which wedges the turn. Drop
+        // every reserved function pxy will not answer, and let the model work
+        // without it.
+        let keep: Vec<String> =
+            servable.iter().map(|t| server_tools::function_name(*t)).collect();
+        if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            tools.retain(|t| match t["function"]["name"].as_str() {
+                Some(n) if server_tools::Tool::from_function_name(n).is_some() => {
+                    keep.iter().any(|k| k == n)
+                }
+                _ => true,
+            });
+            if tools.is_empty() {
+                body.as_object_mut().map(|o| o.remove("tools"));
+            }
+        }
+        for tool in injected.iter().filter(|t| !servable.contains(t)) {
+            debug!(
+                candidate = %cand.full_id(),
+                tool = tool.name(),
+                "server tool dropped: pxy cannot serve it here"
+            );
+        }
+    }
 
     // force_stream: the upstream misbehaves without `stream: true` on this
     // model — or a served web_search needs the stream machinery — so stream
@@ -1239,30 +1281,22 @@ async fn try_candidate_inner(
         }
     }
 
-    // The search loop's replay request: built before the send so the
+    // The server-tool loop's replay request: built before the send so the
     // follow-up call replays this exact request with the results appended.
     // The tool reaches the wire only if pxy will intercept it — that is the
     // invariant this site enforces (the strip below is its other half).
     let search = search_served.then(|| ServerToolLoop {
         filter: ServerCallFilter::default(),
-        uses_left: web_search::plan(payload).map_or(web_search::DEFAULT_MAX_USES, |p| p.max_uses),
+        uses_left: turn_budget(payload, &app.cfg.server_tools),
+        per_tool: servable
+            .iter()
+            .map(|t| (server_tools::function_name(*t), t.max_uses(payload)))
+            .collect(),
         url: prepared.url.clone(),
         headers: prepared.headers.clone(),
         body: body.clone(),
         timeout: Duration::from_secs(provider_cfg.timeout_secs),
     });
-    if has_search_tool && search.is_none() {
-        // Offering a function nobody will intercept hands the client a
-        // tool_use for a tool it never declared, which wedges the turn.
-        // Drop it and let the model answer without search.
-        if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
-            tools.retain(|t| t["function"]["name"] != server_function.as_str());
-            if tools.is_empty() {
-                body.as_object_mut().map(|o| o.remove("tools"));
-            }
-        }
-        debug!(candidate = %cand.full_id(), "web_search dropped: pxy cannot serve it here");
-    }
 
     app.state.rpm_increment(&cand.state_provider());
     // A streaming upstream returns headers as soon as it accepts the request,
@@ -2118,7 +2152,10 @@ struct ServerCallFilter {
 /// and the request to replay once results are in.
 struct ServerToolLoop {
     filter: ServerCallFilter,
+    /// Steps left in the turn, across every served tool.
     uses_left: u64,
+    /// Calls left per reserved function name, from each tool's own `max_uses`.
+    per_tool: std::collections::HashMap<String, u64>,
     url: String,
     headers: Vec<(String, String)>,
     body: Value,
@@ -2137,17 +2174,38 @@ impl ServerToolLoop {
         }
         let mut keys: Vec<u64> = self.filter.ours.keys().copied().collect();
         keys.sort_unstable();
-        keys.into_iter()
-            .take(self.uses_left as usize)
-            .filter_map(|k| {
-                let (id, args) = self.filter.ours.get(&k)?;
-                Some(ServerCall {
-                    name: self.filter.names.get(&k).cloned().unwrap_or_default(),
-                    id: id.clone(),
-                    args: args.clone(),
-                })
-            })
-            .collect()
+        // Selection only; [`commit`](Self::commit) charges what was served. A
+        // call whose tool has no budget left (or none at all) is skipped, so
+        // an exhausted tool never eats another tool's turn budget.
+        let mut left = self.uses_left;
+        let mut per_tool = self.per_tool.clone();
+        let mut out: Vec<ServerCall> = Vec::new();
+        for k in keys {
+            if left == 0 {
+                break;
+            }
+            let Some((id, args)) = self.filter.ours.get(&k) else { continue };
+            let name = self.filter.names.get(&k).cloned().unwrap_or_default();
+            let Some(tool_left) = per_tool.get_mut(&name) else { continue };
+            if *tool_left == 0 {
+                continue;
+            }
+            *tool_left -= 1;
+            left -= 1;
+            out.push(ServerCall { name, id: id.clone(), args: args.clone() });
+        }
+        out
+    }
+
+    /// Charge the calls that were actually served against the turn budget and
+    /// each tool's own cap.
+    fn commit(&mut self, renders: &[(String, server_tools::ClientRender)]) {
+        for (name, _) in renders {
+            self.uses_left = self.uses_left.saturating_sub(1);
+            if let Some(left) = self.per_tool.get_mut(name) {
+                *left = left.saturating_sub(1);
+            }
+        }
     }
 
     /// The captured calls as (id, arguments), for telling whether one is
@@ -2326,6 +2384,52 @@ fn server_tool_served(ty: &str, cfg: &ServerToolsConfig) -> bool {
     cfg.enabled
         .iter()
         .any(|name| server_tools::from_type(&format!("pxy:{name}")) == Some(tool))
+}
+
+/// Is this tool's reserved function present in the body? The translators
+/// inject one per declared served tool; this is how the router learns which
+/// ones the upstream could actually call.
+fn reserved_function_in_body(body: &Value, tool: server_tools::Tool) -> bool {
+    let name = server_tools::function_name(tool);
+    body["tools"]
+        .as_array()
+        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == name.as_str()))
+}
+
+/// Swap declared served-tool entries in an OpenAI-format body for the reserved
+/// functions pxy intercepts. One def per tool, whatever spellings declared it —
+/// a second identical def risks an upstream 400 and hands the model two
+/// indistinguishable functions. Ordinary function tools and hosted tools pxy
+/// does not know pass through untouched.
+fn swap_declared_served_tools(body: &mut Value) {
+    let Some(tools) = body["tools"].as_array().cloned() else { return };
+    let mut seen: Vec<server_tools::Tool> = Vec::new();
+    let converted: Vec<Value> = tools
+        .iter()
+        .filter_map(|t| {
+            // A real function tool: `sanitize_tool_schemas` has already run and
+            // auto-vivifies a null `function` key on hosted entries, so the
+            // name is what tells them apart.
+            if t["function"]["name"].is_string() {
+                return Some(t.clone());
+            }
+            let Some(tool) = t["type"].as_str().and_then(server_tools::from_type) else {
+                return Some(t.clone());
+            };
+            if seen.contains(&tool) {
+                return None;
+            }
+            seen.push(tool);
+            Some(server_tools::tool_def(tool, &t["parameters"]))
+        })
+        .collect();
+    body["tools"] = Value::Array(converted);
+}
+
+/// The step budget for one turn: a request-level `max_tool_calls` over
+/// `[server_tools] max_tool_calls`.
+fn turn_budget(payload: &Value, cfg: &ServerToolsConfig) -> u64 {
+    payload["max_tool_calls"].as_u64().unwrap_or(cfg.max_tool_calls)
 }
 
 /// Tool names the request declared, in either dialect's shape. None when the
@@ -2602,7 +2706,6 @@ impl StreamCtx {
         if calls.is_empty() {
             return None;
         }
-        let queued = calls.len() as u64;
 
         // Run every call through its tool, accumulating the client-side
         // render and the model-side tool output. A malformed call, or one the
@@ -2612,7 +2715,7 @@ impl StreamCtx {
         let served = serve_calls(&self.app, calls).await?;
 
         let search = self.search.as_mut()?;
-        search.uses_left -= queued;
+        search.commit(&served.renders);
         search.filter = ServerCallFilter::default();
 
         // The model's own view of the turn: it called the functions, these
@@ -3184,6 +3287,7 @@ mod tests {
         let loop_ = ServerToolLoop {
             filter: f,
             uses_left: 5,
+            per_tool: Default::default(),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -3197,14 +3301,21 @@ mod tests {
     /// old single-arbitrary-pick silently dropped the model's other queries.
     #[test]
     fn parallel_search_calls_are_all_pending_lowest_index_first() {
+        let ws = server_tools::function_name(server_tools::Tool::WebSearch);
         let mut f = ServerCallFilter::default();
         // Insert out of order on purpose.
-        f.ours.insert(1, ("call_2".into(), "{\"query\":\"b\"}".into()));
-        f.ours.insert(0, ("call_1".into(), "{\"query\":\"a\"}".into()));
-        f.ours.insert(2, ("call_3".into(), "{\"query\":\"c\"}".into()));
+        for (idx, id, args) in [
+            (1u64, "call_2", "{\"query\":\"b\"}"),
+            (0, "call_1", "{\"query\":\"a\"}"),
+            (2, "call_3", "{\"query\":\"c\"}"),
+        ] {
+            f.ours.insert(idx, (id.to_string(), args.to_string()));
+            f.names.insert(idx, ws.clone());
+        }
         let mut loop_ = ServerToolLoop {
             filter: f,
             uses_left: 3,
+            per_tool: std::collections::HashMap::from([(ws.clone(), 3)]),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -3219,9 +3330,13 @@ mod tests {
                 ("call_3".to_string(), "{\"query\":\"c\"}".to_string()),
             ]
         );
-        // The budget caps how many run this turn.
+        // The turn budget caps how many run.
         loop_.uses_left = 2;
         assert_eq!(loop_.pending().len(), 2);
+        // So does the tool's own cap, even with turn budget to spare.
+        loop_.uses_left = 3;
+        loop_.per_tool.insert(ws, 1);
+        assert_eq!(loop_.pending().len(), 1);
         // A client tool sharing the turn still suppresses every search.
         loop_.filter.saw_other = true;
         assert!(loop_.pending().is_empty());
@@ -3310,11 +3425,14 @@ mod tests {
     /// budget and the turn closes instead of looping on pxy's search quota.
     #[test]
     fn exhausted_budget_stops_the_loop() {
+        let ws = server_tools::function_name(server_tools::Tool::WebSearch);
         let mut filter = ServerCallFilter::default();
         filter.ours.insert(0, ("call_1".into(), "{\"query\":\"x\"}".into()));
+        filter.names.insert(0, ws.clone());
         let mut loop_ = ServerToolLoop {
             filter,
             uses_left: 1,
+            per_tool: std::collections::HashMap::from([(ws, 1)]),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -5320,6 +5438,189 @@ mod tests {
         let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
         assert_eq!(status, 400, "a deterministic no must not read as rate limiting: {body}");
         assert_eq!(*calls.lock().unwrap(), 0, "no upstream call may be spent on it");
+    }
+
+    /// A Chat Completions client that declares a served tool has no translator
+    /// to swap it for the reserved function, so the router must. The model
+    /// calls pxy_datetime, pxy answers it with no provider at all, and the
+    /// client sees the model's answer with the reserved call stripped.
+    #[tokio::test]
+    async fn datetime_is_served_for_a_chat_completions_client() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let counter = calls.clone();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let counter = counter.clone();
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // First call: the model asks for the time. Second: it
+                    // answers from the tool result pxy fed back.
+                    let sse = if n == 0 {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_datetime\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"It is now.\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        // No search or fetch providers: datetime needs neither.
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                "#
+            ),
+            "datetime_chat",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what time is it?"}],
+            "tools": [{"type": "pxy:datetime"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("It is now."), "{text}");
+        assert!(!text.contains("\"tool_calls\""), "the reserved call must be stripped: {text}");
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "one call to ask, one to answer");
+        assert!(
+            bodies[0]["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "pxy_datetime")),
+            "the declared tool must become the reserved function: {:?}",
+            bodies[0]["tools"]
+        );
+        // The replay carries the tool result back to the model.
+        let replay = bodies[1]["messages"].to_string();
+        assert!(replay.contains("pxy_datetime"), "{replay}");
+    }
+
+    /// web_fetch is offered only where pxy can run it: a fetch provider is
+    /// configured. Without one the injected function is dropped rather than
+    /// handed to the model to call into nothing.
+    #[tokio::test]
+    async fn web_fetch_is_offered_only_with_a_fetch_provider() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "read this"}],
+            "tools": [{"type": "pxy:web_fetch"}],
+        });
+
+        let without = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                "#
+            ),
+            "web_fetch_no_pool",
+        );
+        let out = handle_chat(
+            without,
+            ClientFormat::Openai,
+            payload.clone(),
+            ClientContext::default(),
+        )
+        .await;
+        if let Outcome::Stream { body, .. } = out {
+            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        }
+        assert!(
+            !seen.lock().unwrap()[0]["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "pxy_web_fetch")),
+            "no fetch provider: the function must be dropped"
+        );
+
+        let with = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                [[fetch.providers]]
+                name = "jina"
+                kind = "jina-reader"
+                api_key = "k"
+                "#
+            ),
+            "web_fetch_pool",
+        );
+        let out =
+            handle_chat(with, ClientFormat::Openai, payload, ClientContext::default()).await;
+        if let Outcome::Stream { body, .. } = out {
+            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        }
+        let bodies = seen.lock().unwrap();
+        assert!(
+            bodies[1]["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "pxy_web_fetch")),
+            "with a fetch provider the function must be offered: {:?}",
+            bodies[1]["tools"]
+        );
     }
 
     /// `[server_tools] enabled` and the registry decide which declared server

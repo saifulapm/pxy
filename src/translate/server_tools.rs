@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::web_search;
-use crate::router::App;
+use crate::router::{App, ClientFormat};
 
 /// A tool pxy can serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,41 @@ impl Tool {
     pub fn from_function_name(name: &str) -> Option<Tool> {
         Tool::implemented().iter().copied().find(|t| function_name(*t) == name)
     }
+
+    /// Whether pxy can run this tool for this app right now: the tool is
+    /// enabled and has whatever executor it needs — a search pool, a fetch
+    /// pool, or, for datetime, nothing.
+    pub fn servable(self, app: &App) -> bool {
+        if !app.cfg.server_tools.enabled.iter().any(|n| self.name() == n) {
+            return false;
+        }
+        match self {
+            Tool::WebSearch => !app.cfg.search.providers.is_empty(),
+            Tool::WebFetch => !app.cfg.fetch.providers.is_empty(),
+            Tool::Datetime => true,
+        }
+    }
+
+    /// Whether this client dialect is offered the tool. pxy never invents a
+    /// client result block, so a tool with none on Anthropic Messages is not
+    /// offered there; Chat Completions and Responses share
+    /// [`ClientFormat::Openai`].
+    pub fn served_on(self, client: ClientFormat) -> bool {
+        match client {
+            ClientFormat::Openai => true,
+            ClientFormat::Anthropic => self == Tool::WebSearch,
+        }
+    }
+
+    /// This tool's own call cap for the request: the declaration's `max_uses`
+    /// (Anthropic spells it top-level, OpenRouter nestles it under
+    /// `parameters`), default 5, clamped to 1..=20.
+    pub fn max_uses(self, payload: &Value) -> u64 {
+        declaration(payload, self)
+            .and_then(|t| t["max_uses"].as_u64().or_else(|| t["parameters"]["max_uses"].as_u64()))
+            .unwrap_or(web_search::DEFAULT_MAX_USES)
+            .clamp(1, 20)
+    }
 }
 
 /// What running one served call produced: the text the model is shown as the
@@ -91,6 +126,16 @@ impl<'a> ToolCtx<'a> {
     pub fn new(app: &'a App, call_id: &'a str) -> Self {
         Self { app, call_id, now: jiff::Timestamp::now() }
     }
+}
+
+/// The request's declaration of this tool, when it carries one. A `function`
+/// field means an ordinary function tool that merely shares the name, and is
+/// left alone.
+fn declaration<'a>(payload: &'a Value, tool: Tool) -> Option<&'a Value> {
+    payload["tools"]
+        .as_array()?
+        .iter()
+        .find(|t| t.get("function").is_none() && t["type"].as_str().and_then(from_type) == Some(tool))
 }
 
 /// Map a declared tool's `type` to the tool pxy serves for it.
@@ -365,6 +410,74 @@ mod tests {
         assert_eq!(def["function"]["name"], "pxy_datetime");
         assert_eq!(def["function"]["parameters"]["properties"]["timezone"]["type"], "string");
         assert!(def["function"]["parameters"].get("required").is_none());
+    }
+
+    /// Each tool's own `max_uses` caps its calls: Anthropic spells it at the
+    /// top level, OpenRouter under `parameters`, and a function that merely
+    /// shares the name is not the server tool.
+    #[test]
+    fn max_uses_reads_both_dialects_and_clamps() {
+        let anthropic = json!({"tools": [{"type": "web_search_20250305", "max_uses": 3}]});
+        assert_eq!(Tool::WebSearch.max_uses(&anthropic), 3);
+        let openrouter =
+            json!({"tools": [{"type": "openrouter:web_fetch", "parameters": {"max_uses": 7}}]});
+        assert_eq!(Tool::WebFetch.max_uses(&openrouter), 7);
+        let bare = json!({"tools": [{"type": "pxy:datetime"}]});
+        assert_eq!(Tool::Datetime.max_uses(&bare), web_search::DEFAULT_MAX_USES);
+        let big = json!({"tools": [{"type": "pxy:web_fetch", "parameters": {"max_uses": 900}}]});
+        assert_eq!(Tool::WebFetch.max_uses(&big), 20);
+        let f = json!({"tools": [{"type": "function", "function": {"name": "web_search"}}]});
+        assert_eq!(Tool::WebSearch.max_uses(&f), web_search::DEFAULT_MAX_USES);
+    }
+
+    /// A tool is servable only with the executor it needs, and only when it is
+    /// enabled; datetime needs nothing but its own entry.
+    #[test]
+    fn servable_needs_the_executor_its_tool_uses() {
+        let none = mock_app("[server]", "servable_none");
+        assert!(!Tool::WebSearch.servable(&none), "no search pool");
+        assert!(!Tool::WebFetch.servable(&none), "no fetch pool");
+        assert!(Tool::Datetime.servable(&none), "datetime needs nothing");
+
+        let search = mock_app(
+            r#"
+            [server]
+            [[search.providers]]
+            name = "s"
+            kind = "brave"
+            api_key = "k"
+            "#,
+            "servable_search",
+        );
+        assert!(Tool::WebSearch.servable(&search));
+        assert!(!Tool::WebFetch.servable(&search), "a search pool is not a fetch pool");
+
+        let disabled = mock_app(
+            r#"
+            [server]
+            [server_tools]
+            enabled = ["datetime"]
+            [[fetch.providers]]
+            name = "f"
+            kind = "jina-reader"
+            api_key = "k"
+            "#,
+            "servable_disabled",
+        );
+        assert!(!Tool::WebFetch.servable(&disabled), "not enabled");
+        assert!(Tool::Datetime.servable(&disabled));
+    }
+
+    /// No tool gets a client result block of its own on Anthropic Messages, so
+    /// web_fetch and datetime are not offered there.
+    #[test]
+    fn anthropic_messages_is_offered_only_web_search() {
+        for tool in Tool::implemented() {
+            assert!(tool.served_on(ClientFormat::Openai), "{tool:?}");
+        }
+        assert!(Tool::WebSearch.served_on(ClientFormat::Anthropic));
+        assert!(!Tool::WebFetch.served_on(ClientFormat::Anthropic));
+        assert!(!Tool::Datetime.served_on(ClientFormat::Anthropic));
     }
 
     /// The web_fetch executor runs the same provider walk `/v1/fetch` runs,
