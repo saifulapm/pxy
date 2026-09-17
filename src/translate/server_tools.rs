@@ -527,10 +527,14 @@ async fn run_image_generation(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, St
                 },
             })
         }
-        Err(e) => {
-            warn!(error = %e, "image_generation failed");
+        Err(resp) => {
+            let status = resp.status();
+            let bytes =
+                axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap_or_default();
+            let detail = String::from_utf8_lossy(&bytes);
+            warn!(%status, error = %detail, "image_generation failed");
             Ok(Ran {
-                model_output: format!("Image generation failed: {e}"),
+                model_output: format!("Image generation failed ({status}): {detail}"),
                 client: ClientRender {
                     blocks: Vec::new(),
                     marker: json!({"id": ctx.call_id, "model": model}),

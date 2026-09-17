@@ -23,7 +23,9 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
             }
             resp
         }
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
+        // The walk's own failure response keeps its status and body: a 404
+        // model-not-found, a 429 cap or cooldown, an upstream passthrough.
+        Err(resp) => resp,
     }
 }
 
@@ -31,38 +33,44 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
 /// the `image_generation` server tool runs through it too, so both share one
 /// walk, one failover and one `provider#media` quota. `model` is the
 /// requested image model (`None` or empty walks the `[media] image` default
-/// chain); returns the normalized OpenAI image body and the `provider/model`
-/// that answered.
+/// chain). On success returns the normalized OpenAI image body and the
+/// `provider/model` that answered; on failure returns the chain's own
+/// response untouched, so `generations` can pass its status and body through.
 pub(crate) async fn run_generate(
     app: &App,
     model: Option<&str>,
     payload: &Value,
-) -> Result<(Value, String), String> {
+) -> Result<(Value, String), Response> {
     let requested = model.unwrap_or("");
     let resp = super::run_chain(app, Capability::Image, requested, |r| {
         Box::pin(attempt(app, r, payload))
     })
     .await;
+    if !resp.status().is_success() {
+        return Err(resp);
+    }
     let wire = resp
         .headers()
         .get("x-pxy-provider")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .map_err(|e| format!("reading image response: {e}"))?;
-    if !status.is_success() {
-        let msg = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|v| v["error"]["message"].as_str().map(String::from))
-            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-        return Err(msg);
+    let bytes = match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("reading image response: {e}"),
+            ));
+        }
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(body) => Ok((body, wire)),
+        Err(e) => Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("bad image response: {e}"),
+        )),
     }
-    let body: Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("bad image response: {e}"))?;
-    Ok((body, wire))
 }
 
 async fn attempt(
@@ -266,5 +274,51 @@ mod tests {
             .expect("a configured provider serves the call");
         assert_eq!(body["data"][0]["url"], "https://x/y.png");
         assert_eq!(wire, "mock/m");
+    }
+
+    /// A failed walk is the chain's own answer: its status and body reach the
+    /// caller untouched, rather than being flattened into a re-wrapped 502.
+    #[tokio::test]
+    async fn run_generate_returns_the_chain_error_untouched() {
+        use axum::routing::post;
+        let router = axum::Router::new()
+            .route("/img", post(|| async { (StatusCode::NOT_FOUND, "model gone") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            r#"
+            [server]
+            [providers.mock]
+            [providers.mock.media]
+            images_url = "http://{addr}/img"
+            image_models = ["m"]
+            "#
+        ))
+        .unwrap();
+        let app = crate::router::App {
+            catalog: crate::catalog::Catalog::from_config(&cfg),
+            secrets: crate::secrets::Secrets::new(),
+            state: crate::state::State::open(
+                &{
+                    let dir = std::env::temp_dir()
+                        .join(format!("pxy-images-err-{}", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&dir);
+                    dir
+                }
+                .join("s.sqlite"),
+            )
+            .unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        };
+
+        let err = run_generate(&app, Some("mock/m"), &json!({"prompt": "p"}))
+            .await
+            .expect_err("a 404 upstream is a failed walk");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(err.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), "model gone");
     }
 }
