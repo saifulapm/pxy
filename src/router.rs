@@ -1112,6 +1112,10 @@ async fn try_candidate_inner(
         }
     }
     body["model"] = json!(cand.model.id);
+    // pxy consumes `max_tool_calls` itself (the loop's turn budget); it is not
+    // a Chat Completions field, so it must not reach an upstream that would
+    // reject the unknown key.
+    body.as_object_mut().map(|o| o.remove("max_tool_calls"));
 
     // OpenAI's newest dialect differs from the compatible-provider majority in
     // two request-body spellings, and the clients pxy fronts speak the newest
@@ -3334,8 +3338,8 @@ mod tests {
         let ws = server_tools::function_name(server_tools::Tool::WebSearch);
         let mut loop_ = ServerToolLoop {
             filter: ServerCallFilter::default(),
-            uses_left: 2,
-            per_tool: std::collections::HashMap::from([(ws.clone(), 1)]),
+            uses_left: 5,
+            per_tool: std::collections::HashMap::from([(ws.clone(), 3)]),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
@@ -3343,11 +3347,15 @@ mod tests {
         };
         let render = || server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null };
         loop_.commit(&[(ws.clone(), render()), (ws.clone(), render())]);
-        assert_eq!(loop_.uses_left, 0);
-        assert_eq!(loop_.per_tool[&ws], 0, "the tool cap must not go negative");
-        // A second charge cannot overshoot below zero.
+        // Non-saturating, so an over-charge is visible: two renders cost two.
+        assert_eq!(loop_.uses_left, 3);
+        assert_eq!(loop_.per_tool[&ws], 1);
         loop_.commit(&[(ws.clone(), render())]);
-        assert_eq!(loop_.uses_left, 0);
+        assert_eq!(loop_.uses_left, 2);
+        assert_eq!(loop_.per_tool[&ws], 0, "the tool cap must not go negative");
+        // A further charge cannot overshoot below zero.
+        loop_.commit(&[(ws.clone(), render())]);
+        assert_eq!(loop_.uses_left, 1);
         assert_eq!(loop_.per_tool[&ws], 0);
     }
 
@@ -5560,6 +5568,7 @@ mod tests {
             "stream": true,
             "messages": [{"role": "user", "content": "what time is it?"}],
             "tools": [{"type": "pxy:datetime"}],
+            "max_tool_calls": 2,
         });
         let out =
             handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
@@ -5582,6 +5591,11 @@ mod tests {
         // The replay carries the tool result back to the model.
         let replay = bodies[1]["messages"].to_string();
         assert!(replay.contains("pxy_datetime"), "{replay}");
+        assert!(
+            bodies[0].get("max_tool_calls").is_none(),
+            "the step budget is pxy's, not an upstream field: {}",
+            bodies[0]
+        );
     }
 
     /// web_fetch is offered only where pxy can run it: a fetch provider is
