@@ -48,6 +48,19 @@ max_bytes = 262144
 max_files = 500
 max_age_secs = 86400
 
+# Server tools pxy runs itself. A client declares one by its `type`; pxy offers
+# the model a reserved function, runs the call and feeds the result back in the
+# same turn. The client implements nothing. Types served today:
+# openrouter:web_search, pxy:web_search, web_search_20250305, web_search_preview.
+[server_tools]
+# Which tools may be served. A tool missing from this list is treated as
+# unservable: dropped on a multi-candidate walk, or the request refused on a
+# single candidate. Default: every tool pxy implements.
+enabled = ["web_search"]
+# Tool-call steps allowed in one turn. A request-level `max_tool_calls`
+# overrides it; a tool's own per-call cap still wins for that tool.
+max_tool_calls = 10
+
 # ---------------------------------------------------------------------------
 # Groups: named failover chains. A group name is itself a routable model id.
 # Walk order is the order of `models` below.

@@ -81,7 +81,9 @@ own, so it never eats a chat budget.
 Web search works on models that never learned it. pxy offers the model a plain
 function, runs the call through the search providers you configure, and feeds
 the results back into the same streamed turn. Claude Code gets the
-`server_tool_use` blocks it expects.
+`server_tool_use` blocks it expects. The `[server_tools]` table in
+`config.toml` decides which tools pxy serves this way and how many tool-call
+steps one turn may take.
 
 The living spec is this project's mem wiki (`mem wiki` lists the pages). Design
 history is in the git log.

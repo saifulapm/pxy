@@ -87,6 +87,10 @@ pub struct Config {
     /// default; nothing is written unless asked.
     #[serde(default)]
     pub capture: CaptureConfig,
+    /// Server tools pxy runs itself (`[server_tools]`). Absent means every
+    /// implemented tool is enabled, with a ten-step budget.
+    #[serde(default)]
+    pub server_tools: ServerToolsConfig,
 }
 
 /// Request artifact capture for translation debugging (wiki:overview). Off by
@@ -138,6 +142,41 @@ fn default_capture_files() -> u64 {
 
 fn default_capture_age() -> u64 {
     24 * 3600
+}
+
+/// Server tools pxy executes itself (wiki:server-tools): the model calls a
+/// reserved function, pxy runs it and feeds the result back in the same turn.
+/// `enabled` gates serving — a tool missing from it is treated as unservable,
+/// exactly like a type pxy does not know. The default lists every tool pxy
+/// implements, so a config that never mentions server tools still serves them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerToolsConfig {
+    #[serde(default = "default_server_tool_names")]
+    pub enabled: Vec<String>,
+    /// Tool-call steps allowed in one turn. A request-level `max_tool_calls`
+    /// overrides it.
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: u64,
+}
+
+impl Default for ServerToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_server_tool_names(),
+            max_tool_calls: default_max_tool_calls(),
+        }
+    }
+}
+
+/// Every tool `translate::server_tools` implements, by canonical name. A tool
+/// added to the registry but not here stays unservable until it is listed.
+fn default_server_tool_names() -> Vec<String> {
+    ["web_search"].into_iter().map(String::from).collect()
+}
+
+fn default_max_tool_calls() -> u64 {
+    10
 }
 
 /// A non-model HTTP service pool (search, fetch). Array of tables so config
@@ -926,6 +965,48 @@ mod tests {
         assert_eq!(models[0].id, "curated");
         assert_eq!(models[0].context_length, 8192, "config.toml's window stands");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An absent `[server_tools]` table must still serve: every tool pxy
+    /// implements is enabled and the step budget is ten (wiki:server-tools).
+    #[test]
+    fn server_tools_default_to_every_implemented_tool_and_ten_steps() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server_tools.max_tool_calls, 10);
+        assert!(
+            cfg.server_tools.enabled.iter().any(|n| n == "web_search"),
+            "the only implemented tool must be enabled by default: {:?}",
+            cfg.server_tools.enabled
+        );
+        // Every name the default enables is backed by a registry entry, so the
+        // default cannot drift from the tools pxy actually implements.
+        for name in &cfg.server_tools.enabled {
+            assert!(
+                crate::translate::server_tools::from_type(&format!("pxy:{name}")).is_some(),
+                "default enables '{name}', which the registry does not implement"
+            );
+        }
+    }
+
+    /// An explicit section replaces both defaults.
+    #[test]
+    fn server_tools_section_overrides_the_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [server_tools]
+            enabled = ["web_fetch"]
+            max_tool_calls = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server_tools.enabled, vec!["web_fetch".to_string()]);
+        assert_eq!(cfg.server_tools.max_tool_calls, 3);
     }
 }
 
