@@ -19,6 +19,7 @@ use crate::router::App;
 pub enum Tool {
     WebSearch,
     WebFetch,
+    Datetime,
 }
 
 impl Tool {
@@ -26,7 +27,7 @@ impl Tool {
     /// enabled` list, so a tool added here is enabled unless config says
     /// otherwise.
     pub fn implemented() -> &'static [Tool] {
-        &[Tool::WebSearch, Tool::WebFetch]
+        &[Tool::WebSearch, Tool::WebFetch, Tool::Datetime]
     }
 
     /// The tool's canonical name: the spelling `[server_tools] enabled` lists,
@@ -35,6 +36,7 @@ impl Tool {
         match self {
             Tool::WebSearch => "web_search",
             Tool::WebFetch => "web_fetch",
+            Tool::Datetime => "datetime",
         }
     }
 
@@ -46,6 +48,7 @@ impl Tool {
         match self {
             Tool::WebSearch => run_web_search(ctx, args).await,
             Tool::WebFetch => run_web_fetch(ctx, args).await,
+            Tool::Datetime => run_datetime(ctx, args),
         }
     }
 
@@ -79,11 +82,14 @@ pub struct ClientRender {
 pub struct ToolCtx<'a> {
     pub app: &'a App,
     pub call_id: &'a str,
+    /// The wall clock the tool sees. `new` reads the real clock; a test builds
+    /// the struct directly to fix it.
+    pub now: jiff::Timestamp,
 }
 
 impl<'a> ToolCtx<'a> {
     pub fn new(app: &'a App, call_id: &'a str) -> Self {
-        Self { app, call_id }
+        Self { app, call_id, now: jiff::Timestamp::now() }
     }
 }
 
@@ -98,6 +104,7 @@ pub fn from_type(ty: &str) -> Option<Tool> {
     match ty {
         "openrouter:web_search" | "pxy:web_search" => Some(Tool::WebSearch),
         "openrouter:web_fetch" | "pxy:web_fetch" => Some(Tool::WebFetch),
+        "openrouter:datetime" | "pxy:datetime" => Some(Tool::Datetime),
         t if t.starts_with("web_search") => Some(Tool::WebSearch),
         _ => None,
     }
@@ -128,6 +135,22 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                         "url": {"type": "string", "description": "The http(s) URL to fetch."}
                     },
                     "required": ["url"],
+                },
+            },
+        }),
+        Tool::Datetime => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::Datetime),
+                "description": "The current date and time, optionally in an IANA timezone.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "timezone": {
+                            "type": "string",
+                            "description": "IANA timezone name, e.g. America/New_York. Default UTC."
+                        }
+                    },
                 },
             },
         }),
@@ -216,6 +239,35 @@ async fn run_web_fetch(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     })
 }
 
+/// The current time as ISO-8601 with its offset, then the zone it is in. No
+/// network, and a zone jiff does not know is reported to the model rather than
+/// failing the call. An empty or absent `timezone` means UTC.
+fn run_datetime(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let requested = args["timezone"].as_str().filter(|z| !z.is_empty());
+    let (zoned, label) = match requested {
+        Some(name) => match ctx.now.in_tz(name) {
+            Ok(z) => (z, name.to_string()),
+            Err(_) => {
+                return Ok(Ran {
+                    model_output: format!("Unknown timezone: {name}"),
+                    client: ClientRender {
+                        blocks: Vec::new(),
+                        marker: json!({"id": ctx.call_id, "timezone": name}),
+                    },
+                });
+            }
+        },
+        None => (ctx.now.to_zoned(jiff::tz::TimeZone::UTC), "UTC".to_string()),
+    };
+    Ok(Ran {
+        model_output: format!("{} ({label})", zoned.strftime("%Y-%m-%dT%H:%M:%S%:z")),
+        client: ClientRender {
+            blocks: Vec::new(),
+            marker: json!({"id": ctx.call_id, "timezone": label}),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +322,49 @@ mod tests {
         }
         assert_eq!(Tool::WebSearch.name(), "web_search");
         assert_eq!(Tool::WebFetch.name(), "web_fetch");
+        assert_eq!(Tool::Datetime.name(), "datetime");
+    }
+
+    /// datetime is clock- and zone-only: the same fixed instant read as UTC
+    /// and as an IANA zone must differ by that zone's offset.
+    #[tokio::test]
+    async fn datetime_defaults_to_utc_and_accepts_an_iana_zone() {
+        let app = mock_app("[server]", "datetime_clock");
+        let now: jiff::Timestamp = "2025-07-15T18:30:00Z".parse().unwrap();
+        let ctx = ToolCtx { app: &app, call_id: "call_1", now };
+
+        let utc = Tool::Datetime.execute(&ctx, &json!({})).await.unwrap();
+        assert_eq!(utc.model_output, "2025-07-15T18:30:00+00:00 (UTC)");
+
+        let ny = Tool::Datetime
+            .execute(&ctx, &json!({"timezone": "America/New_York"}))
+            .await
+            .unwrap();
+        assert_eq!(ny.model_output, "2025-07-15T14:30:00-04:00 (America/New_York)");
+    }
+
+    /// A zone jiff cannot resolve is the model's mistake to see, not a reason
+    /// to drop the call from the replay.
+    #[tokio::test]
+    async fn datetime_reports_an_unknown_zone() {
+        let app = mock_app("[server]", "datetime_bad_zone");
+        let now: jiff::Timestamp = "2025-07-15T18:30:00Z".parse().unwrap();
+        let ctx = ToolCtx { app: &app, call_id: "call_1", now };
+        let ran = Tool::Datetime
+            .execute(&ctx, &json!({"timezone": "Mars/Olympus"}))
+            .await
+            .unwrap();
+        assert!(ran.model_output.contains("Mars/Olympus"), "{}", ran.model_output);
+    }
+
+    /// The injected datetime function models one optional argument; the tool
+    /// must advertise it or the model can never set a zone.
+    #[test]
+    fn datetime_def_advertises_an_optional_timezone() {
+        let def = tool_def(Tool::Datetime, &Value::Null);
+        assert_eq!(def["function"]["name"], "pxy_datetime");
+        assert_eq!(def["function"]["parameters"]["properties"]["timezone"]["type"], "string");
+        assert!(def["function"]["parameters"].get("required").is_none());
     }
 
     /// The web_fetch executor runs the same provider walk `/v1/fetch` runs,
