@@ -21,7 +21,7 @@ use super::TokenUsage;
 
 pub fn request(payload: &Value) -> Value {
     let mut out = Map::new();
-    for key in ["model", "stream", "temperature", "top_p", "parallel_tool_calls"] {
+    for key in ["model", "stream", "temperature", "top_p", "parallel_tool_calls", "max_tool_calls"] {
         if !payload[key].is_null() {
             out.insert(key.into(), payload[key].clone());
         }
@@ -875,6 +875,14 @@ mod tests {
 
     /// The documented string form of `input` must become one user message;
     /// treating it as missing made the model answer a fabricated empty prompt.
+    #[test]
+    fn max_tool_calls_survives_translation() {
+        // The served-tool step budget is read off the chat body by the router;
+        // dropping the key here silently ignored a Responses client's override.
+        let out = request(&json!({"model": "m", "input": "hi", "max_tool_calls": 3}));
+        assert_eq!(out["max_tool_calls"], 3, "{out}");
+    }
+
     #[test]
     fn string_input_becomes_a_user_message() {
         let out = request(&json!({"model": "m", "input": "hello"}));

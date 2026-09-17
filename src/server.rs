@@ -95,6 +95,8 @@ fn client_ctx(headers: &HeaderMap) -> ClientContext {
             .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().to_string()),
+        // Set by the /v1/responses handler; every other route is not Responses.
+        responses: false,
     }
 }
 
@@ -219,7 +221,10 @@ async fn responses(
             .into_response();
     }
 
-    let ctx = client_ctx(&headers);
+    let mut ctx = client_ctx(&headers);
+    // Responses-only: it and Chat Completions are both ClientFormat::Openai,
+    // but only this dialect can read pxy's served-tool marker chunk.
+    ctx.responses = true;
     let model = payload["model"]
         .as_str()
         .map(str::to_string)

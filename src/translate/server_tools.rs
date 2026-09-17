@@ -85,10 +85,16 @@ impl Tool {
 
     /// This tool's own call cap for the request: the declaration's `max_uses`
     /// (Anthropic spells it top-level, OpenRouter nestles it under
-    /// `parameters`), default 5, clamped to 1..=20.
+    /// `parameters`) or `parameters.max_tool_calls` (the wiki's spelling),
+    /// default 5, clamped to 1..=20.
     pub fn max_uses(self, payload: &Value) -> u64 {
         declaration(payload, self)
-            .and_then(|t| t["max_uses"].as_u64().or_else(|| t["parameters"]["max_uses"].as_u64()))
+            .and_then(|t| {
+                t["max_uses"]
+                    .as_u64()
+                    .or_else(|| t["parameters"]["max_uses"].as_u64())
+                    .or_else(|| t["parameters"]["max_tool_calls"].as_u64())
+            })
             .unwrap_or(web_search::DEFAULT_MAX_USES)
             .clamp(1, 20)
     }
@@ -259,6 +265,18 @@ fn fetched_for_model(url: &str, content: &str) -> String {
 /// result block, so it renders nothing for a Messages client.
 async fn run_web_fetch(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let url = args["url"].as_str().filter(|u| !u.is_empty()).ok_or("missing url")?.to_string();
+    // The same check /v1/fetch makes: a reader endpoint is not a general
+    // fetcher, and a self-hosted base_url must not widen what a model can ask
+    // it to read.
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Ok(Ran {
+            model_output: "Fetch failed: url must be http(s)".into(),
+            client: ClientRender {
+                blocks: Vec::new(),
+                marker: json!({"id": ctx.call_id, "url": &url}),
+            },
+        });
+    }
     let found = crate::media::search::run_fetch(ctx.app, &url, None).await;
     Ok(match &found {
         Ok((provider, content)) => {
@@ -426,6 +444,11 @@ mod tests {
         assert_eq!(Tool::Datetime.max_uses(&bare), web_search::DEFAULT_MAX_USES);
         let big = json!({"tools": [{"type": "pxy:web_fetch", "parameters": {"max_uses": 900}}]});
         assert_eq!(Tool::WebFetch.max_uses(&big), 20);
+        // The wiki spells a tool's own cap `parameters.max_tool_calls`; accept
+        // it beside OpenRouter's `max_uses` so neither spelling is silently
+        // ignored.
+        let wiki = json!({"tools": [{"type": "pxy:web_fetch", "parameters": {"max_tool_calls": 2}}]});
+        assert_eq!(Tool::WebFetch.max_uses(&wiki), 2);
         let f = json!({"tools": [{"type": "function", "function": {"name": "web_search"}}]});
         assert_eq!(Tool::WebSearch.max_uses(&f), web_search::DEFAULT_MAX_USES);
     }
@@ -514,6 +537,19 @@ mod tests {
         assert!(ran.model_output.contains("hello from the page"), "{}", ran.model_output);
         assert_eq!(ran.client.marker["url"], "https://example.com/article");
         assert!(ran.client.blocks.is_empty(), "web_fetch has no Anthropic block");
+    }
+
+    /// A URL that is not http(s) is refused before any provider sees it: the
+    /// fetch walk's caller owns the shape check, exactly as /v1/fetch does.
+    #[tokio::test]
+    async fn web_fetch_rejects_non_http_urls() {
+        let app = mock_app("[server]", "web_fetch_scheme");
+        let ctx = ToolCtx::new(&app, "c");
+        let ran = Tool::WebFetch
+            .execute(&ctx, &json!({"url": "file:///etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(ran.model_output.contains("http(s)"), "{}", ran.model_output);
     }
 
     /// A URL-less call is malformed, not a failure to report back: the loop

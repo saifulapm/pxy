@@ -53,6 +53,10 @@ pub struct ClientContext {
     /// (which is pxy's case — `pxy launch opencode` registers it as `pxy`).
     /// Forwarded ONLY to opencode-family upstreams; see `opencode_session`.
     pub session: Option<String>,
+    /// Set by `/v1/responses`: both it and Chat Completions speak
+    /// [`ClientFormat::Openai`], but only the Responses dialect understands
+    /// pxy's served-tool marker chunk, so only it may receive one.
+    pub responses: bool,
 }
 
 /// Outcome handed to the HTTP layer.
@@ -1185,6 +1189,17 @@ async fn try_candidate_inner(
                 body.as_object_mut().map(|o| o.remove("tools"));
             }
         }
+        // A `tool_choice` naming a function pxy just dropped would 400 an
+        // upstream that validates it, and a `tool_choice` with no tools at all
+        // is already invalid.
+        let chosen = body["tool_choice"]["function"]["name"].as_str().map(str::to_string);
+        if body["tools"].is_null()
+            || chosen.is_some_and(|n| {
+                server_tools::Tool::from_function_name(&n).is_some() && !keep.iter().any(|k| k == &n)
+            })
+        {
+            body.as_object_mut().map(|o| o.remove("tool_choice"));
+        }
         for tool in injected.iter().filter(|t| !servable.contains(t)) {
             debug!(
                 candidate = %cand.full_id(),
@@ -1411,6 +1426,7 @@ async fn try_candidate_inner(
             // Cloned: the pre-first-event error path below still needs them to
             // relay `retry-after` on a stream that died before committing.
             fwd_headers.clone(),
+            ctx.responses,
         )
         .await
         {
@@ -2128,6 +2144,10 @@ struct StreamCtx {
     /// Present when the request carried a served server tool and the upstream
     /// speaks OpenAI: pxy runs the tool and continues the turn.
     search: Option<ServerToolLoop>,
+    /// The client speaks the Responses dialect, so it can read pxy's
+    /// served-tool marker chunks. A Chat Completions client must not be sent
+    /// one: it has no item for a served tool and would see a `pxy_*` name.
+    responses_client: bool,
 }
 
 /// Accumulates the model's calls to a reserved `pxy_*` server function while
@@ -2774,19 +2794,21 @@ impl StreamCtx {
             // chunk and translate/responses turns it into the Responses API's
             // `web_search_call` item. Without it the user watches a silent gap
             // for as long as the searches take and assumes it has hung.
-            // Shaped as an ordinary empty-choices chunk so a plain chat client
-            // (which never asked for this and can't reach here anyway) would
-            // skip it the way it skips the usage chunk.
+            // Responses-only: a Chat Completions client has no item for a
+            // served tool, and the marker would put a `pxy_*` name on its
+            // wire.
             _ => {
                 let spent = std::mem::take(&mut self.usage);
                 record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, spent);
-                for (name, render) in &served.renders {
-                    let mut chunk = json!({
-                        "object": "chat.completion.chunk",
-                        "choices": [],
-                    });
-                    chunk[name.as_str()] = render.marker.clone();
-                    out.push_str(&format!("data: {chunk}\n\n"));
+                if self.responses_client {
+                    for (name, render) in &served.renders {
+                        let mut chunk = json!({
+                            "object": "chat.completion.chunk",
+                            "choices": [],
+                        });
+                        chunk[name.as_str()] = render.marker.clone();
+                        out.push_str(&format!("data: {chunk}\n\n"));
+                    }
                 }
             }
         }
@@ -2906,6 +2928,7 @@ async fn stream_outcome(
     declared_names: Option<std::collections::HashSet<String>>,
     search: Option<ServerToolLoop>,
     fwd_headers: Headers,
+    responses_client: bool,
 ) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
@@ -2947,6 +2970,7 @@ async fn stream_outcome(
         done: false,
         stall,
         search,
+        responses_client,
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
@@ -3284,16 +3308,47 @@ mod tests {
         assert_eq!(calls[0]["function"]["name"], "Bash");
         assert!(f.saw_other);
 
-        let loop_ = ServerToolLoop {
+        let ws = server_tools::function_name(server_tools::Tool::WebSearch);
+        let mut loop_ = ServerToolLoop {
             filter: f,
             uses_left: 5,
-            per_tool: Default::default(),
+            per_tool: std::collections::HashMap::from([(ws, 5)]),
             url: String::new(),
             headers: Vec::new(),
             body: Value::Null,
             timeout: Duration::from_secs(1),
         };
+        // The captured search WOULD run...
+        loop_.filter.saw_other = false;
+        assert_eq!(loop_.pending().len(), 1, "the reserved call is captured");
+        // ...but a client tool in the same turn cancels it.
+        loop_.filter.saw_other = true;
         assert!(loop_.pending().is_empty());
+    }
+
+    /// `commit` charges only what was served, against the turn budget and each
+    /// tool's own cap, and neither counter can go below zero on a second
+    /// charge.
+    #[test]
+    fn commit_charges_the_turn_and_the_tool() {
+        let ws = server_tools::function_name(server_tools::Tool::WebSearch);
+        let mut loop_ = ServerToolLoop {
+            filter: ServerCallFilter::default(),
+            uses_left: 2,
+            per_tool: std::collections::HashMap::from([(ws.clone(), 1)]),
+            url: String::new(),
+            headers: Vec::new(),
+            body: Value::Null,
+            timeout: Duration::from_secs(1),
+        };
+        let render = || server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null };
+        loop_.commit(&[(ws.clone(), render()), (ws.clone(), render())]);
+        assert_eq!(loop_.uses_left, 0);
+        assert_eq!(loop_.per_tool[&ws], 0, "the tool cap must not go negative");
+        // A second charge cannot overshoot below zero.
+        loop_.commit(&[(ws.clone(), render())]);
+        assert_eq!(loop_.uses_left, 0);
+        assert_eq!(loop_.per_tool[&ws], 0);
     }
 
     /// A turn may carry SEVERAL search calls (parallel tool calls): all of
@@ -5513,6 +5568,7 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("It is now."), "{text}");
         assert!(!text.contains("\"tool_calls\""), "the reserved call must be stripped: {text}");
+        assert!(!text.contains("pxy_"), "a Chat Completions client must see no pxy_* name: {text}");
 
         let bodies = seen.lock().unwrap();
         assert_eq!(bodies.len(), 2, "one call to ask, one to answer");
@@ -5559,6 +5615,7 @@ mod tests {
             "stream": true,
             "messages": [{"role": "user", "content": "read this"}],
             "tools": [{"type": "pxy:web_fetch"}],
+            "tool_choice": "required",
         });
 
         let without = test_app(
@@ -5584,12 +5641,20 @@ mod tests {
         if let Outcome::Stream { body, .. } = out {
             let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
         }
-        assert!(
-            !seen.lock().unwrap()[0]["tools"]
-                .as_array()
-                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "pxy_web_fetch")),
-            "no fetch provider: the function must be dropped"
-        );
+        {
+            let bodies = seen.lock().unwrap();
+            assert!(
+                !bodies[0]["tools"]
+                    .as_array()
+                    .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "pxy_web_fetch")),
+                "no fetch provider: the function must be dropped"
+            );
+            assert!(
+                bodies[0].get("tool_choice").is_none(),
+                "a dropped tool must not leave tool_choice dangling: {}",
+                bodies[0]
+            );
+        }
 
         let with = test_app(
             &format!(
