@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use super::web_search;
 use crate::catalog::Catalog;
-use crate::router::{App, ClientFormat};
+use crate::router::{App, ClientContext, ClientFormat, Outcome, SharedApp, handle_chat};
 
 /// A tool pxy can serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +146,43 @@ pub struct ToolCtx<'a> {
 impl<'a> ToolCtx<'a> {
     pub fn new(app: &'a App, call_id: &'a str) -> Self {
         Self { app, call_id, now: jiff::Timestamp::now() }
+    }
+}
+
+/// Issue one sub-request through pxy's own router and return the assistant's
+/// text. The meta-tools consult a model this way: the leg resolves providers,
+/// passes limits and cooldowns, translates, records usage and fails over
+/// exactly like a client turn, because it is one. `params` is merged into the
+/// payload beside `model`, `messages` and `stream`, which pxy owns here.
+pub async fn run_internal_chat(
+    app: &SharedApp,
+    model: &str,
+    messages: Vec<Value>,
+    params: Value,
+) -> Result<String, String> {
+    let mut payload = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+    });
+    if let (Some(dst), Some(src)) = (payload.as_object_mut(), params.as_object()) {
+        for (k, v) in src {
+            if k != "model" && k != "messages" && k != "stream" {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    match handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await {
+        Outcome::Json { status, body, .. } if status < 400 => body["choices"][0]["message"]
+            ["content"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "sub-request returned no assistant text".to_string()),
+        Outcome::Json { status, body, .. } => {
+            let message = body["error"]["message"].as_str().unwrap_or("sub-request failed");
+            Err(format!("sub-request failed ({status}): {message}"))
+        }
+        Outcome::Stream { .. } => Err("sub-request unexpectedly streamed".to_string()),
     }
 }
 
@@ -962,6 +999,47 @@ mod tests {
         let app = mock_app("[server]", "image_generation_no_prompt");
         let ctx = ToolCtx::new(&app, "c");
         assert!(Tool::ImageGeneration.execute(&ctx, &json!({})).await.is_err());
+    }
+
+    /// The meta-tools issue their sub-request through pxy's own router, so a
+    /// consultation is a real turn: it resolves the provider, reaches the
+    /// upstream, and records usage like any client request.
+    #[tokio::test]
+    async fn internal_chat_returns_the_answer_and_records_usage() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/c",
+            post(|| async {
+                axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "advisor says hi"},
+                    "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["m"]
+                "#
+            ),
+            "internal_chat",
+        );
+        let text = run_internal_chat(
+            &app,
+            "p/m",
+            vec![json!({"role": "user", "content": "advise me"})],
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "advisor says hi");
+        assert_eq!(app.state.usage_total("p").unwrap().requests, 1);
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
