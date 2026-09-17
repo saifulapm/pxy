@@ -212,25 +212,26 @@ pub async fn fetch(State(app): State<SharedApp>, Json(payload): Json<Value>) -> 
     .await
 }
 
-async fn fetch_inner(app: SharedApp, params: FetchParams) -> Response {
-    if !params.url.starts_with("http://") && !params.url.starts_with("https://") {
-        return error_response(StatusCode::BAD_REQUEST, "url must be http(s)");
-    }
+/// The provider walk behind `/v1/fetch`, without the HTTP layer: the
+/// `web_fetch` server tool runs through it too, so both share one walk and
+/// one quota. Returns the provider that answered and its content. The caller
+/// validates the URL's shape; the walk only decides which provider answers.
+pub(crate) async fn run_fetch(
+    app: &App,
+    url: &str,
+    only: Option<&str>,
+) -> Result<(String, String), String> {
     let mut errors: Vec<String> = Vec::new();
     for p in &app.cfg.fetch.providers {
-        if params.provider.as_deref().is_some_and(|o| o != p.name) {
+        if only.is_some_and(|o| o != p.name) {
             continue;
         }
-        let Some(key) = service_ready(&app, "fetch", p) else { continue };
-        super::record(&app, &key);
-        match fetch_one(&app, p, &params.url).await {
+        let Some(key) = service_ready(app, "fetch", p) else { continue };
+        super::record(app, &key);
+        match fetch_one(app, p, url).await {
             Ok(content) => {
                 app.state.clear_cooldown(&key, "");
-                return (
-                    StatusCode::OK,
-                    Json(json!({"provider": p.name, "url": params.url, "content": content})),
-                )
-                    .into_response();
+                return Ok((p.name.clone(), content));
             }
             Err(e) => {
                 app.state.set_cooldown(&key, None, None, true, &format!("{e:#}"));
@@ -238,10 +239,21 @@ async fn fetch_inner(app: SharedApp, params: FetchParams) -> Response {
             }
         }
     }
-    error_response(
-        StatusCode::BAD_GATEWAY,
-        if errors.is_empty() { "no fetch provider available".into() } else { errors.join("; ") },
-    )
+    Err(if errors.is_empty() { "no fetch provider available".into() } else { errors.join("; ") })
+}
+
+async fn fetch_inner(app: SharedApp, params: FetchParams) -> Response {
+    if !params.url.starts_with("http://") && !params.url.starts_with("https://") {
+        return error_response(StatusCode::BAD_REQUEST, "url must be http(s)");
+    }
+    match run_fetch(&app, &params.url, params.provider.as_deref()).await {
+        Ok((provider, content)) => (
+            StatusCode::OK,
+            Json(json!({"provider": provider, "url": params.url, "content": content})),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
+    }
 }
 
 async fn fetch_one(app: &App, p: &ServiceProvider, url: &str) -> anyhow::Result<String> {
