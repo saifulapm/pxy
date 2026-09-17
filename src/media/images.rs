@@ -15,7 +15,7 @@ use crate::config::MediaKind;
 use crate::router::{App, SharedApp};
 
 pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value>) -> Response {
-    match run_generate(&app, payload["model"].as_str(), &payload).await {
+    match run_generate(&app, payload["model"].as_str(), &payload, false).await {
         Ok((body, wire)) => {
             let mut resp = (StatusCode::OK, Json(body)).into_response();
             if let Ok(v) = wire.parse() {
@@ -33,17 +33,21 @@ pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value
 /// the `image_generation` server tool runs through it too, so both share one
 /// walk, one failover and one `provider#media` quota. `model` is the
 /// requested image model (`None` or empty walks the `[media] image` default
-/// chain). On success returns the normalized OpenAI image body and the
-/// `provider/model` that answered; on failure returns the chain's own
-/// response untouched, so `generations` can pass its status and body through.
+/// chain); `want_url` makes a candidate that answers with base64 (which a
+/// text tool result cannot carry) a retryable failure, so the chain continues
+/// to one that returns a URL. On success returns the normalized OpenAI image
+/// body and the `provider/model` that answered; on failure returns the
+/// chain's own response untouched, so `generations` can pass its status and
+/// body through.
 pub(crate) async fn run_generate(
     app: &App,
     model: Option<&str>,
     payload: &Value,
+    want_url: bool,
 ) -> Result<(Value, String), Response> {
     let requested = model.unwrap_or("");
     let resp = super::run_chain(app, Capability::Image, requested, |r| {
-        Box::pin(attempt(app, r, payload))
+        Box::pin(attempt(app, r, payload, want_url))
     })
     .await;
     if !resp.status().is_success() {
@@ -77,6 +81,7 @@ async fn attempt(
     app: &crate::router::App,
     r: &super::Resolved<'_>,
     payload: &Value,
+    want_url: bool,
 ) -> super::Attempt {
     use super::Attempt;
 
@@ -153,6 +158,15 @@ async fn attempt(
             _ => normalize_json(&body),
         }
     };
+
+    // The server tool hands the model a URL, so a base64-only answer is not a
+    // usable success: let the chain continue to a URL-capable candidate.
+    if want_url && normalized["data"][0]["url"].as_str().is_none() {
+        return Attempt::Retryable(error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("{}/{} returned no URL (base64 image)", r.provider, r.model),
+        ));
+    }
 
     app.state.clear_cooldown(&super::media_key(&r.provider), &r.model);
     Attempt::Ok(tag(normalized, &r.provider, &r.model))
@@ -269,7 +283,7 @@ mod tests {
             cfg,
         };
 
-        let (body, wire) = run_generate(&app, Some("mock/m"), &json!({"prompt": "p"}))
+        let (body, wire) = run_generate(&app, Some("mock/m"), &json!({"prompt": "p"}), false)
             .await
             .expect("a configured provider serves the call");
         assert_eq!(body["data"][0]["url"], "https://x/y.png");
@@ -314,11 +328,66 @@ mod tests {
             cfg,
         };
 
-        let err = run_generate(&app, Some("mock/m"), &json!({"prompt": "p"}))
+        let err = run_generate(&app, Some("mock/m"), &json!({"prompt": "p"}), false)
             .await
             .expect_err("a 404 upstream is a failed walk");
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         let bytes = axum::body::to_bytes(err.into_body(), 1 << 20).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes), "model gone");
+    }
+
+    /// With `want_url`, a candidate that answers base64 is a retryable
+    /// failure: the walk continues to a candidate that returns a URL, because
+    /// the server tool can only hand the model a URL.
+    #[tokio::test]
+    async fn run_generate_fails_over_past_a_base64_candidate() {
+        use axum::routing::post;
+        let router = axum::Router::new()
+            .route(
+                "/cf",
+                post(|| async { axum::Json(json!({"result": {"image": "aGk="}, "success": true})) }),
+            )
+            .route(
+                "/o",
+                post(|| async {
+                    axum::Json(json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            r#"
+            [server]
+            [providers.cf]
+            [providers.cf.media]
+            kind = "cloudflare"
+            images_url = "http://{addr}/cf"
+            image_models = ["m"]
+            [providers.o]
+            [providers.o.media]
+            images_url = "http://{addr}/o"
+            image_models = ["m"]
+            [media]
+            image = ["cf/m", "o/m"]
+            "#
+        ))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("pxy-images-b64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = crate::router::App {
+            catalog: crate::catalog::Catalog::from_config(&cfg),
+            secrets: crate::secrets::Secrets::new(),
+            state: crate::state::State::open(&dir.join("s.sqlite")).unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        };
+
+        let (body, wire) = run_generate(&app, None, &json!({"prompt": "p"}), true)
+            .await
+            .expect("the URL-capable candidate serves the call");
+        assert_eq!(body["data"][0]["url"], "https://x/y.png");
+        assert_eq!(wire, "o/m");
     }
 }

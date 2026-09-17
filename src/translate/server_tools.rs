@@ -516,29 +516,19 @@ fn models_for_model(matches: &[Value], total: usize) -> String {
 async fn run_image_generation(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let prompt = args["prompt"].as_str().filter(|p| !p.is_empty()).ok_or("missing prompt")?;
     let model = args["model"].as_str().filter(|m| !m.is_empty());
-    match crate::media::images::run_generate(ctx.app, model, &json!({"prompt": prompt})).await {
+    match crate::media::images::run_generate(ctx.app, model, &json!({"prompt": prompt}), true).await {
+        // The walk is told the tool needs a URL, so a base64-only candidate
+        // fails over and a success here carries one.
         Ok((body, provider)) => {
-            let url = body["data"][0]["url"].as_str().map(String::from);
-            let b64_bytes = body["data"][0]["b64_json"].as_str().map(str::len);
+            let url = body["data"][0]["url"].as_str().unwrap_or("");
             info!(%provider, "image_generation served");
-            let (output, marker) = match (&url, b64_bytes) {
-                (Some(url), _) => (
-                    format!("Generated image: {url}"),
-                    json!({"id": ctx.call_id, "provider": provider, "url": url}),
-                ),
-                // A base64 image is not a URL a text tool result can carry; say
-                // so instead of reporting a success with nothing usable.
-                (None, Some(n)) => (
-                    "Image generation returned base64 image data; this tool can only hand back a URL."
-                        .to_string(),
-                    json!({"id": ctx.call_id, "provider": provider, "b64_bytes": n}),
-                ),
-                (None, None) => (
-                    "Generated an image, but the provider returned no URL.".to_string(),
-                    json!({"id": ctx.call_id, "provider": provider}),
-                ),
-            };
-            Ok(Ran { model_output: output, client: ClientRender { blocks: Vec::new(), marker } })
+            Ok(Ran {
+                model_output: format!("Generated image: {url}"),
+                client: ClientRender {
+                    blocks: Vec::new(),
+                    marker: json!({"id": ctx.call_id, "provider": provider, "url": url}),
+                },
+            })
         }
         Err(resp) => {
             let status = resp.status();
@@ -929,10 +919,11 @@ mod tests {
         assert!(ran.client.blocks.is_empty(), "no Anthropic block for image_generation");
     }
 
-    /// A walk that answers base64 says so: a text tool result cannot carry the
-    /// bytes, so the model is told instead of handed a hollow success.
+    /// A base64-only chain has no URL to hand the model. The walk fails over,
+    /// and with no URL-capable candidate left the tool reports the failure
+    /// rather than a hollow success.
     #[tokio::test]
-    async fn image_generation_reports_a_base64_answer() {
+    async fn image_generation_reports_a_base64_only_chain_as_failed() {
         use axum::routing::post;
         let router = axum::Router::new().route(
             "/img",
@@ -962,7 +953,7 @@ mod tests {
             .await
             .unwrap();
         assert!(ran.model_output.contains("base64"), "{}", ran.model_output);
-        assert_eq!(ran.client.marker["b64_bytes"], 4, "{}", ran.client.marker);
+        assert!(ran.model_output.contains("failed"), "{}", ran.model_output);
     }
 
     /// A prompt-less call is malformed, not a failure to report back.
