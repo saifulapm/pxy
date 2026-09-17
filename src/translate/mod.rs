@@ -5,6 +5,7 @@ pub mod aisdk;
 pub mod anthropic_to_openai;
 pub mod openai_to_anthropic;
 pub mod responses;
+pub mod server_tools;
 pub mod sse;
 pub mod think;
 pub mod tool_text;
