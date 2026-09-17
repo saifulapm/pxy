@@ -12,14 +12,57 @@ use serde_json::{Value, json};
 
 use super::{Capability, error_response};
 use crate::config::MediaKind;
-use crate::router::SharedApp;
+use crate::router::{App, SharedApp};
 
 pub async fn generations(State(app): State<SharedApp>, Json(payload): Json<Value>) -> Response {
-    let requested = payload["model"].as_str().unwrap_or("").to_string();
-    super::run_chain(&app, Capability::Image, &requested, |r| {
-        Box::pin(attempt(&app, r, &payload))
+    match run_generate(&app, payload["model"].as_str(), &payload).await {
+        Ok((body, wire)) => {
+            let mut resp = (StatusCode::OK, Json(body)).into_response();
+            if let Ok(v) = wire.parse() {
+                resp.headers_mut().insert("x-pxy-provider", v);
+            }
+            resp
+        }
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+/// The provider walk behind `/v1/images/generations`, without the HTTP layer:
+/// the `image_generation` server tool runs through it too, so both share one
+/// walk, one failover and one `provider#media` quota. `model` is the
+/// requested image model (`None` or empty walks the `[media] image` default
+/// chain); returns the normalized OpenAI image body and the `provider/model`
+/// that answered.
+pub(crate) async fn run_generate(
+    app: &App,
+    model: Option<&str>,
+    payload: &Value,
+) -> Result<(Value, String), String> {
+    let requested = model.unwrap_or("");
+    let resp = super::run_chain(app, Capability::Image, requested, |r| {
+        Box::pin(attempt(app, r, payload))
     })
-    .await
+    .await;
+    let wire = resp
+        .headers()
+        .get("x-pxy-provider")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .map_err(|e| format!("reading image response: {e}"))?;
+    if !status.is_success() {
+        let msg = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(String::from))
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+        return Err(msg);
+    }
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("bad image response: {e}"))?;
+    Ok((body, wire))
 }
 
 async fn attempt(
@@ -179,5 +222,49 @@ mod tests {
         assert_eq!(body["steps"], 4);
         assert!(body.get("response_format").is_none());
         assert!(body.get("model").is_none());
+    }
+
+    /// The walk behind `/v1/images/generations` is the one the
+    /// `image_generation` server tool runs: given a provider, it returns the
+    /// normalized image body and the `provider/model` that answered.
+    #[tokio::test]
+    async fn run_generate_walks_a_provider_and_returns_body_and_wire_id() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/img",
+            post(|| async {
+                axum::Json(json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            r#"
+            [server]
+            [providers.mock]
+            [providers.mock.media]
+            images_url = "http://{addr}/img"
+            image_models = ["m"]
+            "#
+        ))
+        .unwrap();
+        let catalog = crate::catalog::Catalog::from_config(&cfg);
+        let dir = std::env::temp_dir().join(format!("pxy-images-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = crate::router::App {
+            catalog,
+            secrets: crate::secrets::Secrets::new(),
+            state: crate::state::State::open(&dir.join("s.sqlite")).unwrap(),
+            http: reqwest::Client::new(),
+            cfg,
+        };
+
+        let (body, wire) = run_generate(&app, Some("mock/m"), &json!({"prompt": "p"}))
+            .await
+            .expect("a configured provider serves the call");
+        assert_eq!(body["data"][0]["url"], "https://x/y.png");
+        assert_eq!(wire, "mock/m");
     }
 }
