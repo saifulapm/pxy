@@ -22,6 +22,7 @@ pub enum Tool {
     WebFetch,
     Datetime,
     SearchModels,
+    ImageGeneration,
 }
 
 impl Tool {
@@ -29,7 +30,13 @@ impl Tool {
     /// enabled` list, so a tool added here is enabled unless config says
     /// otherwise.
     pub fn implemented() -> &'static [Tool] {
-        &[Tool::WebSearch, Tool::WebFetch, Tool::Datetime, Tool::SearchModels]
+        &[
+            Tool::WebSearch,
+            Tool::WebFetch,
+            Tool::Datetime,
+            Tool::SearchModels,
+            Tool::ImageGeneration,
+        ]
     }
 
     /// The tool's canonical name: the spelling `[server_tools] enabled` lists,
@@ -40,6 +47,7 @@ impl Tool {
             Tool::WebFetch => "web_fetch",
             Tool::Datetime => "datetime",
             Tool::SearchModels => "search_models",
+            Tool::ImageGeneration => "image_generation",
         }
     }
 
@@ -53,6 +61,7 @@ impl Tool {
             Tool::WebFetch => run_web_fetch(ctx, args).await,
             Tool::Datetime => run_datetime(ctx, args),
             Tool::SearchModels => run_search_models(ctx, args),
+            Tool::ImageGeneration => run_image_generation(ctx, args).await,
         }
     }
 
@@ -74,6 +83,9 @@ impl Tool {
             Tool::WebFetch => !app.cfg.fetch.providers.is_empty(),
             Tool::Datetime => true,
             Tool::SearchModels => true,
+            Tool::ImageGeneration => {
+                app.cfg.media.image.as_ref().is_some_and(|c| !c.as_slice().is_empty())
+            }
         }
     }
 
@@ -164,6 +176,7 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "openrouter:experimental__search_models" | "pxy:search_models" => {
             Some(Tool::SearchModels)
         }
+        "openrouter:image_generation" | "pxy:image_generation" => Some(Tool::ImageGeneration),
         t if t.starts_with("web_search") => Some(Tool::WebSearch),
         _ => None,
     }
@@ -248,6 +261,27 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                             "description": "true for free models only, false to exclude them."
                         },
                     },
+                },
+            },
+        }),
+        Tool::ImageGeneration => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::ImageGeneration),
+                "description": "Generate an image from a text prompt and return its URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "What the image should show."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Image model to use; defaults to the configured [media] image chain."
+                        },
+                    },
+                    "required": ["prompt"],
                 },
             },
         }),
@@ -471,6 +505,41 @@ fn models_for_model(matches: &[Value], total: usize) -> String {
     out.trim_end().to_string()
 }
 
+/// Run one image_generation call through the image media walk — the same walk
+/// `/v1/images/generations` runs, so the media quota and failover are shared.
+/// A missing prompt makes the call unserved; a provider failure is reported
+/// to the model. The model is handed the image URL, not the bytes.
+async fn run_image_generation(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let prompt = args["prompt"].as_str().filter(|p| !p.is_empty()).ok_or("missing prompt")?;
+    let model = args["model"].as_str().filter(|m| !m.is_empty());
+    match crate::media::images::run_generate(ctx.app, model, &json!({"prompt": prompt})).await {
+        Ok((body, provider)) => {
+            let url = body["data"][0]["url"].as_str().map(String::from);
+            info!(%provider, "image_generation served");
+            Ok(Ran {
+                model_output: match &url {
+                    Some(url) => format!("Generated image: {url}"),
+                    None => "Generated an image, but the provider returned no URL.".into(),
+                },
+                client: ClientRender {
+                    blocks: Vec::new(),
+                    marker: json!({"id": ctx.call_id, "provider": provider, "url": url}),
+                },
+            })
+        }
+        Err(e) => {
+            warn!(error = %e, "image_generation failed");
+            Ok(Ran {
+                model_output: format!("Image generation failed: {e}"),
+                client: ClientRender {
+                    blocks: Vec::new(),
+                    marker: json!({"id": ctx.call_id, "model": model}),
+                },
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +596,7 @@ mod tests {
         assert_eq!(Tool::WebFetch.name(), "web_fetch");
         assert_eq!(Tool::Datetime.name(), "datetime");
         assert_eq!(Tool::SearchModels.name(), "search_models");
+        assert_eq!(Tool::ImageGeneration.name(), "image_generation");
     }
 
     /// datetime is clock- and zone-only: the same fixed instant read as UTC
@@ -602,6 +672,7 @@ mod tests {
         assert!(!Tool::WebSearch.servable(&none), "no search pool");
         assert!(!Tool::WebFetch.servable(&none), "no fetch pool");
         assert!(Tool::Datetime.servable(&none), "datetime needs nothing");
+        assert!(!Tool::ImageGeneration.servable(&none), "no image chain");
 
         let search = mock_app(
             r#"
@@ -757,6 +828,52 @@ mod tests {
         // No match is a report, not an unserved call.
         let ran = Tool::SearchModels.execute(&ctx, &json!({"query": "nope"})).await.unwrap();
         assert!(ran.model_output.contains("0 of 3"), "{}", ran.model_output);
+    }
+
+    /// image_generation runs the image media walk and hands the model the URL
+    /// the provider answered with; the generation is a media cost, not a chat
+    /// one.
+    #[tokio::test]
+    async fn image_generation_returns_the_image_url_from_a_mock_provider() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/img",
+            post(|| async {
+                axum::Json(json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.mock]
+                [providers.mock.media]
+                images_url = "http://{addr}/img"
+                image_models = ["m"]
+                [media]
+                image = ["mock/m"]
+                "#
+            ),
+            "image_generation",
+        );
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::ImageGeneration
+            .execute(&ctx, &json!({"prompt": "a cat"}))
+            .await
+            .expect("a configured image chain serves the call");
+        assert!(ran.model_output.contains("https://x/y.png"), "{}", ran.model_output);
+        assert!(ran.client.blocks.is_empty(), "no Anthropic block for image_generation");
+    }
+
+    /// A prompt-less call is malformed, not a failure to report back.
+    #[tokio::test]
+    async fn image_generation_without_a_prompt_is_unserved() {
+        let app = mock_app("[server]", "image_generation_no_prompt");
+        let ctx = ToolCtx::new(&app, "c");
+        assert!(Tool::ImageGeneration.execute(&ctx, &json!({})).await.is_err());
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
