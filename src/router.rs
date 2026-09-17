@@ -12,9 +12,10 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::catalog::{Candidate, Catalog};
-use crate::config::{Config, ErrorAction, WireFormat};
+use crate::config::{Config, ErrorAction, ServerToolsConfig, WireFormat};
 use crate::secrets::Secrets;
 use crate::state::State;
+use crate::translate::server_tools;
 use crate::translate::sse::SseParser;
 use crate::translate::think::ThinkFilter;
 use crate::translate::tool_text::ToolTextFilter;
@@ -428,7 +429,7 @@ pub async fn handle_chat(
         + estimate_tokens(&payload["system"])
         + estimate_tokens(&payload["tools"]);
     let wants_tools = payload["tools"].as_array().is_some_and(|a| !a.is_empty());
-    let server_tools = openai_unservable_server_tools(&payload);
+    let server_tools = openai_unservable_server_tools(&payload, &app.cfg.server_tools);
 
     let mut skipped: Vec<String> = Vec::new();
     let multi = candidates.len() > 1;
@@ -2203,23 +2204,25 @@ fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
     v.to_string()
 }
 
-/// Anthropic server / Anthropic-defined tools pxy cannot represent on an
-/// OpenAI upstream: entries with a dated `type` and no `input_schema` (their
-/// schemas live server-side, so the translator's function mapping has nothing
-/// to send — code_execution_*, bash_*, text_editor_*, computer_*).
-/// web_search is excluded: pxy substitutes a real function and serves it.
-/// Anthropic-format upstreams are unaffected — the tools pass through and the
-/// upstream answers for itself.
-fn openai_unservable_server_tools(payload: &Value) -> Vec<String> {
+/// Declared server / Anthropic-defined tools pxy cannot serve on an OpenAI
+/// upstream: entries with a `type` that isn't `function`/`custom` and no
+/// `input_schema` (their schemas live server-side, so the translator's
+/// function mapping has nothing to send — code_execution_*, bash_*,
+/// text_editor_*, computer_*). Whether pxy can serve a declared server tool is
+/// the registry and `[server_tools] enabled`'s call, not a bare name prefix:
+/// [`server_tool_served`] asks both, so a tool left out of `enabled` is
+/// unservable. Anthropic-format upstreams are unaffected — the tools pass
+/// through and the upstream answers for itself.
+fn openai_unservable_server_tools(payload: &Value, cfg: &ServerToolsConfig) -> Vec<String> {
     payload["tools"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|t| !t["input_schema"].is_object())
         .filter(|t| {
-            t["type"]
-                .as_str()
-                .is_some_and(|ty| ty != "function" && ty != "custom" && !ty.starts_with("web_search"))
+            t["type"].as_str().is_some_and(|ty| {
+                ty != "function" && ty != "custom" && !server_tool_served(ty, cfg)
+            })
         })
         .map(|t| {
             t["name"]
@@ -2229,6 +2232,22 @@ fn openai_unservable_server_tools(payload: &Value) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// Is this declared tool type one pxy serves right now? Three things must
+/// hold: the registry maps the spelling, the tool is `enabled`, and the
+/// translator can actually inject it. Until the translators inject from the
+/// registry (t6) only the native `web_search` family is emitted, so an
+/// `openrouter:web_search` stays unservable rather than being classified
+/// served and then dropped from the OpenAI body.
+fn server_tool_served(ty: &str, cfg: &ServerToolsConfig) -> bool {
+    if !ty.starts_with("web_search") {
+        return false;
+    }
+    let Some(tool) = server_tools::from_type(ty) else { return false };
+    cfg.enabled
+        .iter()
+        .any(|name| server_tools::from_type(&format!("pxy:{name}")) == Some(tool))
 }
 
 /// Tool names the request declared, in either dialect's shape. None when the
@@ -3185,6 +3204,29 @@ mod tests {
         assert!(!loop_.pending().is_empty());
         loop_.uses_left = 0;
         assert!(loop_.pending().is_empty());
+    }
+
+    /// `[server_tools] enabled` gates servability: a spelling the registry
+    /// knows is still unservable when its tool is not enabled. An
+    /// `openrouter:` spelling stays unservable meanwhile, because the
+    /// translators do not inject it yet.
+    #[test]
+    fn enabled_gates_servability() {
+        let payload = json!({"tools": [
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"type": "openrouter:web_search"},
+            {"type": "openrouter:web_fetch"},
+        ]});
+        let default = ServerToolsConfig::default();
+        assert_eq!(
+            openai_unservable_server_tools(&payload, &default),
+            vec!["openrouter:web_search", "openrouter:web_fetch"]
+        );
+        let none = ServerToolsConfig { enabled: vec![], ..default };
+        assert_eq!(
+            openai_unservable_server_tools(&payload, &none),
+            vec!["web_search", "openrouter:web_search", "openrouter:web_fetch"]
+        );
     }
 
     /// A chunk with no tool calls at all comes back byte-identical.
@@ -5156,6 +5198,110 @@ mod tests {
         let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
         assert_eq!(status, 400, "a deterministic no must not read as rate limiting: {body}");
         assert_eq!(*calls.lock().unwrap(), 0, "no upstream call may be spent on it");
+    }
+
+    /// `[server_tools] enabled` and the registry decide which declared server
+    /// tools pxy can serve, but only the spellings the translator injects
+    /// count: an `openrouter:web_fetch` (no executor) or `openrouter:web_search`
+    /// (executor present, but not injected yet) is refused on a single OpenAI
+    /// candidate rather than silently dropped from the body, and skipped on a
+    /// walk so an Anthropic peer can take it.
+    #[tokio::test]
+    async fn server_tool_servability_follows_the_registry() {
+        use axum::routing::post;
+        let oa_calls = Arc::new(std::sync::Mutex::new(0u32));
+        let oa = oa_calls.clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new()
+            .route(
+                "/oa",
+                post(move |_body: axum::Json<Value>| {
+                    let oa = oa.clone();
+                    async move {
+                        *oa.lock().unwrap() += 1;
+                        axum::Json(json!({
+                            "choices": [{"index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/anthropic",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({
+                            "id": "m1", "type": "message", "role": "assistant",
+                            "model": "big", "content": [{"type": "text", "text": "ran it"}],
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 5, "output_tokens": 2},
+                        }))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.free]
+                base_url = "{base}/oa"
+                models = ["small"]
+                [providers.paid]
+                base_url = "{base}/anthropic"
+                format = "anthropic"
+                models = ["big"]
+                [groups.auto]
+                models = ["free/small", "paid/big"]
+                "#
+            ),
+            "server_tool_registry",
+        );
+
+        // Alone on an OpenAI candidate there is no peer to hand a spelling pxy
+        // cannot inject to: 400, with no upstream call spent.
+        for ty in ["openrouter:web_fetch", "openrouter:web_search"] {
+            let payload = json!({
+                "model": "free/small", "max_tokens": 100,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": ty}],
+            });
+            let out =
+                handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                    .await;
+            let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
+            assert_eq!(status, 400, "{ty}: {body}");
+            assert!(body["error"]["message"].as_str().unwrap().contains(ty), "{body}");
+        }
+        assert_eq!(*oa_calls.lock().unwrap(), 0, "a refused request must spend no call");
+
+        // On a walk the OpenAI candidate is pre-filtered and the Anthropic peer
+        // receives the tool intact.
+        let payload = json!({
+            "model": "auto", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "fetch"}],
+            "tools": [{"type": "openrouter:web_fetch"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, provider, .. } = out else { panic!("expected JSON") };
+        assert_eq!(status, 200);
+        assert_eq!(provider.as_deref(), Some("paid/big"));
+        assert_eq!(*oa_calls.lock().unwrap(), 0, "the OpenAI candidate must be skipped");
+        let bodies = seen.lock().unwrap();
+        assert!(
+            bodies[0]["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "openrouter:web_fetch")),
+            "the unservable tool must reach the Anthropic peer intact: {:?}",
+            bodies[0]["tools"]
+        );
     }
 
     /// When every candidate is cooling, the terminal 429 must
