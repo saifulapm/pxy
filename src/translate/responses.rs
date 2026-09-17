@@ -498,16 +498,25 @@ impl StreamState {
             self.usage = TokenUsage::from_openai(&chunk["usage"]);
         }
 
-        // pxy's marker for a search it ran itself
-        // (router::continue_after_server_calls). Replayed here as the Responses
-        // API's own `web_search_call` item so the client shows the query
-        // instead of a silent gap.
-        let marker = server_tools::function_name(server_tools::Tool::WebSearch);
-        if let Some(ws) = chunk.get(marker.as_str()).filter(|v| v.is_object()) {
-            out.push_str(&self.web_search_call(
-                ws["id"].as_str().unwrap_or("ws_pxy"),
-                ws["query"].as_str().unwrap_or(""),
-            ));
+        // pxy's marker for a tool it ran itself
+        // (router::continue_after_server_calls): an empty-choices chunk keyed
+        // by the tool's reserved function name. web_search has a documented
+        // Responses item, so it is replayed as the API's own `web_search_call`
+        // and the client shows the query instead of a silent gap. A tool with
+        // no such item (web_fetch, datetime) is swallowed: the client still
+        // gets the model's answer, and the marker must not fall through to the
+        // usage-chunk branch and complete the response before it.
+        for (key, value) in chunk.as_object().into_iter().flatten() {
+            let Some(tool) = server_tools::Tool::from_function_name(key) else { continue };
+            if !value.is_object() {
+                continue;
+            }
+            if tool == server_tools::Tool::WebSearch {
+                out.push_str(&self.web_search_call(
+                    value["id"].as_str().unwrap_or("ws_pxy"),
+                    value["query"].as_str().unwrap_or(""),
+                ));
+            }
             return out;
         }
 
@@ -1068,5 +1077,37 @@ mod tests {
         // completed output holds reasoning item then message item
         let completed_line = c.lines().find(|l| l.contains("response.completed")).unwrap_or("");
         assert!(completed_line.is_empty() || c.contains("reasoning"));
+    }
+
+    /// A served tool's marker chunk: web_search has a documented Responses
+    /// item and is replayed as one; web_fetch and datetime have none and are
+    /// swallowed. Either way the empty-choices marker must not be mistaken for
+    /// the trailing usage chunk and complete the response before the model
+    /// answers.
+    #[test]
+    fn served_tool_markers_render_or_swallow_without_completing() {
+        for (name, rendered) in
+            [("pxy_web_search", true), ("pxy_web_fetch", false), ("pxy_datetime", false)]
+        {
+            let mut st = StreamState::new(1);
+            st.on_data(r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#);
+            // A marker arrives while a usage chunk is still outstanding — the
+            // shape that used to complete the response early.
+            st.awaiting_usage = true;
+            let chunk = json!({
+                "object": "chat.completion.chunk",
+                "choices": [],
+                name: {"id": "ws_1", "query": "q", "url": "https://e/x"},
+            });
+            let out = st.on_data(&chunk.to_string());
+            assert!(!out.contains("response.completed"), "{name} completed early: {out}");
+            assert!(!out.contains(name), "{name} must not leak to the client: {out}");
+            if rendered {
+                assert!(out.contains("\"web_search_call\""), "{name}: {out}");
+                assert!(out.contains("\"query\":\"q\""), "{name}: {out}");
+            } else {
+                assert!(out.is_empty(), "{name} has no item to render: {out}");
+            }
+        }
     }
 }
