@@ -5598,6 +5598,119 @@ mod tests {
         );
     }
 
+    /// search_models and image_generation render through the same Chat
+    /// Completions path as datetime: the reserved call is stripped, no `pxy_*`
+    /// name reaches the client, and the client sees one answer. The image call
+    /// lands on the media walk (the mock provider), not the chat upstream.
+    #[tokio::test]
+    async fn catalog_and_image_tools_are_served_without_leaking_a_pxy_name() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let chats = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = chats.clone();
+        let image_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let images = image_calls.clone();
+        let router = axum::Router::new()
+            .route(
+                "/m",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        let n = {
+                            let mut v = seen.lock().unwrap();
+                            v.push(body);
+                            v.len() - 1
+                        };
+                        let sse = match n {
+                            0 => concat!(
+                                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                                "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                                "\"function\":{\"name\":\"pxy_search_models\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                                "data: [DONE]\n\n",
+                            ),
+                            1 => concat!(
+                                "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                                "{\"index\":0,\"id\":\"call_2\",\"type\":\"function\",",
+                                "\"function\":{\"name\":\"pxy_image_generation\",\"arguments\":\"{\\\"prompt\\\":\\\"a cat\\\"}\"}}]}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                                "data: [DONE]\n\n",
+                            ),
+                            _ => concat!(
+                                "data: {\"id\":\"c3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                                "data: [DONE]\n\n",
+                            ),
+                        };
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .unwrap()
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/img",
+                post(move || {
+                    let images = images.clone();
+                    async move {
+                        images.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [providers.p.media]
+                images_url = "{base}/img"
+                image_models = ["im"]
+                [media]
+                image = ["p/im"]
+                [groups.free]
+                models = ["p/m"]
+                "#
+            ),
+            "catalog_image_chat",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [{"type": "pxy:search_models"}, {"type": "pxy:image_generation"}],
+            "max_tool_calls": 4,
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("done"), "{text}");
+        assert!(!text.contains("pxy_"), "a Chat Completions client must see no pxy_* name: {text}");
+        assert!(!text.contains("\"tool_calls\""), "reserved calls must be stripped: {text}");
+        assert_eq!(
+            image_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the image walk ran once"
+        );
+        let bodies = chats.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "search, image, then the answer");
+        let names: Vec<&str> = bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"pxy_search_models"), "{names:?}");
+        assert!(names.contains(&"pxy_image_generation"), "{names:?}");
+    }
+
     /// web_fetch is offered only where pxy can run it: a fetch provider is
     /// configured. Without one the injected function is dropped rather than
     /// handed to the model to call into nothing.

@@ -960,6 +960,25 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], reserved);
     }
 
+    /// Each declared served tool becomes exactly one reserved function in the
+    /// chat body the router runs, whatever spelling declared it — the request
+    /// half of "one rendering path per tool per dialect".
+    #[test]
+    fn catalog_and_image_tools_convert_to_their_reserved_functions() {
+        let chat = request(&json!({
+            "input": [],
+            "tools": [
+                {"type": "pxy:search_models"},
+                {"type": "openrouter:experimental__search_models"},
+                {"type": "pxy:image_generation"},
+            ],
+        }));
+        let tools = chat["tools"].as_array().unwrap();
+        let names: Vec<&str> =
+            tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert_eq!(names, vec!["pxy_search_models", "pxy_image_generation"], "{chat}");
+    }
+
     /// image_generation and friends still have no equivalent, and a hosted
     /// tool mapped to a function would reach the client as a call it can't run.
     #[test]
@@ -1088,15 +1107,19 @@ mod tests {
     }
 
     /// A served tool's marker chunk: web_search has a documented Responses
-    /// item and is replayed as one; web_fetch and datetime have none and are
-    /// swallowed. Either way the empty-choices marker must not be mistaken for
-    /// the trailing usage chunk and complete the response before the model
-    /// answers.
+    /// item and is replayed as one; every other tool — web_fetch, datetime,
+    /// search_models, image_generation — has none and is swallowed. Either way
+    /// the empty-choices marker must not be mistaken for the trailing usage
+    /// chunk and complete the response before the model answers.
     #[test]
     fn served_tool_markers_render_or_swallow_without_completing() {
-        for (name, rendered) in
-            [("pxy_web_search", true), ("pxy_web_fetch", false), ("pxy_datetime", false)]
-        {
+        for (name, rendered) in [
+            ("pxy_web_search", true),
+            ("pxy_web_fetch", false),
+            ("pxy_datetime", false),
+            ("pxy_search_models", false),
+            ("pxy_image_generation", false),
+        ] {
             let mut st = StreamState::new(1);
             st.on_data(r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#);
             // A marker arrives while a usage chunk is still outstanding — the
