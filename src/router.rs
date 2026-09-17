@@ -2095,8 +2095,9 @@ struct StreamCtx {
     search: Option<SearchLoop>,
 }
 
-/// Accumulates the model's calls to `web_search::TOOL_NAME` while stripping
-/// them from the chunks, so the client never sees a tool_use it can't run.
+/// Accumulates the model's calls to a reserved `pxy_*` server function while
+/// stripping them from the chunks, so the client never sees a tool_use it
+/// can't run.
 #[derive(Default)]
 struct SearchCallFilter {
     /// openai tool_call index -> (id, arguments so far). The function name
@@ -2139,7 +2140,17 @@ impl SearchLoop {
     }
 }
 
-/// Strip calls to the injected search function out of an openai chunk,
+/// The prefix pxy reserves for the OpenAI functions it injects for served
+/// tools. A client tool that merely shares a tool's own name (`web_search`)
+/// never carries it, so it is never intercepted.
+const SERVER_CALL_PREFIX: &str = "pxy_";
+
+/// Is this upstream function name one pxy reserved for a server tool?
+fn is_server_call(name: &str) -> bool {
+    name.starts_with(SERVER_CALL_PREFIX)
+}
+
+/// Strip calls to a reserved `pxy_*` server function out of an openai chunk,
 /// remembering id + arguments. Returns the rewritten chunk.
 fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(data) else {
@@ -2160,7 +2171,7 @@ fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
         for call in calls {
             let idx = call["index"].as_u64().unwrap_or(0);
             let name = call["function"]["name"].as_str().unwrap_or("");
-            if name != web_search::TOOL_NAME && !f.ours.contains_key(&idx) {
+            if !is_server_call(name) && !f.ours.contains_key(&idx) {
                 if !name.is_empty() {
                     f.saw_other = true;
                 }
@@ -3081,6 +3092,44 @@ mod tests {
         assert!(v["choices"][0]["finish_reason"].is_null(), "{out}");
         assert_eq!(f.ours[&0], ("call_1".into(), "{\"query\":\"rust\"}".into()));
         assert!(!f.saw_other);
+    }
+
+    /// The filter is generic: any reserved `pxy_*` function the upstream calls
+    /// is captured and stripped, not only `web_search`.
+    #[test]
+    fn any_reserved_server_call_is_stripped() {
+        let mut f = SearchCallFilter::default();
+        let out = rewrite_chunk_search(
+            &json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_9", "type": "function",
+                "function": {"name": "pxy_web_fetch", "arguments": "{\"url\":\"https://example.com\"}"}
+            }]}}]})
+            .to_string(),
+            &mut f,
+        );
+        assert!(!out.contains("tool_calls"), "{out}");
+        assert_eq!(
+            f.ours[&0],
+            ("call_9".into(), "{\"url\":\"https://example.com\"}".into())
+        );
+        assert!(!f.saw_other);
+    }
+
+    /// A client tool that merely shares a served tool's own name is not
+    /// reserved: only the `pxy_` prefix marks a function pxy injected, so the
+    /// call reaches the client untouched and cancels the search.
+    #[test]
+    fn unprefixed_client_tool_reaches_the_client() {
+        let mut f = SearchCallFilter::default();
+        let data = json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0, "id": "c1",
+            "function": {"name": "web_search", "arguments": "{}"}
+        }]}}]})
+        .to_string();
+        let out = rewrite_chunk_search(&data, &mut f);
+        assert_eq!(out, data);
+        assert!(f.ours.is_empty());
+        assert!(f.saw_other);
     }
 
     /// A client tool called in the same turn is forwarded untouched, and its
