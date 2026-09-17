@@ -5623,6 +5623,115 @@ mod tests {
         );
     }
 
+    /// A disabled tool is unservable whatever dialect declared it: on a lone
+    /// OpenAI candidate that is an honest 400 up front, not a silent drop.
+    #[tokio::test]
+    async fn a_disabled_served_tool_is_refused_on_a_single_candidate() {
+        let app = test_app(
+            r#"
+            [server]
+            [server_tools]
+            enabled = ["web_search"]
+            [providers.p]
+            base_url = "https://unused.example/m"
+            models = ["m"]
+            [groups.free]
+            models = ["p/m"]
+            "#,
+            "disabled_tools",
+        );
+        for ty in ["pxy:web_fetch", "pxy:datetime"] {
+            let payload = json!({
+                "model": "free",
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": ty}],
+            });
+            let out =
+                handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+                    .await;
+            let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
+            assert_eq!(status, 400, "{ty}: {body}");
+            assert!(body["error"]["message"].as_str().unwrap().contains(ty), "{body}");
+        }
+    }
+
+    /// Anthropic Messages has no client result block for web_fetch or
+    /// datetime, so they are never offered there: the injected function is
+    /// stripped before the wire, while web_search still goes through.
+    #[tokio::test]
+    async fn anthropic_messages_never_receives_web_fetch_or_datetime() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        // Both executors are configured, so nothing is unservable for lack of
+        // a provider: only the dialect rules web_fetch and datetime out.
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                [[search.providers]]
+                name = "brave"
+                kind = "brave"
+                api_key = "k"
+                [[fetch.providers]]
+                name = "jina"
+                kind = "jina-reader"
+                api_key = "k"
+                "#
+            ),
+            "anthropic_no_fetch",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [
+                {"type": "pxy:web_fetch"},
+                {"type": "pxy:datetime"},
+                {"type": "web_search_20250305", "name": "web_search"},
+            ],
+        });
+        let out =
+            handle_chat(app, ClientFormat::Anthropic, payload, ClientContext::default()).await;
+        if let Outcome::Stream { body, .. } = out {
+            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        }
+        let bodies = seen.lock().unwrap();
+        let names: Vec<&str> = bodies[0]["tools"]
+            .as_array()
+            .expect("web_search must survive")
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"pxy_web_search"), "{names:?}");
+        assert!(!names.contains(&"pxy_web_fetch"), "{names:?}");
+        assert!(!names.contains(&"pxy_datetime"), "{names:?}");
+    }
+
     /// `[server_tools] enabled` and the registry decide which declared server
     /// tools pxy can serve: an `openrouter:image_generation` (no registry
     /// entry) is refused on a single OpenAI candidate rather than silently
