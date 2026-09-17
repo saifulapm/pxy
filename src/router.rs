@@ -1145,9 +1145,10 @@ async fn try_candidate_inner(
     // streaming upstream anyway (force_stream below) and re-assembling its
     // JSON from the translated stream: a non-streaming turn
     // must not silently lose the search it asked for.
+    let server_function = server_tools::function_name(server_tools::Tool::WebSearch);
     let has_search_tool = body["tools"]
         .as_array()
-        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME));
+        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == server_function.as_str()));
     let search_served = has_search_tool
         && upstream_format == WireFormat::Openai
         && !app.cfg.search.providers.is_empty();
@@ -1243,8 +1244,8 @@ async fn try_candidate_inner(
     // follow-up call replays this exact request with the results appended.
     // The tool reaches the wire only if pxy will intercept it — that is the
     // invariant this site enforces (the strip below is its other half).
-    let search = search_served.then(|| SearchLoop {
-        filter: SearchCallFilter::default(),
+    let search = search_served.then(|| ServerToolLoop {
+        filter: ServerCallFilter::default(),
         uses_left: web_search::plan(payload).map_or(web_search::DEFAULT_MAX_USES, |p| p.max_uses),
         url: prepared.url.clone(),
         headers: prepared.headers.clone(),
@@ -1256,7 +1257,7 @@ async fn try_candidate_inner(
         // tool_use for a tool it never declared, which wedges the turn.
         // Drop it and let the model answer without search.
         if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
-            tools.retain(|t| t["function"]["name"] != web_search::TOOL_NAME);
+            tools.retain(|t| t["function"]["name"] != server_function.as_str());
             if tools.is_empty() {
                 body.as_object_mut().map(|o| o.remove("tools"));
             }
@@ -2091,16 +2092,16 @@ struct StreamCtx {
     /// timeout (a long turn must not die at timeout_secs), so this is the
     /// death signal instead: silence for this long ends the stream.
     stall: Duration,
-    /// Present when the request carried the web_search server tool and the
-    /// upstream speaks OpenAI: pxy runs the search and continues the turn.
-    search: Option<SearchLoop>,
+    /// Present when the request carried a served server tool and the upstream
+    /// speaks OpenAI: pxy runs the tool and continues the turn.
+    search: Option<ServerToolLoop>,
 }
 
 /// Accumulates the model's calls to a reserved `pxy_*` server function while
 /// stripping them from the chunks, so the client never sees a tool_use it
 /// can't run.
 #[derive(Default)]
-struct SearchCallFilter {
+struct ServerCallFilter {
     /// openai tool_call index -> (id, arguments so far). The function name
     /// only rides the first chunk of a call, so later chunks are matched on
     /// the index instead.
@@ -2114,10 +2115,10 @@ struct SearchCallFilter {
     saw_other: bool,
 }
 
-/// The web_search server tool's loop: what the model asked for, what's left of
-/// its budget, and the request to replay once results are in.
-struct SearchLoop {
-    filter: SearchCallFilter,
+/// The served-tool loop: what the model asked for, what's left of its budget,
+/// and the request to replay once results are in.
+struct ServerToolLoop {
+    filter: ServerCallFilter,
     uses_left: u64,
     url: String,
     headers: Vec<(String, String)>,
@@ -2125,7 +2126,7 @@ struct SearchLoop {
     timeout: Duration,
 }
 
-impl SearchLoop {
+impl ServerToolLoop {
     /// Every captured server call this turn, lowest tool-call index first: a
     /// model may issue SEVERAL in one turn (parallel calls), and running only
     /// an arbitrary one silently lost the model's other queries. Capped by
@@ -2304,7 +2305,7 @@ fn is_server_call(name: &str) -> bool {
 
 /// Strip calls to a reserved `pxy_*` server function out of an openai chunk,
 /// remembering id + arguments. Returns the rewritten chunk.
-fn rewrite_chunk_search(data: &str, f: &mut SearchCallFilter) -> String {
+fn rewrite_chunk_search(data: &str, f: &mut ServerCallFilter) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(data) else {
         return data.to_string();
     };
@@ -2400,16 +2401,11 @@ fn openai_unservable_server_tools(payload: &Value, cfg: &ServerToolsConfig) -> V
         .collect()
 }
 
-/// Is this declared tool type one pxy serves right now? Three things must
-/// hold: the registry maps the spelling, the tool is `enabled`, and the
-/// translator can actually inject it. Until the translators inject from the
-/// registry (t6) only the native `web_search` family is emitted, so an
-/// `openrouter:web_search` stays unservable rather than being classified
-/// served and then dropped from the OpenAI body.
+/// Is this declared tool type one pxy serves right now? The registry maps the
+/// spelling and `[server_tools] enabled` gates it. The translator injects one
+/// reserved function per served tool, and the router strips it when no
+/// upstream can run it.
 fn server_tool_served(ty: &str, cfg: &ServerToolsConfig) -> bool {
-    if !ty.starts_with("web_search") {
-        return false;
-    }
     let Some(tool) = server_tools::from_type(ty) else { return false };
     cfg.enabled
         .iter()
@@ -2685,7 +2681,7 @@ impl StreamCtx {
     /// (then the turn closes normally). A tool failure is reported to the
     /// model AND to the client rather than aborting: an error block is what
     /// the real API sends too.
-    async fn continue_after_search(&mut self) -> Option<Bytes> {
+    async fn continue_after_server_calls(&mut self) -> Option<Bytes> {
         let calls = self.search.as_ref()?.pending_calls();
         if calls.is_empty() {
             return None;
@@ -2701,7 +2697,7 @@ impl StreamCtx {
 
         let search = self.search.as_mut()?;
         search.uses_left -= queued;
-        search.filter = SearchCallFilter::default();
+        search.filter = ServerCallFilter::default();
 
         // The model's own view of the turn: it called the functions, these
         // are what they returned — one assistant message carrying ALL calls,
@@ -2889,7 +2885,7 @@ async fn stream_outcome(
     input_estimate: u64,
     tool_names: Option<std::collections::HashSet<String>>,
     declared_names: Option<std::collections::HashSet<String>>,
-    search: Option<SearchLoop>,
+    search: Option<ServerToolLoop>,
     fwd_headers: Headers,
 ) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
@@ -2994,9 +2990,9 @@ async fn stream_outcome(
                 Some((Ok(tail), ctx))
             }
             Ok(None) => {
-                // A queued web_search swaps in a fresh upstream response and
+                // A queued server call swaps in a fresh upstream response and
                 // keeps the same client stream going.
-                if let Some(blocks) = ctx.continue_after_search().await {
+                if let Some(blocks) = ctx.continue_after_server_calls().await {
                     return Some((Ok(blocks), ctx));
                 }
                 ctx.done = true;
@@ -3186,11 +3182,11 @@ mod tests {
     /// close the turn as `stop_reason: tool_use` with nothing to answer.
     #[test]
     fn search_call_is_stripped_from_the_stream() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         let out = rewrite_chunk_search(
             &json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
                 "index": 0, "id": "call_1", "type": "function",
-                "function": {"name": web_search::TOOL_NAME, "arguments": "{\"query\":"}
+                "function": {"name": server_tools::function_name(server_tools::Tool::WebSearch), "arguments": "{\"query\":"}
             }]}}]})
             .to_string(),
             &mut f,
@@ -3215,7 +3211,7 @@ mod tests {
     /// is captured and stripped, not only `web_search`.
     #[test]
     fn any_reserved_server_call_is_stripped() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         let out = rewrite_chunk_search(
             &json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
                 "index": 0, "id": "call_9", "type": "function",
@@ -3237,7 +3233,7 @@ mod tests {
     /// call reaches the client untouched and cancels the search.
     #[test]
     fn unprefixed_client_tool_reaches_the_client() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         let data = json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
             "index": 0, "id": "c1",
             "function": {"name": "web_search", "arguments": "{}"}
@@ -3254,10 +3250,10 @@ mod tests {
     /// first and searches on the following turn.
     #[test]
     fn client_tool_calls_survive_and_cancel_the_search() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         let out = rewrite_chunk_search(
             &json!({"choices": [{"index": 0, "delta": {"tool_calls": [
-                {"index": 0, "id": "c1", "function": {"name": web_search::TOOL_NAME, "arguments": "{}"}},
+                {"index": 0, "id": "c1", "function": {"name": server_tools::function_name(server_tools::Tool::WebSearch), "arguments": "{}"}},
                 {"index": 1, "id": "c2", "function": {"name": "Bash", "arguments": "{}"}}
             ]}}]})
             .to_string(),
@@ -3269,7 +3265,7 @@ mod tests {
         assert_eq!(calls[0]["function"]["name"], "Bash");
         assert!(f.saw_other);
 
-        let loop_ = SearchLoop {
+        let loop_ = ServerToolLoop {
             filter: f,
             uses_left: 5,
             url: String::new(),
@@ -3285,12 +3281,12 @@ mod tests {
     /// old single-arbitrary-pick silently dropped the model's other queries.
     #[test]
     fn parallel_search_calls_are_all_pending_lowest_index_first() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         // Insert out of order on purpose.
         f.ours.insert(1, ("call_2".into(), "{\"query\":\"b\"}".into()));
         f.ours.insert(0, ("call_1".into(), "{\"query\":\"a\"}".into()));
         f.ours.insert(2, ("call_3".into(), "{\"query\":\"c\"}".into()));
-        let mut loop_ = SearchLoop {
+        let mut loop_ = ServerToolLoop {
             filter: f,
             uses_left: 3,
             url: String::new(),
@@ -3368,7 +3364,7 @@ mod tests {
     /// the turn is over while the search is still running.
     #[test]
     fn bare_finish_reason_chunk_is_neutralised() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         f.ours.insert(0, ("call_1".into(), "{}".into()));
         let out = rewrite_chunk_search(
             &json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
@@ -3395,7 +3391,7 @@ mod tests {
     /// carries the token counts.
     #[test]
     fn usage_only_chunk_passes_through() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         f.ours.insert(0, ("call_1".into(), "{}".into()));
         let data = json!({"choices": [], "usage": {"prompt_tokens": 5}}).to_string();
         assert_eq!(rewrite_chunk_search(&data, &mut f), data);
@@ -3405,9 +3401,9 @@ mod tests {
     /// budget and the turn closes instead of looping on pxy's search quota.
     #[test]
     fn exhausted_budget_stops_the_loop() {
-        let mut filter = SearchCallFilter::default();
+        let mut filter = ServerCallFilter::default();
         filter.ours.insert(0, ("call_1".into(), "{\"query\":\"x\"}".into()));
-        let mut loop_ = SearchLoop {
+        let mut loop_ = ServerToolLoop {
             filter,
             uses_left: 1,
             url: String::new(),
@@ -3421,9 +3417,8 @@ mod tests {
     }
 
     /// `[server_tools] enabled` gates servability: a spelling the registry
-    /// knows is still unservable when its tool is not enabled. An
-    /// `openrouter:` spelling stays unservable meanwhile, because the
-    /// translators do not inject it yet.
+    /// knows is unservable when its tool is not enabled, whatever dialect
+    /// declared it. A tool the registry does not know stays unservable too.
     #[test]
     fn enabled_gates_servability() {
         let payload = json!({"tools": [
@@ -3434,7 +3429,7 @@ mod tests {
         let default = ServerToolsConfig::default();
         assert_eq!(
             openai_unservable_server_tools(&payload, &default),
-            vec!["openrouter:web_search", "openrouter:web_fetch"]
+            vec!["openrouter:web_fetch"]
         );
         let none = ServerToolsConfig { enabled: vec![], ..default };
         assert_eq!(
@@ -3446,7 +3441,7 @@ mod tests {
     /// A chunk with no tool calls at all comes back byte-identical.
     #[test]
     fn plain_chunks_pass_through_untouched() {
-        let mut f = SearchCallFilter::default();
+        let mut f = ServerCallFilter::default();
         let data = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}).to_string();
         assert_eq!(rewrite_chunk_search(&data, &mut f), data);
         assert_eq!(rewrite_chunk_search("[DONE]", &mut f), "[DONE]");
@@ -3807,7 +3802,7 @@ mod tests {
             r#"{"choices":[{"delta":{"content":5}}]}"#,
         ];
         for data in samples {
-            assert_eq!(rewrite_chunk_search(data, &mut SearchCallFilter::default()), data);
+            assert_eq!(rewrite_chunk_search(data, &mut ServerCallFilter::default()), data);
             let names = declared_tool_names(&json!({"tools": [{"function": {"name": "f"}}]})).unwrap();
             assert_eq!(rewrite_chunk_tools(data, &mut ToolTextFilter::new(names)), data);
             assert_eq!(rewrite_chunk_think(data, &mut ThinkFilter::new()), data);
@@ -5073,7 +5068,7 @@ mod tests {
         assert_eq!(bodies.len(), 1, "expected exactly one upstream call");
         let tools = bodies[0]["tools"].as_array().expect("client tool must survive");
         assert!(
-            !tools.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME),
+            !tools.iter().any(|t| t["function"]["name"] == server_tools::function_name(server_tools::Tool::WebSearch)),
             "pxy_web_search must not be offered when no search provider is configured: {:?}",
             bodies[0]["tools"]
         );
@@ -5120,7 +5115,7 @@ mod tests {
         assert!(
             last["tools"]
                 .as_array()
-                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)),
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == server_tools::function_name(server_tools::Tool::WebSearch))),
             "pxy_web_search must be offered when a search provider IS configured: {:?}",
             last["tools"]
         );
@@ -5201,7 +5196,7 @@ mod tests {
         assert!(
             bodies[0]["tools"]
                 .as_array()
-                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)),
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == server_tools::function_name(server_tools::Tool::WebSearch))),
             "the search function must be offered on a non-streaming turn too: {:?}",
             bodies[0]["tools"]
         );
@@ -5263,7 +5258,7 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0]["stream"].is_null(), "must not stream upstream: {}", bodies[0]);
         let tools = bodies[0]["tools"].as_array().unwrap();
-        assert!(!tools.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME));
+        assert!(!tools.iter().any(|t| t["function"]["name"] == server_tools::function_name(server_tools::Tool::WebSearch)));
         assert!(tools.iter().any(|t| t["function"]["name"] == "Read"));
     }
 
@@ -5415,11 +5410,10 @@ mod tests {
     }
 
     /// `[server_tools] enabled` and the registry decide which declared server
-    /// tools pxy can serve, but only the spellings the translator injects
-    /// count: an `openrouter:web_fetch` (no executor) or `openrouter:web_search`
-    /// (executor present, but not injected yet) is refused on a single OpenAI
-    /// candidate rather than silently dropped from the body, and skipped on a
-    /// walk so an Anthropic peer can take it.
+    /// tools pxy can serve: an `openrouter:web_fetch` (no registry entry) is
+    /// refused on a single OpenAI candidate rather than silently dropped from
+    /// the body, and skipped on a walk so an Anthropic peer can take it. A
+    /// spelling the registry maps is servable, so the translator injects it.
     #[tokio::test]
     async fn server_tool_servability_follows_the_registry() {
         use axum::routing::post;
@@ -5479,7 +5473,7 @@ mod tests {
 
         // Alone on an OpenAI candidate there is no peer to hand a spelling pxy
         // cannot inject to: 400, with no upstream call spent.
-        for ty in ["openrouter:web_fetch", "openrouter:web_search"] {
+        for ty in ["openrouter:web_fetch"] {
             let payload = json!({
                 "model": "free/small", "max_tokens": 100,
                 "messages": [{"role": "user", "content": "x"}],

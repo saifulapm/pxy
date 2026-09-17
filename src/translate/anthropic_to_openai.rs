@@ -3,6 +3,7 @@
 
 use serde_json::{json, Map, Value};
 
+use super::server_tools;
 use super::sse::format_event;
 use super::web_search;
 use super::TokenUsage;
@@ -69,13 +70,13 @@ pub fn request(anthropic: &Value, reasoning_replay: bool) -> Value {
     }
 
     if let Some(tools) = anthropic["tools"].as_array() {
-        let mut mapped: Vec<Value> = tools
+        let mapped: Vec<Value> = tools
             .iter()
             // Server tools (web_search, code_execution, …) carry a `name` but
             // no schema because the API, not the model, runs them. Mapping one
             // to a function yields a zero-argument call the client can't
             // execute, so they never reach the upstream as functions:
-            // web_search is substituted below, the rest are dropped.
+            // the registry serves what it knows, the rest are dropped.
             .filter(|t| t["name"].is_string() && t["input_schema"].is_object())
             .map(|t| {
                 let mut params = t["input_schema"].clone();
@@ -93,18 +94,29 @@ pub fn request(anthropic: &Value, reasoning_replay: bool) -> Value {
                 })
             })
             .collect();
-        // web_search is the one server tool pxy can run itself: it comes back
-        // as a real function, and the router intercepts the calls — for a
-        // non-streaming client too, by running the request through the stream
-        // machinery and re-assembling its JSON. Whether pxy can actually
-        // serve it (search provider configured, upstream format) is the
-        // router's call: attempt() strips the function whenever nothing would
-        // intercept it, so injecting on the dialect evidence alone is safe.
-        if web_search::plan(anthropic).is_some()
-            && !mapped.iter().any(|t| t["function"]["name"] == web_search::TOOL_NAME)
-        {
-            mapped.insert(0, web_search::tool_def());
+        // Server tools pxy can run itself become the reserved function the
+        // router intercepts — for a non-streaming client too, by running the
+        // request through the stream machinery and re-assembling its JSON.
+        // Whether pxy can actually serve one (search provider configured,
+        // upstream format) is the router's call: attempt() strips the function
+        // whenever nothing would intercept it, so injecting on the dialect
+        // evidence alone is safe. One injection per served tool, however many
+        // spellings declared it.
+        let mut reserved: Vec<Value> = Vec::new();
+        for t in tools {
+            let Some(tool) = server_tools::from_type(t["type"].as_str().unwrap_or("")) else {
+                continue;
+            };
+            let name = server_tools::function_name(tool);
+            if mapped.iter().any(|f| f["function"]["name"] == name)
+                || reserved.iter().any(|f| f["function"]["name"] == name)
+            {
+                continue;
+            }
+            reserved.push(server_tools::tool_def(tool, &t["input_schema"]));
         }
+        reserved.extend(mapped);
+        let mapped = reserved;
         if !mapped.is_empty() {
             out.insert("tools".into(), Value::Array(mapped));
         }
@@ -731,13 +743,18 @@ mod tests {
         assert_eq!(out["content"][0]["name"], "bash");
     }
 
+    /// A server tool the registry knows becomes a reserved function pxy can
+    /// intercept, whatever spelling declared it; client tools are untouched and
+    /// every other server tool is dropped: mapped as a function it would reach
+    /// the client as a call for a tool it never registered.
     #[test]
     fn server_tools_are_substituted_or_dropped() {
+        let reserved = server_tools::function_name(server_tools::Tool::WebSearch);
         let req = json!({
             "stream": true,
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+                {"type": "openrouter:web_search"},
                 {"type": "code_execution_20250522", "name": "code_execution"},
                 {"name": "Bash", "input_schema": {"type": "object", "properties": {}}},
             ],
@@ -749,7 +766,8 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec![web_search::TOOL_NAME, "Bash"]);
+        // The registry spelling maps to the reserved function the loop answers.
+        assert_eq!(names, vec![reserved.as_str(), "Bash"]);
         assert_eq!(
             out["tools"][0]["function"]["parameters"]["required"],
             json!(["query"])
@@ -767,7 +785,7 @@ mod tests {
         });
         assert_eq!(
             request(&req, false)["tools"][0]["function"]["name"],
-            web_search::TOOL_NAME
+            server_tools::function_name(server_tools::Tool::WebSearch)
         );
     }
 
