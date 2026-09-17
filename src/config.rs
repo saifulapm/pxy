@@ -172,7 +172,10 @@ impl Default for ServerToolsConfig {
 /// Every tool `translate::server_tools` implements, by canonical name. A tool
 /// added to the registry but not here stays unservable until it is listed.
 fn default_server_tool_names() -> Vec<String> {
-    ["web_search"].into_iter().map(String::from).collect()
+    crate::translate::server_tools::Tool::implemented()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect()
 }
 
 fn default_max_tool_calls() -> u64 {

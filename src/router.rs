@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use futures_util::future::BoxFuture;
 use jiff::Timestamp;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -2107,7 +2106,7 @@ struct ServerCallFilter {
     /// the index instead.
     ours: std::collections::HashMap<u64, (String, String)>,
     /// openai tool_call index -> the reserved function name, captured from
-    /// the first chunk so the continuation can pick the tool's spec.
+    /// the first chunk so the continuation can pick the tool to run.
     names: std::collections::HashMap<u64, String>,
     /// A client tool was called in the same turn. Anthropic's API doesn't run
     /// the search then either — it hands the client tools back first and
@@ -2167,91 +2166,6 @@ struct ServerCall {
     args: String,
 }
 
-/// What running one served call produced: the text the model is shown as the
-/// tool's return and the material the client's transcript records.
-struct Ran {
-    model_output: String,
-    client: ClientRender,
-}
-
-/// The client-facing half of a served call. The loop emits it in the client's
-/// dialect without knowing which tool produced it: an Anthropic stream gets
-/// the blocks, an OpenAI / Responses client gets the marker payload under the
-/// tool's reserved function name.
-struct ClientRender {
-    /// Blocks spliced into an Anthropic stream, in order.
-    blocks: Vec<Value>,
-    /// Payload of the empty-choices marker chunk a Responses client reads.
-    marker: Value,
-}
-
-/// Runs one served call. Boxed so a spec can sit in a list beside the ones a
-/// later tool adds; `None` means the call was malformed and is left unserved,
-/// so the replay only carries the calls pxy actually answered.
-type RunTool = for<'a> fn(&'a App, &'a str, &'a Value) -> BoxFuture<'a, Option<Ran>>;
-
-/// One served tool as the continuation uses it: the reserved function name the
-/// upstream calls and the code that answers one call. web_search is the only
-/// spec today; a second tool is another registry entry and another
-/// [`run_web_search`] arm, not a branch in the continuation.
-struct ToolSpec {
-    name: String,
-    run: RunTool,
-}
-
-/// The served tools this build runs, one spec each.
-fn server_tool_specs() -> Vec<ToolSpec> {
-    vec![ToolSpec {
-        name: server_tools::function_name(server_tools::Tool::WebSearch),
-        run: web_search_run,
-    }]
-}
-
-/// Box `run_web_search` into the spec's function type.
-fn web_search_run<'a>(
-    app: &'a App,
-    call_id: &'a str,
-    args: &'a Value,
-) -> BoxFuture<'a, Option<Ran>> {
-    Box::pin(run_web_search(app, call_id, args))
-}
-
-/// Run one web_search call through the provider walk. Missing or empty query
-/// arguments make it unserved; a provider failure is reported to the model,
-/// the way the real API does.
-async fn run_web_search(app: &App, call_id: &str, args: &Value) -> Option<Ran> {
-    let query = args["query"].as_str().filter(|q| !q.is_empty())?.to_string();
-    let found = crate::media::search::run_search(app, &query, 5, None).await;
-    Some(match &found {
-        Ok((provider, results)) => {
-            info!(%query, %provider, hits = results.len(), "web_search served");
-            Ran {
-                model_output: web_search::results_for_model(results),
-                client: ClientRender {
-                    blocks: vec![
-                        web_search::server_tool_use_block(call_id, &query),
-                        web_search::result_block(call_id, results),
-                    ],
-                    marker: json!({"id": call_id, "query": &query}),
-                },
-            }
-        }
-        Err(e) => {
-            warn!(%query, error = %e, "web_search failed");
-            Ran {
-                model_output: format!("Search failed: {e}"),
-                client: ClientRender {
-                    blocks: vec![
-                        web_search::server_tool_use_block(call_id, &query),
-                        web_search::error_block(call_id),
-                    ],
-                    marker: json!({"id": call_id, "query": &query}),
-                },
-            }
-        }
-    })
-}
-
 /// The replay material one continuation step assembles from the calls it
 /// served: the assistant message's tool_calls, the tool results, and each
 /// call's client render paired with the reserved name the loop emits it
@@ -2259,25 +2173,27 @@ async fn run_web_search(app: &App, call_id: &str, args: &Value) -> Option<Ran> {
 struct Served {
     tool_calls: Vec<Value>,
     tool_results: Vec<Value>,
-    renders: Vec<(String, ClientRender)>,
+    renders: Vec<(String, server_tools::ClientRender)>,
 }
 
-/// Run every captured call through its spec, lowest first. A call no spec
-/// answers, or one whose arguments will not parse, is skipped: the assistant
-/// message carries only the calls pxy actually served, so the replay stays
-/// valid. Returns None when nothing was served.
-async fn serve_calls(specs: &[ToolSpec], app: &App, calls: Vec<ServerCall>) -> Option<Served> {
+/// Run every captured call through its tool, lowest first. A call whose
+/// reserved name maps to no tool, whose arguments will not parse, or whose
+/// executor refuses it is skipped: the assistant message carries only the
+/// calls pxy actually served, so the replay stays valid. Returns None when
+/// nothing was served.
+async fn serve_calls(app: &App, calls: Vec<ServerCall>) -> Option<Served> {
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
-    let mut renders: Vec<(String, ClientRender)> = Vec::new();
+    let mut renders: Vec<(String, server_tools::ClientRender)> = Vec::new();
     for call in calls {
-        let Some(spec) = specs.iter().find(|s| s.name == call.name) else {
+        let Some(tool) = server_tools::Tool::from_function_name(&call.name) else {
             continue;
         };
         let Ok(args) = serde_json::from_str::<Value>(&call.args) else {
             continue;
         };
-        let Some(ran) = (spec.run)(app, &call.id, &args).await else {
+        let ctx = server_tools::ToolCtx::new(app, &call.id);
+        let Ok(ran) = tool.execute(&ctx, &args).await else {
             continue;
         };
         tool_calls.push(json!({
@@ -2288,7 +2204,7 @@ async fn serve_calls(specs: &[ToolSpec], app: &App, calls: Vec<ServerCall>) -> O
         tool_results.push(json!({
             "role": "tool", "tool_call_id": &call.id, "content": ran.model_output,
         }));
-        renders.push((spec.name.clone(), ran.client));
+        renders.push((call.name.clone(), ran.client));
     }
     (!tool_calls.is_empty()).then_some(Served { tool_calls, tool_results, renders })
 }
@@ -2305,7 +2221,7 @@ fn is_server_call(name: &str) -> bool {
 
 /// Strip calls to a reserved `pxy_*` server function out of an openai chunk,
 /// remembering id + arguments. Returns the rewritten chunk.
-fn rewrite_chunk_search(data: &str, f: &mut ServerCallFilter) -> String {
+fn rewrite_chunk_server_calls(data: &str, f: &mut ServerCallFilter) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(data) else {
         return data.to_string();
     };
@@ -2595,7 +2511,7 @@ impl StreamCtx {
                             data = rewrite_chunk_tools(&data, tf);
                         }
                         if let Some(s) = search.as_mut() {
-                            data = rewrite_chunk_search(&data, &mut s.filter);
+                            data = rewrite_chunk_server_calls(&data, &mut s.filter);
                         }
                         out.push_str(&format!("data: {data}\n\n"));
                     }
@@ -2652,7 +2568,7 @@ impl StreamCtx {
                             data = rewrite_chunk_tools(&data, tf);
                         }
                         if let Some(s) = search.as_mut() {
-                            data = rewrite_chunk_search(&data, &mut s.filter);
+                            data = rewrite_chunk_server_calls(&data, &mut s.filter);
                         }
                         out.push_str(&state.on_data(&data));
                     }
@@ -2673,7 +2589,7 @@ impl StreamCtx {
 
     /// End-of-stream flush (upstream may end without a terminal marker).
     /// The upstream call ended on a reserved server-tool call. Run each call
-    /// through its spec, splice the protocol blocks into the client's stream,
+    /// through its tool, splice the protocol blocks into the client's stream,
     /// and re-issue the request with the results appended so the model answers
     /// from them — all inside the one message the client is already reading.
     ///
@@ -2688,12 +2604,12 @@ impl StreamCtx {
         }
         let queued = calls.len() as u64;
 
-        // Run every call through its tool's spec, accumulating the client-side
-        // render and the model-side tool output. A malformed call, or one no
-        // spec answers, is skipped: the synthesized assistant message below
-        // carries only the calls that were actually served, so the protocol
-        // stays valid.
-        let served = serve_calls(&server_tool_specs(), &self.app, calls).await?;
+        // Run every call through its tool, accumulating the client-side
+        // render and the model-side tool output. A malformed call, or one the
+        // registry does not implement, is skipped: the synthesized assistant
+        // message below carries only the calls that were actually served, so
+        // the protocol stays valid.
+        let served = serve_calls(&self.app, calls).await?;
 
         let search = self.search.as_mut()?;
         search.uses_left -= queued;
@@ -3183,7 +3099,7 @@ mod tests {
     #[test]
     fn search_call_is_stripped_from_the_stream() {
         let mut f = ServerCallFilter::default();
-        let out = rewrite_chunk_search(
+        let out = rewrite_chunk_server_calls(
             &json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
                 "index": 0, "id": "call_1", "type": "function",
                 "function": {"name": server_tools::function_name(server_tools::Tool::WebSearch), "arguments": "{\"query\":"}
@@ -3194,7 +3110,7 @@ mod tests {
         assert!(!out.contains("tool_calls"), "{out}");
 
         // Arguments streamed across chunks: later ones carry no name.
-        let out = rewrite_chunk_search(
+        let out = rewrite_chunk_server_calls(
             &json!({"choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {"tool_calls": [{
                 "index": 0, "function": {"arguments": "\"rust\"}"}
             }]}}]})
@@ -3212,7 +3128,7 @@ mod tests {
     #[test]
     fn any_reserved_server_call_is_stripped() {
         let mut f = ServerCallFilter::default();
-        let out = rewrite_chunk_search(
+        let out = rewrite_chunk_server_calls(
             &json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
                 "index": 0, "id": "call_9", "type": "function",
                 "function": {"name": "pxy_web_fetch", "arguments": "{\"url\":\"https://example.com\"}"}
@@ -3239,7 +3155,7 @@ mod tests {
             "function": {"name": "web_search", "arguments": "{}"}
         }]}}]})
         .to_string();
-        let out = rewrite_chunk_search(&data, &mut f);
+        let out = rewrite_chunk_server_calls(&data, &mut f);
         assert_eq!(out, data);
         assert!(f.ours.is_empty());
         assert!(f.saw_other);
@@ -3251,7 +3167,7 @@ mod tests {
     #[test]
     fn client_tool_calls_survive_and_cancel_the_search() {
         let mut f = ServerCallFilter::default();
-        let out = rewrite_chunk_search(
+        let out = rewrite_chunk_server_calls(
             &json!({"choices": [{"index": 0, "delta": {"tool_calls": [
                 {"index": 0, "id": "c1", "function": {"name": server_tools::function_name(server_tools::Tool::WebSearch), "arguments": "{}"}},
                 {"index": 1, "id": "c2", "function": {"name": "Bash", "arguments": "{}"}}
@@ -3311,12 +3227,12 @@ mod tests {
         assert!(loop_.pending().is_empty());
     }
 
-    /// The continuation dispatches a captured call to its spec by reserved
-    /// function name, so a second tool runs through the same path with no
-    /// change to the loop. web_search is the only spec today, so this stands
-    /// in for the tool that lands next.
+    /// The continuation dispatches a captured call through the registry by its
+    /// reserved function name. A reserved name no tool implements, arguments
+    /// that will not parse, and a call the executor refuses are all left
+    /// unserved: the replay may only carry the calls pxy actually answered.
     #[tokio::test]
-    async fn serve_calls_dispatches_a_second_tool_through_its_spec() {
+    async fn serve_calls_leaves_unimplemented_and_unusable_calls_unserved() {
         let app = test_app(
             r#"
             [server]
@@ -3324,39 +3240,32 @@ mod tests {
             base_url = "https://unused.example/m"
             models = ["m"]
             "#,
-            "spec_dispatch",
+            "serve_calls_skip",
         );
-        let specs = [ToolSpec { name: "pxy_web_fetch".to_string(), run: fetch_run }];
-        let calls = vec![ServerCall {
-            name: "pxy_web_fetch".to_string(),
-            id: "call_1".to_string(),
-            args: r#"{"url":"https://example.com"}"#.to_string(),
-        }];
-        let served = serve_calls(&specs, &app, calls).await.expect("the spec runs");
-        assert_eq!(served.tool_calls.len(), 1);
-        assert_eq!(served.tool_calls[0]["function"]["name"], "pxy_web_fetch");
-        assert_eq!(served.tool_results[0]["content"], "fetched https://example.com");
-        assert_eq!(served.renders[0].0, "pxy_web_fetch");
-        assert_eq!(served.renders[0].1.marker["url"], "https://example.com");
-    }
-
-    /// A stand-in for the next served tool: it answers one call without an
-    /// upstream, so the dispatch can be exercised in a unit test.
-    fn fetch_run<'a>(
-        _app: &'a App,
-        _call_id: &'a str,
-        args: &'a Value,
-    ) -> BoxFuture<'a, Option<Ran>> {
-        Box::pin(async move {
-            let url = args["url"].as_str().unwrap_or("");
-            Some(Ran {
-                model_output: format!("fetched {url}"),
-                client: ClientRender {
-                    blocks: vec![json!({"type": "server_tool_use", "id": "call_1"})],
-                    marker: json!({"url": url}),
-                },
-            })
-        })
+        let known = server_tools::function_name(server_tools::Tool::WebSearch);
+        let calls = vec![
+            ServerCall {
+                name: "pxy_not_a_tool".to_string(),
+                id: "call_1".to_string(),
+                args: "{}".to_string(),
+            },
+            // Arguments that are not JSON at all.
+            ServerCall {
+                name: known.clone(),
+                id: "call_2".to_string(),
+                args: "not json".to_string(),
+            },
+            // JSON, but nothing the executor can run.
+            ServerCall {
+                name: known,
+                id: "call_3".to_string(),
+                args: "{}".to_string(),
+            },
+        ];
+        assert!(
+            serve_calls(&app, calls).await.is_none(),
+            "nothing served, so the turn must close normally"
+        );
     }
 
     /// The upstream closes a tool turn with a bare `finish_reason` chunk that
@@ -3366,7 +3275,7 @@ mod tests {
     fn bare_finish_reason_chunk_is_neutralised() {
         let mut f = ServerCallFilter::default();
         f.ours.insert(0, ("call_1".into(), "{}".into()));
-        let out = rewrite_chunk_search(
+        let out = rewrite_chunk_server_calls(
             &json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
                 .to_string(),
             &mut f,
@@ -3379,12 +3288,12 @@ mod tests {
         f.saw_other = true;
         let data =
             json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}).to_string();
-        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
+        assert_eq!(rewrite_chunk_server_calls(&data, &mut f), data);
 
         // So must an ordinary end-of-turn finish.
         f.saw_other = false;
         let data = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}).to_string();
-        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
+        assert_eq!(rewrite_chunk_server_calls(&data, &mut f), data);
     }
 
     /// The trailing usage-only chunk (`choices: []`) must pass through: it
@@ -3394,7 +3303,7 @@ mod tests {
         let mut f = ServerCallFilter::default();
         f.ours.insert(0, ("call_1".into(), "{}".into()));
         let data = json!({"choices": [], "usage": {"prompt_tokens": 5}}).to_string();
-        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
+        assert_eq!(rewrite_chunk_server_calls(&data, &mut f), data);
     }
 
     /// `max_uses` is a hard stop: a model that keeps searching runs out of
@@ -3443,8 +3352,8 @@ mod tests {
     fn plain_chunks_pass_through_untouched() {
         let mut f = ServerCallFilter::default();
         let data = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}).to_string();
-        assert_eq!(rewrite_chunk_search(&data, &mut f), data);
-        assert_eq!(rewrite_chunk_search("[DONE]", &mut f), "[DONE]");
+        assert_eq!(rewrite_chunk_server_calls(&data, &mut f), data);
+        assert_eq!(rewrite_chunk_server_calls("[DONE]", &mut f), "[DONE]");
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -3802,7 +3711,7 @@ mod tests {
             r#"{"choices":[{"delta":{"content":5}}]}"#,
         ];
         for data in samples {
-            assert_eq!(rewrite_chunk_search(data, &mut ServerCallFilter::default()), data);
+            assert_eq!(rewrite_chunk_server_calls(data, &mut ServerCallFilter::default()), data);
             let names = declared_tool_names(&json!({"tools": [{"function": {"name": "f"}}]})).unwrap();
             assert_eq!(rewrite_chunk_tools(data, &mut ToolTextFilter::new(names)), data);
             assert_eq!(rewrite_chunk_think(data, &mut ThinkFilter::new()), data);
