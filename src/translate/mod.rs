@@ -9,6 +9,7 @@ pub mod responses_upstream;
 pub mod server_tools;
 pub mod sse;
 pub mod think;
+pub mod tool_search;
 pub mod tool_text;
 pub mod web_search;
 

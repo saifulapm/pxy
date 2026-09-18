@@ -11,7 +11,7 @@
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use super::web_search;
+use super::{tool_search, web_search};
 use crate::catalog::Catalog;
 use crate::router::{App, ClientContext, ClientFormat, Outcome, SharedApp, handle_chat};
 
@@ -26,6 +26,7 @@ pub enum Tool {
     Advisor,
     Subagent,
     Fusion,
+    ToolSearch,
 }
 
 impl Tool {
@@ -42,6 +43,7 @@ impl Tool {
             Tool::Advisor,
             Tool::Subagent,
             Tool::Fusion,
+            Tool::ToolSearch,
         ]
     }
 
@@ -57,6 +59,7 @@ impl Tool {
             Tool::Advisor => "advisor",
             Tool::Subagent => "subagent",
             Tool::Fusion => "fusion",
+            Tool::ToolSearch => "tool_search",
         }
     }
 
@@ -81,6 +84,7 @@ impl Tool {
             Tool::Advisor => run_advisor(ctx, args).await,
             Tool::Subagent => run_subagent(ctx, args).await,
             Tool::Fusion => run_fusion(ctx, args).await,
+            Tool::ToolSearch => run_tool_search(ctx, args),
         }
     }
 
@@ -107,6 +111,9 @@ impl Tool {
             // additionally needs a panel to convene.
             Tool::Advisor | Tool::Subagent => true,
             Tool::Fusion => !app.cfg.server_tools.fusion_panel.is_empty(),
+            // The search runs over the request's own deferred tools, so it
+            // needs nothing of the app at all.
+            Tool::ToolSearch => true,
         }
     }
 
@@ -117,8 +124,11 @@ impl Tool {
     pub fn served_on(self, client: ClientFormat) -> bool {
         match client {
             ClientFormat::Openai => true,
-            // The advisor has an Anthropic result block; the subagent does not.
-            ClientFormat::Anthropic => matches!(self, Tool::WebSearch | Tool::Advisor),
+            // web_search, the advisor and tool_search have documented
+            // Anthropic result blocks; the subagent and the rest do not.
+            ClientFormat::Anthropic => {
+                matches!(self, Tool::WebSearch | Tool::Advisor | Tool::ToolSearch)
+            }
         }
     }
 
@@ -181,6 +191,9 @@ pub struct ToolCtx<'a> {
     /// The turn's conversation as the upstream sees it, for an advisor
     /// declared with `forward_transcript`.
     pub transcript: Vec<Value>,
+    /// The client function definitions held out of the upstream body this
+    /// turn, for tool_search to match against.
+    pub deferred: Vec<Value>,
 }
 
 impl<'a> ToolCtx<'a> {
@@ -195,6 +208,7 @@ impl<'a> ToolCtx<'a> {
             outer_model: String::new(),
             results_used: 0,
             transcript: Vec::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -510,6 +524,11 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "openrouter:advisor" | "pxy:advisor" => Some(Tool::Advisor),
         "openrouter:subagent" | "pxy:subagent" => Some(Tool::Subagent),
         "openrouter:fusion" | "pxy:fusion" => Some(Tool::Fusion),
+        "openrouter:tool_search" | "pxy:tool_search" | "tool_search" => Some(Tool::ToolSearch),
+        // Anthropic names the matcher in the type. Only the regex one is pxy's;
+        // `tool_search_tool_bm25*` falls through to `None` and is unservable,
+        // because pxy would otherwise answer a BM25 search with regex results.
+        t if t.starts_with("tool_search_tool_regex") => Some(Tool::ToolSearch),
         // The Anthropic native advisor is dated, like its other server tools.
         t if t.starts_with("advisor_") => Some(Tool::Advisor),
         t if t.starts_with("web_search") => Some(Tool::WebSearch),
@@ -700,6 +719,32 @@ pub fn tool_def(tool: Tool, params: &Value) -> Value {
                         },
                     },
                     "required": ["prompt"],
+                },
+            },
+        }),
+        Tool::ToolSearch => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::ToolSearch),
+                "description": "Find tools that are available but not yet loaded. Some of \
+                    this conversation's tools are held back to save context; search for \
+                    them by capability before concluding a task cannot be done, and the \
+                    matches become callable on the next step.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "A regular expression, matched case-insensitively \
+                                against each held-back tool's name, description and argument \
+                                names. Alternate with | to cover synonyms."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "How many tools to reveal at most."
+                        },
+                    },
+                    "required": ["pattern"],
                 },
             },
         }),
@@ -1021,6 +1066,58 @@ fn matching_models(catalog: &Catalog, args: &Value) -> Vec<Value> {
 /// anything but an asserted yes, because an unasserted capability is not a no.
 fn matches_flag(asserted: Option<bool>, want: bool) -> bool {
     if want { asserted == Some(true) } else { asserted != Some(true) }
+}
+
+/// Run one tool_search call over the definitions the router held back this
+/// turn. Nothing outside the request is consulted, so the only unserved call
+/// is one with no pattern at all; an unusable pattern is reported to the
+/// model, which can then write a better one.
+///
+/// The declaration's `max_results` caps the call's own `limit` and stands in
+/// for it when the model sends none.
+fn run_tool_search(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let pattern =
+        args["pattern"].as_str().filter(|p| !p.is_empty()).ok_or("missing pattern")?.to_string();
+    let max_results = ctx.params["max_results"]
+        .as_u64()
+        .unwrap_or(tool_search::DEFAULT_MAX_RESULTS)
+        .clamp(1, 50);
+    let limit = args["limit"].as_u64().unwrap_or(max_results).clamp(1, max_results);
+
+    let (model_output, found, result) =
+        match tool_search::search_deferred(&ctx.deferred, &pattern, limit as usize) {
+            Ok(found) => {
+                info!(%pattern, revealed = found.len(), "tool_search served");
+                let mut output = json!({
+                    "status": "ok",
+                    "found": found,
+                    "total_matches": found.len(),
+                });
+                if !found.is_empty() {
+                    output["note"] = json!("these tools are now available to call");
+                }
+                let block = tool_search::result_block(ctx.call_id, &found);
+                (output, found, block)
+            }
+            Err(e) => {
+                warn!(%pattern, error = %e, "tool_search pattern rejected");
+                let block = tool_search::error_block(ctx.call_id, &e);
+                (json!({"status": "error", "error": e}), Vec::new(), block)
+            }
+        };
+
+    Ok(Ran {
+        model_output: model_output.to_string(),
+        client: ClientRender {
+            blocks: vec![
+                tool_search::server_tool_use_block(ctx.call_id, &pattern, limit),
+                result,
+            ],
+            // The loop reads `found` off the marker to move those definitions
+            // into the continuation body, so it rides every outcome.
+            marker: json!({"id": ctx.call_id, "pattern": &pattern, "found": found}),
+        },
+    })
 }
 
 /// The declaration's own `parameters` object for a tool, when the request
@@ -1426,6 +1523,75 @@ mod tests {
         assert!(!dhaka["function"]["description"].as_str().unwrap().contains("UTC"), "{dhaka}");
     }
 
+    /// Every spelling `wiki:tool-search` lists maps to the tool; the BM25
+    /// variants map to nothing, because pxy matches by regex only and an
+    /// unknown server tool is unservable rather than quietly mis-served.
+    #[test]
+    fn from_type_maps_every_tool_search_spelling_but_not_bm25() {
+        for ty in [
+            "openrouter:tool_search",
+            "pxy:tool_search",
+            "tool_search",
+            "tool_search_tool_regex",
+            "tool_search_tool_regex_20251119",
+        ] {
+            assert_eq!(from_type(ty), Some(Tool::ToolSearch), "{ty}");
+        }
+        for ty in ["tool_search_tool_bm25", "tool_search_tool_bm25_20251119"] {
+            assert_eq!(from_type(ty), None, "{ty}");
+        }
+    }
+
+    /// The search reads the turn's deferred definitions off the context, tells
+    /// the model what it revealed, and leaves the names on the marker for the
+    /// loop and on the blocks for a Messages client.
+    #[tokio::test]
+    async fn tool_search_reveals_matches_and_renders_the_blocks() {
+        let app = mock_app("[server]", "tool_search_reveal");
+        let deferred = vec![
+            json!({"type": "function", "function": {"name": "get_weather", "description": "Conditions for a city."}}),
+            json!({"type": "function", "function": {"name": "send_email", "description": "Deliver a note."}}),
+        ];
+        let ctx = ToolCtx { deferred: deferred.clone(), ..ToolCtx::new(&app, "call_1") };
+
+        let hit = Tool::ToolSearch.execute(&ctx, &json!({"pattern": "weather"})).await.unwrap();
+        let output: Value = serde_json::from_str(&hit.model_output).unwrap();
+        assert_eq!(output["status"], "ok");
+        assert_eq!(output["found"], json!(["get_weather"]));
+        assert_eq!(output["total_matches"], 1);
+        assert_eq!(hit.client.marker["found"], json!(["get_weather"]));
+        assert_eq!(hit.client.blocks[0]["name"], tool_search::ANTHROPIC_NAME);
+        assert_eq!(hit.client.blocks[1]["content"]["tool_references"][0]["tool_name"], "get_weather");
+
+        // No match is an answer, not a failure: the model must stop looking.
+        let miss = Tool::ToolSearch.execute(&ctx, &json!({"pattern": "kubernetes"})).await.unwrap();
+        let output: Value = serde_json::from_str(&miss.model_output).unwrap();
+        assert_eq!(output["found"], json!([]));
+        assert_eq!(output["total_matches"], 0);
+
+        // A pattern the engine rejects reaches the model as an error result.
+        let bad = Tool::ToolSearch.execute(&ctx, &json!({"pattern": "get_("})).await.unwrap();
+        let output: Value = serde_json::from_str(&bad.model_output).unwrap();
+        assert_eq!(output["status"], "error");
+        assert!(
+            output["error"].as_str().unwrap().starts_with("invalid regular expression: "),
+            "{}",
+            bad.model_output
+        );
+        assert_eq!(bad.client.blocks[1]["content"]["error_code"], "invalid_tool_input");
+        assert_eq!(bad.client.marker["found"], json!([]));
+
+        // `limit` on the call is clamped to the declaration's `max_results`.
+        let capped = ToolCtx {
+            deferred,
+            params: json!({"max_results": 1}),
+            ..ToolCtx::new(&app, "call_2")
+        };
+        let both = Tool::ToolSearch.execute(&capped, &json!({"pattern": "e", "limit": 9})).await.unwrap();
+        let output: Value = serde_json::from_str(&both.model_output).unwrap();
+        assert_eq!(output["found"], json!(["get_weather"]));
+    }
+
     /// Each tool's own `max_uses` caps its calls: Anthropic spells it at the
     /// top level, OpenRouter under `parameters`, and a function that merely
     /// shares the name is not the server tool.
@@ -1521,15 +1687,16 @@ mod tests {
     }
 
     /// On Anthropic Messages only the tools with a documented result block are
-    /// offered: web_search and the advisor. web_fetch, datetime, search_models,
-    /// image_generation and the subagent have none.
+    /// offered: web_search, the advisor and tool_search. web_fetch, datetime,
+    /// search_models, image_generation and the subagent have none.
     #[test]
-    fn anthropic_messages_is_offered_web_search_and_advisor() {
+    fn anthropic_messages_is_offered_the_tools_with_a_result_block() {
         for tool in Tool::implemented() {
             assert!(tool.served_on(ClientFormat::Openai), "{tool:?}");
         }
         assert!(Tool::WebSearch.served_on(ClientFormat::Anthropic));
         assert!(Tool::Advisor.served_on(ClientFormat::Anthropic));
+        assert!(Tool::ToolSearch.served_on(ClientFormat::Anthropic));
         assert!(!Tool::WebFetch.served_on(ClientFormat::Anthropic));
         assert!(!Tool::Datetime.served_on(ClientFormat::Anthropic));
         assert!(!Tool::Subagent.served_on(ClientFormat::Anthropic));
