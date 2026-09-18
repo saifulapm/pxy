@@ -454,6 +454,15 @@ async fn handle_chat_inner(
     // Session affinity key (group walks only): keeps a conversation on its
     // last winning candidate for prompt-cache locality.
     let session_key = if app.catalog.is_group(&requested) { session_key(&payload) } else { None };
+    // A win under a route pin is the pin's doing, not the conversation's:
+    // binding it would keep a session on the pinned model for an hour after
+    // `pxy route --clear`, when the chain is what was asked for.
+    let pinned_ids: Vec<String> = app
+        .catalog
+        .group_name(&requested)
+        .and_then(|g| active_route_pin(&app.catalog, &app.cfg, &app.state, g))
+        .map(|p| p.iter().map(|c| c.full_id()).collect())
+        .unwrap_or_default();
     let candidates =
         resolve_candidates(&app.catalog, &app.cfg, &app.state, &requested, session_key.as_deref());
     if candidates.is_empty() {
@@ -567,9 +576,12 @@ async fn handle_chat_inner(
                 AttemptResult::Done(outcome) => {
                     // A real success repairs the model's failure-rate record.
                     app.state.model_result(&cand.state_provider(), &cand.model.id, true);
-                    // ...and rebinds the conversation's session affinity.
+                    // ...and rebinds the conversation's session affinity,
+                    // unless the pin chose this candidate.
                     if let Some(key) = &session_key {
-                        app.state.session_set(key, &cand.full_id());
+                        if !pinned_ids.contains(&cand.full_id()) {
+                            app.state.session_set(key, &cand.full_id());
+                        }
                     }
                     return outcome;
                 }
@@ -7377,6 +7389,58 @@ mod tests {
         assert!(body["error"]["reset_time"].as_str().is_some_and(|t| t.contains('T')), "{body}");
         let ra = headers.iter().find(|(k, _)| k == "retry-after").expect("retry-after header");
         assert_eq!(ra.1, secs.to_string());
+    }
+
+    /// A win under a route pin must not become session affinity: once the
+    /// pin is cleared the conversation follows the chain again at once,
+    /// not an hour later.
+    #[tokio::test]
+    async fn a_pinned_win_does_not_bind_the_session() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/{p}",
+            post(|axum::extract::Path(p): axum::extract::Path<String>| async move {
+                axum::Json(json!({"choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": p}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+                .into_response()
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m1"]
+                [providers.b]
+                base_url = "{base}/b"
+                models = ["m2"]
+                [groups.free]
+                models = ["a/m1", "b/m2"]
+                "#
+            ),
+            "pinned_no_bind",
+        );
+        let ask = |app: SharedApp| async move {
+            let out = handle_chat(
+                app,
+                ClientFormat::Openai,
+                json!({"model": "free", "user": "s1", "messages": [{"role": "user", "content": "hi"}]}),
+                ClientContext::default(),
+            )
+            .await;
+            let Outcome::Json { provider, .. } = out else { panic!("expected json") };
+            provider.unwrap()
+        };
+        app.state.kv_set(&route_pin_key("free"), "b/m2").unwrap();
+        assert_eq!(ask(app.clone()).await, "b/m2", "the pin leads");
+        assert!(app.state.session_get("user:s1").is_none(), "a pinned win is not bound");
+        app.state.kv_delete(&route_pin_key("free")).unwrap();
+        assert_eq!(ask(app.clone()).await, "a/m1", "cleared pin: chain order at once");
+        assert_eq!(app.state.session_get("user:s1").as_deref(), Some("a/m1"), "a chain win binds");
     }
 
     /// A 429 that names a spent allowance is the ACCOUNT's quota (opencode
