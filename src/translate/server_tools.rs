@@ -210,6 +210,29 @@ pub async fn run_internal_chat(
     }
 }
 
+/// Run the same prompt across a panel of models at once and keep each leg's
+/// answer under the model that gave it. Every leg is an independent
+/// sub-request through pxy's own router, so provider limits, cooldowns and
+/// usage accounting apply to each. A leg's failure is its own: it is returned
+/// beside the answers that succeeded, because a partial panel is still worth
+/// reading.
+pub async fn run_panel(
+    app: &SharedApp,
+    models: &[String],
+    prompt: &str,
+    params: &Value,
+) -> Vec<(String, Result<String, String>)> {
+    let legs = models.iter().map(|model| {
+        let messages = vec![json!({"role": "user", "content": prompt})];
+        let params = params.clone();
+        async move {
+            let answer = run_internal_chat(app, model, messages, params).await;
+            (model.clone(), answer)
+        }
+    });
+    futures_util::future::join_all(legs).await
+}
+
 /// The request's declaration of this tool, when it carries one. A `function`
 /// field means an ordinary function tool that merely shares the name, and is
 /// left alone.
@@ -1384,6 +1407,63 @@ mod tests {
             }),
             "the declared served tool must be offered: {first}"
         );
+    }
+
+    /// The panel runs every model at once and keeps each answer under the
+    /// model that gave it. Three legs that all wait on one barrier can only
+    /// pass if the panel issued them concurrently; a sequential panel would
+    /// hang on the first wait.
+    #[tokio::test]
+    async fn panel_runs_its_models_concurrently_and_labels_each_answer() {
+        use std::sync::Arc;
+        use axum::routing::post;
+        use tokio::sync::Barrier;
+        let barrier = Arc::new(Barrier::new(3));
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let barrier = barrier.clone();
+                async move {
+                    // Only a concurrently-issued panel reaches all three.
+                    barrier.wait().await;
+                    let model = body["model"].as_str().unwrap_or("?");
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant",
+                            "content": format!("answer from {model}")},
+                        "finish_reason": "stop"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["a", "b", "c"]
+                "#
+            ),
+            "panel_parallel",
+        );
+        let models =
+            vec!["p/a".to_string(), "p/b".to_string(), "p/c".to_string()];
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_panel(&app, &models, "compare answers", &json!({})),
+        )
+        .await
+        .expect("the panel must not serialise: the barrier never released");
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, "p/a");
+        assert_eq!(results[0].1.as_ref().unwrap(), "answer from a");
+        assert_eq!(results[1].0, "p/b");
+        assert_eq!(results[1].1.as_ref().unwrap(), "answer from b");
+        assert_eq!(results[2].0, "p/c");
+        assert_eq!(results[2].1.as_ref().unwrap(), "answer from c");
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
