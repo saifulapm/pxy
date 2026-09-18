@@ -484,7 +484,7 @@ async fn handle_chat_inner(
     // reads above on purpose: a default never makes a candidate unservable
     // and never turns a toolless request into a tools request for routing.
     if ctx.tool_depth == 0 {
-        inject_default_server_tools(&mut payload, &app, client_format);
+        inject_default_server_tools(&mut payload, &app);
     }
 
     let mut skipped: Vec<String> = Vec::new();
@@ -1246,7 +1246,7 @@ async fn try_candidate_inner(
         injected
             .iter()
             .copied()
-            .filter(|t| t.served_on(client_format) && t.servable(app))
+            .filter(|t| t.servable(app))
             // A sub-request may not re-enter a meta-tool: at depth 1 the
             // advisor and subagent are dropped like a tool pxy cannot serve.
             .filter(|t| !(ctx.tool_depth >= 1 && t.is_meta()))
@@ -2894,10 +2894,10 @@ fn settle_tool_choice(body: &mut Value) {
 /// Declare `[server_tools.defaults]` on this turn as if the client had sent
 /// them: one `{"type":"pxy:<tool>","parameters":{..}}` entry per default the
 /// request can use. A tool the client declared itself is left to the client's
-/// declaration, whatever spelling it used. Only a tool this app can serve on
-/// this dialect is added — a default is an offer, and offering a function
-/// nobody intercepts hands the client a tool_use it never declared.
-fn inject_default_server_tools(payload: &mut Value, app: &App, client: ClientFormat) {
+/// declaration, whatever spelling it used. Only a tool this app can serve is
+/// added — a default is an offer, and offering a function nobody intercepts
+/// hands the client a tool_use it never declared.
+fn inject_default_server_tools(payload: &mut Value, app: &App) {
     if app.cfg.server_tools.defaults.is_empty() {
         return;
     }
@@ -2910,7 +2910,7 @@ fn inject_default_server_tools(payload: &mut Value, app: &App, client: ClientFor
     let mut added: Vec<Value> = Vec::new();
     for (name, params) in &app.cfg.server_tools.defaults {
         let Some(tool) = server_tools::from_type(&format!("pxy:{name}")) else { continue };
-        if declared.contains(&tool) || !tool.servable(app) || !tool.served_on(client) {
+        if declared.contains(&tool) || !tool.servable(app) {
             continue;
         }
         let mut entry = json!({"type": format!("pxy:{name}")});
@@ -7232,7 +7232,7 @@ mod tests {
             {"type": "function", "function": {"name": "mine", "parameters": {}}},
             {"type": "openrouter:datetime", "parameters": {"timezone": "Asia/Dhaka"}},
         ]});
-        inject_default_server_tools(&mut payload, &app, ClientFormat::Openai);
+        inject_default_server_tools(&mut payload, &app);
         let tools = payload["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 3, "{tools:?}");
         assert_eq!(tools[1]["parameters"]["timezone"], "Asia/Dhaka");
@@ -7244,10 +7244,10 @@ mod tests {
     }
 
     /// A default is an offer, not a demand: one the app cannot serve (no
-    /// search pool) or the dialect is not offered (datetime on Messages) is
-    /// left out rather than declared and dropped.
+    /// search pool) is left out rather than declared and dropped. The client's
+    /// dialect decides nothing — every tool is offered on both.
     #[test]
-    fn default_server_tools_respect_dialect_and_executor() {
+    fn default_server_tools_respect_the_executor_not_the_dialect() {
         let app = test_app(
             r#"
             [server]
@@ -7261,21 +7261,20 @@ mod tests {
             "#,
             "default_tools_dialect",
         );
-        let mut anthropic = json!({"messages": []});
-        inject_default_server_tools(&mut anthropic, &app, ClientFormat::Anthropic);
+        // An Anthropic client's payload: the advisor has a result block there
+        // and datetime has none, and both are declared all the same — a tool
+        // without a block is served silently, not withheld.
+        let mut anthropic = json!({"messages": [], "max_tokens": 100});
+        inject_default_server_tools(&mut anthropic, &app);
         let types: Vec<&str> = anthropic["tools"]
             .as_array()
             .map(|ts| ts.iter().filter_map(|t| t["type"].as_str()).collect())
             .unwrap_or_default();
-        assert_eq!(types, vec!["pxy:advisor"], "{anthropic}");
-
-        let mut openai = json!({"messages": []});
-        inject_default_server_tools(&mut openai, &app, ClientFormat::Openai);
-        let types: Vec<&str> = openai["tools"]
-            .as_array()
-            .map(|ts| ts.iter().filter_map(|t| t["type"].as_str()).collect())
-            .unwrap_or_default();
-        assert_eq!(types, vec!["pxy:advisor", "pxy:datetime"], "web_search has no pool: {openai}");
+        assert_eq!(
+            types,
+            vec!["pxy:advisor", "pxy:datetime"],
+            "web_search has no pool: {anthropic}"
+        );
     }
 
     /// An Anthropic-format upstream never sees a `pxy:*` entry: the loop
@@ -7893,34 +7892,17 @@ mod tests {
         }
     }
 
-    /// Anthropic Messages has no client result block for web_fetch or
-    /// datetime, so they are never offered there: the injected function is
-    /// stripped before the wire, while web_search still goes through.
+    /// Anthropic Messages is offered every tool pxy can serve, including the
+    /// ones with no documented client result block: datetime and web_fetch go
+    /// up beside web_search, the round is served silently — nothing is spliced
+    /// into the client's stream — and the usage still reports the call.
     #[tokio::test]
-    async fn anthropic_messages_never_receives_web_fetch_or_datetime() {
-        use axum::response::IntoResponse;
-        use axum::routing::post;
-        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-        let sink = seen.clone();
-        let router = axum::Router::new().route(
-            "/m",
-            post(move |axum::Json(body): axum::Json<Value>| {
-                let sink = sink.clone();
-                async move {
-                    sink.lock().unwrap().push(body);
-                    axum::http::Response::builder()
-                        .header("content-type", "text/event-stream")
-                        .body(axum::body::Body::from(
-                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
-                        ))
-                        .unwrap()
-                        .into_response()
-                }
-            }),
-        );
-        let base = mock_server(router).await;
+    async fn served_turn_on_anthropic_messages_is_silent_without_a_block() {
+        let first = calls_sse(&[("call_1", "pxy_datetime", "{}")]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
         // Both executors are configured, so nothing is unservable for lack of
-        // a provider: only the dialect rules web_fetch and datetime out.
+        // a provider: the dialect is the only thing that ever ruled them out.
         let app = test_app(
             &format!(
                 r#"
@@ -7940,7 +7922,7 @@ mod tests {
                 api_key = "k"
                 "#
             ),
-            "anthropic_no_fetch",
+            "anthropic_silent_round",
         );
         let payload = json!({
             "model": "free",
@@ -7955,19 +7937,30 @@ mod tests {
         });
         let out =
             handle_chat(app, ClientFormat::Anthropic, payload, ClientContext::default()).await;
-        if let Outcome::Stream { body, .. } = out {
-            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
-        }
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+
         let bodies = seen.lock().unwrap();
         let names: Vec<&str> = bodies[0]["tools"]
             .as_array()
-            .expect("web_search must survive")
+            .expect("every declared tool must survive")
             .iter()
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(names.contains(&"pxy_web_search"), "{names:?}");
-        assert!(!names.contains(&"pxy_web_fetch"), "{names:?}");
-        assert!(!names.contains(&"pxy_datetime"), "{names:?}");
+        assert!(names.contains(&"pxy_web_fetch"), "{names:?}");
+        assert!(names.contains(&"pxy_datetime"), "{names:?}");
+        assert_eq!(bodies.len(), 2, "the served call must have been replayed");
+
+        // datetime has no Anthropic result block, so the client sees the
+        // answer and nothing else — never a block naming a tool it cannot
+        // interpret, and never pxy's own reserved name.
+        assert!(text.contains("done"), "{text}");
+        assert!(!text.contains("\"type\":\"server_tool_use\""), "{text}");
+        assert!(!text.contains("pxy_"), "{text}");
+        // The round still happened, and the usage says so.
+        assert!(text.contains("\"datetime_requests\":1"), "{text}");
     }
 
     /// `[server_tools] enabled` and the registry decide which declared server

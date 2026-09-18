@@ -117,21 +117,6 @@ impl Tool {
         }
     }
 
-    /// Whether this client dialect is offered the tool. pxy never invents a
-    /// client result block, so a tool with none on Anthropic Messages is not
-    /// offered there; Chat Completions and Responses share
-    /// [`ClientFormat::Openai`].
-    pub fn served_on(self, client: ClientFormat) -> bool {
-        match client {
-            ClientFormat::Openai => true,
-            // web_search, the advisor and tool_search have documented
-            // Anthropic result blocks; the subagent and the rest do not.
-            ClientFormat::Anthropic => {
-                matches!(self, Tool::WebSearch | Tool::Advisor | Tool::ToolSearch)
-            }
-        }
-    }
-
     /// This tool's own call cap for the request: the declaration's `max_uses`
     /// (Anthropic spells it top-level, OpenRouter nestles it under
     /// `parameters`) or `parameters.max_tool_calls` (the wiki's spelling),
@@ -1717,22 +1702,6 @@ mod tests {
         );
         assert!(!Tool::WebFetch.servable(&disabled), "not enabled");
         assert!(Tool::Datetime.servable(&disabled));
-    }
-
-    /// On Anthropic Messages only the tools with a documented result block are
-    /// offered: web_search, the advisor and tool_search. web_fetch, datetime,
-    /// search_models, image_generation and the subagent have none.
-    #[test]
-    fn anthropic_messages_is_offered_the_tools_with_a_result_block() {
-        for tool in Tool::implemented() {
-            assert!(tool.served_on(ClientFormat::Openai), "{tool:?}");
-        }
-        assert!(Tool::WebSearch.served_on(ClientFormat::Anthropic));
-        assert!(Tool::Advisor.served_on(ClientFormat::Anthropic));
-        assert!(Tool::ToolSearch.served_on(ClientFormat::Anthropic));
-        assert!(!Tool::WebFetch.served_on(ClientFormat::Anthropic));
-        assert!(!Tool::Datetime.served_on(ClientFormat::Anthropic));
-        assert!(!Tool::Subagent.served_on(ClientFormat::Anthropic));
     }
 
     /// A model asserted `vision = false` 400s on an image part, so each one
