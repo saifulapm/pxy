@@ -92,8 +92,10 @@ max_tool_calls = 10
 # each image in the transcript for `[image N]` for a `vision = false` model,
 # and this tool sends the real image to the model named here. `ocr_model` is
 # used for `mode = "ocr"` and falls back to `model`.
+# The model named here must be one that CAN see: it is sent the real image,
+# and a `vision = false` entry would answer every call with its own 400.
 # [server_tools.defaults.describe_image]
-# model = "alpha/model-thinking"
+# model = "beta/model-large"
 # ocr_model = "jina/jina-ocr-v1"
 
 # ---------------------------------------------------------------------------
