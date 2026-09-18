@@ -1700,6 +1700,11 @@ fn quota_window_cooldown(
     if has(&["per week", "weekly", "this week"]) {
         return Some((Duration::from_secs(4 * 3600), "weekly quota reported exhausted"));
     }
+    if has(&["per hour", "hourly", "-hour", "rolling"]) {
+        // A rolling window (opencode Go's 5h) drains as it goes; recheck
+        // well inside it. The Retry-After header, when sent, wins anyway.
+        return Some((Duration::from_secs(30 * 60), "hourly quota reported exhausted"));
+    }
     if has(&["per day", "daily", "today", "free allocation"]) {
         // Until the provider's next daily reset (+2 min margin). Fail open
         // to a 6h recheck if the window computation errors.
@@ -1722,6 +1727,11 @@ fn quota_window_cooldown(
         "insufficient promotional resources",
     ]) {
         return Some((Duration::from_secs(3600), "credits reported exhausted"));
+    }
+    // A usage limit with no window named (opencode's FreeUsageLimitError
+    // body, "usage limit reached"): an allowance, not a rate, so an hour.
+    if has(&["usagelimiterror", "usage limit reached"]) {
+        return Some((Duration::from_secs(3600), "usage limit reported reached"));
     }
     None
 }
@@ -1822,28 +1832,35 @@ fn classify_error(
             429 => "rate limited",
             _ => "upstream error",
         };
-        // Account-wide problems cool the whole provider; rate limits and
-        // upstream errors are usually per-model on aggregators, so they must
-        // not sideline the provider's other models.
-        let account_wide = matches!(status, 401 | 402 | 403);
+        let limits = app.cfg.providers.get(&cand.provider).and_then(|p| p.limits.as_ref());
+        // A 429 whose body names a spent allowance (a daily/weekly/monthly
+        // window, credits, a usage limit) is the account's quota, not this
+        // model's rate: every model on the account is out until the reset.
+        let quota = (status == 429)
+            .then(|| quota_window_cooldown(limits, &err_body))
+            .flatten();
+        // Account-wide problems cool the whole provider (per account on a
+        // multi-account provider); plain rate limits and upstream errors are
+        // usually per-model on aggregators, so they must not sideline the
+        // provider's other models.
+        let account_wide = matches!(status, 401 | 402 | 403) || quota.is_some();
         let model_scope = (!account_wide).then_some(cand.model.id.as_str());
         // Auth/credit failures and delisted models don't heal in seconds, so
         // the retry loop must not wait on them (or re-fire a dead key).
         let retryable = !account_wide && status != 404;
-        let limits = app.cfg.providers.get(&cand.provider).and_then(|p| p.limits.as_ref());
-        // Header wins; else a quota-window body horizon; else a 402 without
-        // any hint waits an hour (credits don't reappear in 120s); else the
-        // ordinary exponential backoff.
-        let (wait, retryable, why) = match retry_after {
-            Some(d) => (Some(d), retryable, format!("{status} {reason}")),
-            None if status == 429 => match quota_window_cooldown(limits, &err_body) {
-                Some((d, why)) => (Some(d), false, format!("429 {why}")),
-                None => (None, retryable, format!("{status} {reason}")),
-            },
-            None if status == 402 => {
-                (Some(Duration::from_secs(3600)), false, format!("{status} {reason}"))
-            }
-            None => (None, retryable, format!("{status} {reason}")),
+        // Header wins for the wait; the body's window names the reason. Else
+        // the window's own horizon; else a 402 without any hint waits an
+        // hour (credits don't reappear in 120s); else the ordinary
+        // exponential backoff.
+        let why = match &quota {
+            Some((_, why)) => format!("429 {why}"),
+            None => format!("{status} {reason}"),
+        };
+        let (wait, retryable) = match (retry_after, &quota) {
+            (Some(d), _) => (Some(d), retryable),
+            (None, Some((d, _))) => (Some(*d), false),
+            (None, None) if status == 402 => (Some(Duration::from_secs(3600)), false),
+            (None, None) => (None, retryable),
         };
         app.state.set_cooldown(&cand.state_provider(), model_scope, wait, retryable, &why);
         return AttemptResult::SkipRaw {
@@ -2173,8 +2190,12 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         Err(_) => parse_go_duration(v).or_else(|| parse_http_date(v))?,
     };
     let secs = dur.as_secs();
-    // Sanity clamp (litellm): obey only reasonable waits; else exponential backoff.
-    if secs > 0 && secs <= 3600 { Some(dur) } else { None }
+    // Sanity clamp: obey only plausible waits, else exponential backoff. A
+    // week covers every real quota window (5h rolling, daily, weekly); a
+    // monthly reset still lands under it on the recheck. litellm's 1h clamp
+    // threw away exactly the headers that matter most — a provider stating
+    // "back in 2 days" was re-probed every 4h instead.
+    if secs > 0 && secs <= 7 * 24 * 3600 { Some(dur) } else { None }
 }
 
 /// IMF-fixdate as used in Retry-After / Date headers. Returns the wait from
@@ -5350,6 +5371,11 @@ mod tests {
         let credits =
             quota_window_cooldown(None, "insufficient promotional resources").unwrap();
         assert_eq!(credits.0, Duration::from_secs(3600));
+        // opencode Go's rolling window and its typed limit errors.
+        let rolling = quota_window_cooldown(None, "5-hour usage limit reached. Resets in 2 hours").unwrap();
+        assert_eq!(rolling.0, Duration::from_secs(30 * 60));
+        let free = quota_window_cooldown(None, r#"{"type":"error","error":{"type":"FreeUsageLimitError","message":"..."}}"#).unwrap();
+        assert_eq!(free.0, Duration::from_secs(3600));
         // Gemini's TRANSIENT free-tier boilerplate must not classify as a
         // window: no window word, no unambiguous credits phrase.
         assert!(quota_window_cooldown(
@@ -5384,8 +5410,13 @@ mod tests {
             parse_retry_after(&headers(&[("retry-after", "2m30s")])),
             Some(Duration::from_secs(150))
         );
-        // Over the sanity clamp or garbage: fall back to exponential backoff.
-        assert_eq!(parse_retry_after(&headers(&[("retry-after", "2h")])), None);
+        // A stated multi-day reset is obeyed (a weekly allowance).
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "172800")])),
+            Some(Duration::from_secs(172_800))
+        );
+        // Over the sanity clamp (a week) or garbage: exponential backoff.
+        assert_eq!(parse_retry_after(&headers(&[("retry-after", "700000")])), None);
         assert_eq!(parse_retry_after(&headers(&[("retry-after", "soon")])), None);
     }
 
@@ -7346,6 +7377,106 @@ mod tests {
         assert!(body["error"]["reset_time"].as_str().is_some_and(|t| t.contains('T')), "{body}");
         let ra = headers.iter().find(|(k, _)| k == "retry-after").expect("retry-after header");
         assert_eq!(ra.1, secs.to_string());
+    }
+
+    /// A 429 that names a spent allowance is the ACCOUNT's quota (opencode
+    /// Go's weekly window, a daily free tier): the whole account cools, for
+    /// the stated Retry-After even when it is days, and no sibling model pays
+    /// its own 429 to find out. The walk moves to the next account.
+    #[tokio::test]
+    async fn quota_window_429_cools_the_whole_account_for_the_stated_reset() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let hits = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let sink = hits.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    let key = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let model = body["model"].as_str().unwrap_or("").to_string();
+                    sink.lock().unwrap().push((key.clone(), model));
+                    if key.ends_with("key-gh") {
+                        return axum::http::Response::builder()
+                            .status(429)
+                            .header("retry-after", "172800")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"type":"error","error":{"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 2 days. To continue using this model now, enable usage from your available balance"},"metadata":{"limitName":"weekly"}}"#,
+                            ))
+                            .unwrap()
+                            .into_response();
+                    }
+                    axum::Json(json!({"choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+                    .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.go]
+                base_url = "{base}/m"
+                models = ["m1", "m2"]
+                [[providers.go.accounts]]
+                name = "gh"
+                api_key = "key-gh"
+                [[providers.go.accounts]]
+                name = "g"
+                api_key = "key-g"
+                [groups.one]
+                models = ["go/m1"]
+                [groups.two]
+                models = ["go/m2"]
+                "#
+            ),
+            "quota_account_wide",
+        );
+
+        // First request on m1: the gh account reports its weekly window
+        // spent; the walk lands on the g account and the client is served.
+        let out = handle_chat(
+            app.clone(),
+            ClientFormat::Openai,
+            json!({"model": "one", "messages": [{"role": "user", "content": "hi"}]}),
+            ClientContext::default(),
+        )
+        .await;
+        let Outcome::Json { status, provider, .. } = out else { panic!("expected json") };
+        assert_eq!(status, 200);
+        assert_eq!(provider.as_deref(), Some("go/m1"));
+
+        // The cooldown is on the ACCOUNT, for the stated two days, and not
+        // something the retry loop should wait on.
+        let cd = app.state.cooldown("go#gh", "m2").expect("account-wide cooldown covers m2");
+        assert!(!cd.retryable, "{cd:?}");
+        let left = cd.until.saturating_duration_since(std::time::Instant::now());
+        assert!(left > Duration::from_secs(172_000), "stated reset obeyed: {left:?}");
+        assert!(cd.reason.contains("weekly"), "{cd:?}");
+        assert!(app.state.cooldown("go#g", "m1").is_none(), "the other account is untouched");
+
+        // A request on the sibling model skips the gh account outright.
+        let out = handle_chat(
+            app.clone(),
+            ClientFormat::Openai,
+            json!({"model": "two", "messages": [{"role": "user", "content": "hi"}]}),
+            ClientContext::default(),
+        )
+        .await;
+        let Outcome::Json { status, .. } = out else { panic!("expected json") };
+        assert_eq!(status, 200);
+        let hits = hits.lock().unwrap().clone();
+        let gh: Vec<&String> = hits.iter().filter(|(k, _)| k.ends_with("key-gh")).map(|(_, m)| m).collect();
+        assert_eq!(gh, vec!["m1"], "gh was probed once, never for m2: {hits:?}");
     }
 
     /// An OpenAI-dialect client (codex/opencode/fx) routed to an
