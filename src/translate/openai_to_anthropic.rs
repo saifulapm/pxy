@@ -412,6 +412,13 @@ impl StreamState {
                 if let Some(o) = payload["usage"]["output_tokens"].as_u64() {
                     self.usage.output = o;
                 }
+                // The final usage is cumulative and, on the current API and
+                // on some Anthropic-format gateways (meta.ai), the ONLY place
+                // input_tokens appears; message_start alone billed those
+                // turns as zero input.
+                if payload["usage"]["input_tokens"].is_u64() {
+                    self.usage.input = TokenUsage::from_anthropic(&payload["usage"]).input;
+                }
                 let finish = map_stop_reason(payload["delta"]["stop_reason"].as_str());
                 self.finished = true;
                 let mut out = self.chunk_with_usage(json!({}), Some(finish));
@@ -590,6 +597,22 @@ mod tests {
         assert!(out.contains("\"finish_reason\":\"tool_calls\""));
         assert!(out.contains("[DONE]"));
         assert_eq!(st.usage.input, 9);
+        assert_eq!(st.usage.output, 4);
+    }
+
+    /// A gateway that reports input only on the final message_delta (meta.ai)
+    /// must not be billed as zero input; cache traffic counts as input there
+    /// too, as it does on message_start.
+    #[test]
+    fn message_delta_usage_refreshes_input_tokens() {
+        let mut st = StreamState::new("m", None);
+        let start = json!({"type": "message_start", "message": {"id": "msg1", "usage": {}}});
+        st.on_event(Some("message_start"), &start.to_string());
+        assert_eq!(st.usage.input, 0);
+        let md = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": 100, "cache_read_input_tokens": 50, "output_tokens": 4}});
+        st.on_event(Some("message_delta"), &md.to_string());
+        assert_eq!(st.usage.input, 150);
         assert_eq!(st.usage.output, 4);
     }
 }
