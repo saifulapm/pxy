@@ -30,19 +30,20 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
     // Same resolution the daemon runs, pin included: explain must describe
     // the walk a request would actually take, not the config-only chain.
     let candidates = crate::router::resolve_candidates(&catalog, cfg, &st, requested, None);
-    let pin = st
-        .kv_get(crate::router::ROUTE_PIN_KEY)
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty());
+    // The requested group's own pin; a model request has none.
+    let pin = catalog.group_name(requested).and_then(|g| {
+        st.kv_get(&crate::router::route_pin_key(g))
+            .ok()
+            .flatten()
+            .filter(|p| !p.is_empty())
+    });
     let pinned_ids: std::collections::HashSet<String> = pin
         .as_deref()
         .map(|p| catalog.resolve(cfg, p).iter().map(|c| c.full_id()).collect())
         .unwrap_or_default();
-    let is_group = catalog.is_group(requested);
     // A stale pin (resolve_candidates ignored it) must not be reported as
     // steering the walk: when active, the pin leads — so check the head.
-    let pin_active = is_group
+    let pin_active = pin.is_some()
         && candidates.first().is_some_and(|c| pinned_ids.contains(&c.full_id()));
     if candidates.is_empty() {
         if json {
@@ -65,7 +66,7 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                 "'{requested}' -> {} candidate(s) (pin '{p}' first), walked in order:\n",
                 candidates.len()
             ),
-            (Some(p), false) if is_group => println!(
+            (Some(p), false) => println!(
                 "'{requested}' -> {} candidate(s); pin '{p}' is STALE (not in the catalog), walked in chain order:\n",
                 candidates.len()
             ),

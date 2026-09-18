@@ -1010,14 +1010,24 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
     // this works with the daemon down too (a stale in-memory-only rpm window
     // is the only thing the CLI can't see).
     let catalog = Catalog::from_config(cfg);
-    let route_pin = state.kv_get(crate::router::ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty());
-    // Whether the pin actually steers routing right now — a pin gone stale
-    // (model dropped from the catalog) is ignored by resolve_candidates, and
-    // reporting it as simply "pinned" would have the panel lie about the walk.
-    let route_pin_active = route_pin.as_deref().is_some_and(|p| {
-        let resolved = catalog.resolve(cfg, p);
-        !resolved.is_empty() && resolved.iter().all(|c| catalog.is_listed(&c.full_id()))
-    });
+    // One entry per pinned group. `active` says whether the pin actually
+    // steers routing right now — a pin gone stale (model dropped from the
+    // catalog) is ignored by resolve_candidates, and reporting it as simply
+    // "pinned" would have the panel lie about the walk.
+    let route_pins: Vec<Value> = catalog
+        .group_names()
+        .filter_map(|name| {
+            let pin = state
+                .kv_get(&crate::router::route_pin_key(name))
+                .ok()
+                .flatten()
+                .filter(|p| !p.is_empty())?;
+            let resolved = catalog.resolve(cfg, &pin);
+            let active =
+                !resolved.is_empty() && resolved.iter().all(|c| catalog.is_listed(&c.full_id()));
+            Some(json!({"group": name, "model": pin, "active": active}))
+        })
+        .collect();
     // The routable group ids, so the desktop panel can walk each chain without
     // parsing config.toml itself.
     let groups: Vec<Value> = catalog
@@ -1056,8 +1066,7 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
             .collect();
         let mut root = serde_json::Map::new();
         root.insert("port".into(), json!(cfg.server.port));
-        root.insert("routePin".into(), json!(route_pin));
-        root.insert("routePinActive".into(), json!(route_pin_active));
+        root.insert("routePins".into(), Value::Array(route_pins));
         root.insert("groups".into(), Value::Array(groups));
         root.insert("cooldowns".into(), Value::Array(cooldowns));
         root.insert("providers".into(), Value::Object(json_providers));
@@ -1074,11 +1083,12 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
                 .collect();
             let _ = writeln!(out, "\ngroups: {}", names.join(", "));
         }
-        if let Some(pin) = &route_pin {
-            if route_pin_active {
-                let _ = writeln!(out, "route pinned to: {pin} (the group chain is the fallback)");
+        for pin in &route_pins {
+            let (group, model) = (&pin["group"], &pin["model"]);
+            if pin["active"] == true {
+                let _ = writeln!(out, "{group}: route pinned to {model} (the group chain is the fallback)");
             } else {
-                let _ = writeln!(out, "route pin '{pin}' is STALE (not in the catalog) — group chain priority in effect");
+                let _ = writeln!(out, "{group}: route pin {model} is STALE (not in the catalog) — group chain priority in effect");
             }
         }
         if !cooldowns.is_empty() {

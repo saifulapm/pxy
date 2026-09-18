@@ -157,9 +157,19 @@ impl Catalog {
 
     /// Is this id a routable group (bare, or behind the "claude/" mirror)?
     pub fn is_group(&self, requested: &str) -> bool {
+        self.group_name(requested).is_some()
+    }
+
+    /// The bare group name a requested id routes on (the `claude/` mirror and
+    /// the `[1m]` marker stripped), or None when it is not a routable group.
+    /// The route pin is keyed on this, so both spellings share one pin.
+    pub fn group_name(&self, requested: &str) -> Option<&str> {
         let bare = requested.strip_prefix("claude/").unwrap_or(requested);
         let bare = bare.strip_suffix(CTX_1M_MARKER).unwrap_or(bare);
-        self.groups.get(bare).is_some_and(|g| !g.chain.is_empty())
+        self.groups
+            .get_key_value(bare)
+            .filter(|(_, g)| !g.chain.is_empty())
+            .map(|(k, _)| k.as_str())
     }
 
     /// The GroupConfig a requested id names, accepting the `claude/` mirror and

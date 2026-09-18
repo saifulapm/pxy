@@ -47,8 +47,9 @@ provider in cooldown, over a limit window, or with too small a context is
 skipped. Real token counts from response bodies land in sqlite, so limits
 survive a restart, and `x-pxy-provider` on the response says who served it.
 
-`pxy route <provider/model>` pins one model to the front of every group walk,
-with the chain still behind it as fallback. `pxy route --clear` undoes it.
+`pxy route <group> <provider/model>` pins one model to the front of that
+group's walk, with the chain still behind it as fallback; other groups are
+untouched. `pxy route <group> --clear` undoes it, `pxy route` lists the pins.
 
 `config.toml` is the whole catalog: a model is served when a provider lists it,
 and not otherwise. `models.toml` is a report that `pxy refresh --generate`

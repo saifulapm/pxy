@@ -61,12 +61,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Pin one model ahead of every group chain, or show the current pin
+    /// Pin one model ahead of a group's chain, or show the current pins
     Route {
+        /// Group to pin into; omit to list every group's pin
+        group: Option<String>,
         /// Model id to pin ("provider/model" or a bare id); omit to show the
-        /// current pin
+        /// group's current pin
         model: Option<String>,
-        /// Remove the pin — group requests follow their configured chain again
+        /// Remove the pin — the group follows its configured chain again
+        /// (with no group: every pin)
         #[arg(long)]
         clear: bool,
     },
@@ -198,9 +201,9 @@ fn main() -> Result<()> {
             let cfg = config::Config::load(&cfg_path)?;
             diagnose::explain(&cfg, &model, json)
         }
-        Command::Route { model, clear } => {
+        Command::Route { group, model, clear } => {
             let cfg = config::Config::load(&cfg_path)?;
-            route(&cfg, model.as_deref(), clear)
+            route(&cfg, group.as_deref(), model.as_deref(), clear)
         }
         Command::Refresh { generate } => {
             let cfg = config::Config::load(&cfg_path)?;
@@ -379,24 +382,48 @@ fn models(cfg: &config::Config, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `pxy route [MODEL] [--clear]` — the route pin: one model walked ahead of
-/// whichever group chain a request asks for. The pin lives in the daemon's
-/// sqlite kv and is read per request, so no restart is needed; the desktop pxy
+/// `pxy route [GROUP] [MODEL] [--clear]` — the route pin: one model walked
+/// ahead of one group's chain. A pin lives in the daemon's sqlite kv, keyed by
+/// group, and is read per request, so no restart is needed; the desktop pxy
 /// panel drives this same verb.
-fn route(cfg: &config::Config, model: Option<&str>, clear: bool) -> Result<()> {
+fn route(cfg: &config::Config, group: Option<&str>, model: Option<&str>, clear: bool) -> Result<()> {
     let st = state::State::open(&config::data_dir().join("state.sqlite"))?;
     let catalog = catalog::Catalog::from_config(cfg);
+    let Some(group) = group else {
+        if clear {
+            for name in catalog.group_names() {
+                st.kv_delete(&router::route_pin_key(name))?;
+            }
+            println!("every route unpinned — group chain priority restored");
+            return Ok(());
+        }
+        let mut any = false;
+        for name in catalog.group_names() {
+            if let Some(pin) = st.kv_get(&router::route_pin_key(name))?.filter(|p| !p.is_empty()) {
+                println!("{name}: pinned to {pin} (the group chain is the fallback)");
+                any = true;
+            }
+        }
+        if !any {
+            println!("no route pinned (configured group chain priority)");
+        }
+        return Ok(());
+    };
+    let Some(group) = catalog.group_name(group) else {
+        anyhow::bail!("'{group}' is not a group — usage: pxy route <group> <model>; see `pxy models`");
+    };
+    let key = router::route_pin_key(group);
     // Pinning a GROUP means "no single model" — pinning would grab whatever
     // happens to lead that chain today and freeze it, so it clears instead.
     if clear || model.is_some_and(|m| catalog.is_group(m)) {
-        st.kv_delete(router::ROUTE_PIN_KEY)?;
-        println!("route unpinned — group chain priority restored");
+        st.kv_delete(&key)?;
+        println!("{group}: route unpinned — group chain priority restored");
         return Ok(());
     }
     let Some(model) = model else {
-        match st.kv_get(router::ROUTE_PIN_KEY)?.filter(|p| !p.is_empty()) {
-            Some(pin) => println!("route pinned to: {pin} (the group chain is the fallback)"),
-            None => println!("route unpinned (configured group chain priority)"),
+        match st.kv_get(&key)?.filter(|p| !p.is_empty()) {
+            Some(pin) => println!("{group}: pinned to {pin} (the group chain is the fallback)"),
+            None => println!("{group}: unpinned (configured group chain priority)"),
         }
         return Ok(());
     };
@@ -405,7 +432,7 @@ fn route(cfg: &config::Config, model: Option<&str>, clear: bool) -> Result<()> {
         anyhow::bail!("'{model}' resolves to nothing — see `pxy models`");
     };
     // resolve() fabricates a candidate for any id under a known provider;
-    // refuse to store one, or a typo'd pin leads every group walk to a model
+    // refuse to store one, or a typo'd pin leads the group walk to a model
     // that doesn't exist.
     if !catalog.is_listed(&cand.full_id()) {
         anyhow::bail!("'{model}' is not in the catalog — see `pxy models`");
@@ -413,11 +440,8 @@ fn route(cfg: &config::Config, model: Option<&str>, clear: bool) -> Result<()> {
     // Store what the user typed, resolved to its canonical pair: a bare id
     // pins ONE provider's copy, deterministically, not whichever bare match
     // wins on a later config.
-    st.kv_set(router::ROUTE_PIN_KEY, &cand.full_id())?;
-    println!(
-        "route pinned to: {} (the group chain is the fallback)",
-        cand.full_id()
-    );
+    st.kv_set(&key, &cand.full_id())?;
+    println!("{group}: pinned to {} (the group chain is the fallback)", cand.full_id());
     Ok(())
 }
 

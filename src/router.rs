@@ -150,17 +150,42 @@ fn forwardable_headers(h: &reqwest::header::HeaderMap) -> Headers {
         .collect()
 }
 
-/// kv key holding the route pin, set from `pxy route` / the desktop panel.
-/// Read per request so a pin takes effect without a daemon restart.
-pub const ROUTE_PIN_KEY: &str = "route_pin";
+/// kv key holding one group's route pin, set from `pxy route` / the desktop
+/// panel. Read per request so a pin takes effect without a daemon restart.
+/// Pins are per group: pinning deepseek-flash into `deepseek` must not steer
+/// a `glm` session.
+pub fn route_pin_key(group: &str) -> String {
+    format!("route_pin:{group}")
+}
 
-/// Candidates for a request, honoring the route pin: on a GROUP request the
-/// pinned model is walked FIRST, with the group's chain behind it as fallback —
-/// pinning must never cost the failover safety a group exists for. One pin
-/// covers every group: an agent is launched with a fixed model id, so the pin
-/// is the only way to steer a running session. Explicit model requests are
-/// untouched, and a pin that no longer resolves (config edit, provider
-/// disabled) degrades to the plain chain.
+/// The group's active pin: the stored model resolved to listed candidates, or
+/// None when nothing is pinned or the pin went stale. `is_listed`, not just
+/// resolves: resolve() fabricates a candidate for any id under an enabled
+/// provider, and a pin gone stale (config edit, refresh dropping the model)
+/// must degrade to the chain, not put a phantom at the head of the walk.
+pub fn active_route_pin(
+    catalog: &Catalog,
+    cfg: &Config,
+    state: &State,
+    group: &str,
+) -> Option<Vec<Candidate>> {
+    let pin = state.kv_get(&route_pin_key(group)).ok().flatten().filter(|p| !p.is_empty())?;
+    let resolved = catalog.resolve(cfg, &pin);
+    if !resolved.is_empty() && resolved.iter().all(|c| catalog.is_listed(&c.full_id())) {
+        Some(resolved)
+    } else {
+        warn!(group, pin, "route pin is not in the catalog; using the group chain");
+        None
+    }
+}
+
+/// Candidates for a request, honoring the group's route pin: on a GROUP
+/// request the pinned model is walked FIRST, with the group's chain behind it
+/// as fallback — pinning must never cost the failover safety a group exists
+/// for. An agent is launched with a fixed group id, so the pin is the only way
+/// to steer a running session, and it steers only that group. Explicit model
+/// requests are untouched, and a pin that no longer resolves (config edit,
+/// provider disabled) degrades to the plain chain.
 pub fn resolve_candidates(
     catalog: &Catalog,
     cfg: &Config,
@@ -195,19 +220,9 @@ pub fn resolve_candidates(
     }
     // Manual pin: walked FIRST, ahead of session affinity — `pxy route` is an
     // explicit human decision.
-    let mut pinned = None;
-    if let Some(pin) = state.kv_get(ROUTE_PIN_KEY).ok().flatten().filter(|p| !p.is_empty()) {
-        // is_listed, not just resolves: resolve() fabricates a candidate for
-        // any id under an enabled provider, and a pin gone stale (config
-        // edit, refresh dropping the model) must degrade to the chain, not
-        // put a phantom at the head of every group walk.
-        let resolved = catalog.resolve(cfg, &pin);
-        if !resolved.is_empty() && resolved.iter().all(|c| catalog.is_listed(&c.full_id())) {
-            pinned = Some(resolved);
-        } else {
-            warn!(pin, "route pin is not in the catalog; using the group chain");
-        }
-    }
+    let pinned = catalog
+        .group_name(requested)
+        .and_then(|g| active_route_pin(catalog, cfg, state, g));
     // Session affinity: the candidate this conversation last won on walks
     // first, so a post-failover conversation keeps its prompt-cache locality
     // instead of bouncing back to the chain head. A stale or unlisted
@@ -4295,6 +4310,8 @@ mod tests {
             models = ["m2"]
             [groups.free]
             models = ["a/m1", "b/m2"]
+            [groups.other]
+            models = ["a/m1", "b/m2"]
             "#,
             "route_pin",
         );
@@ -4307,12 +4324,26 @@ mod tests {
         assert_eq!(ids, ["a/m1", "b/m2"]);
 
         // Pinned: the pin leads, the rest of the chain follows, no duplicate.
-        app.state.kv_set(ROUTE_PIN_KEY, "b/m2").unwrap();
+        app.state.kv_set(&route_pin_key("free"), "b/m2").unwrap();
         let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
             .iter()
             .map(|c| c.full_id())
             .collect();
         assert_eq!(ids, ["b/m2", "a/m1"], "pin first, chain as fallback");
+
+        // The pin is the group's own: a sibling group keeps its config order,
+        // and the claude/ mirror of the pinned group shares its pin.
+        let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "other", None)
+            .iter()
+            .map(|c| c.full_id())
+            .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"], "a pin must not leak into another group");
+        let ids: Vec<String> =
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, "claude/free", None)
+                .iter()
+                .map(|c| c.full_id())
+                .collect();
+        assert_eq!(ids, ["b/m2", "a/m1"], "the mirror spelling shares the pin");
 
         // Explicit model requests ignore the pin entirely.
         let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "a/m1", None)
@@ -4322,7 +4353,7 @@ mod tests {
         assert_eq!(ids, ["a/m1"]);
 
         // A pin that stopped resolving degrades to the plain chain.
-        app.state.kv_set(ROUTE_PIN_KEY, "gone/nope").unwrap();
+        app.state.kv_set(&route_pin_key("free"), "gone/nope").unwrap();
         let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
             .iter()
             .map(|c| c.full_id())
@@ -4333,7 +4364,7 @@ mod tests {
         // resolve() fabricates a candidate for it, and without the is_listed
         // gate that phantom would lead every group walk (and a 400 "unknown
         // model" is Fatal — no failover).
-        app.state.kv_set(ROUTE_PIN_KEY, "a/ghost").unwrap();
+        app.state.kv_set(&route_pin_key("free"), "a/ghost").unwrap();
         let ids: Vec<String> = resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", None)
             .iter()
             .map(|c| c.full_id())
@@ -4378,14 +4409,14 @@ mod tests {
         assert_eq!(ids, ["a/m1", "b/m2"]);
 
         // A manual pin outranks the affinity binding.
-        app.state.kv_set(ROUTE_PIN_KEY, "a/m1").unwrap();
+        app.state.kv_set(&route_pin_key("free"), "a/m1").unwrap();
         let ids: Vec<String> =
             resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", Some("uid:u1"))
                 .iter()
                 .map(|c| c.full_id())
                 .collect();
         assert_eq!(ids, ["a/m1", "b/m2"], "pin first, affinity never leads");
-        app.state.kv_set(ROUTE_PIN_KEY, "").unwrap();
+        app.state.kv_set(&route_pin_key("free"), "").unwrap();
 
         // An unlisted binding degrades (is_listed gate, like the pin).
         app.state.session_set("uid:u2", "gone/nope");
