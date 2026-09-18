@@ -2446,6 +2446,37 @@ impl ServerToolLoop {
         }
     }
 
+    /// Move every definition the model's search found out of `deferred` and
+    /// into the replay body's `tools`, so the next round can call it. A tool
+    /// revealed stays revealed for the rest of the turn; the next request's
+    /// history decides again (wiki:tool-search).
+    fn reveal_found(&mut self, renders: &[(String, server_tools::ClientRender)]) {
+        let searched = server_tools::function_name(server_tools::Tool::ToolSearch);
+        let found: Vec<&Value> = renders
+            .iter()
+            .filter(|(name, _)| *name == searched)
+            .flat_map(|(_, render)| render.marker["found"].as_array().into_iter().flatten())
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        let mut revealed: Vec<Value> = Vec::new();
+        self.deferred.retain(|definition| {
+            if !found.iter().any(|name| **name == definition["function"]["name"]) {
+                return true;
+            }
+            revealed.push(definition.clone());
+            false
+        });
+        if revealed.is_empty() {
+            return;
+        }
+        match self.body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            Some(tools) => tools.extend(revealed),
+            None => self.body["tools"] = Value::Array(revealed),
+        }
+    }
+
     /// The captured calls as (id, arguments), for telling whether one is
     /// queued; the continuation uses [`pending_calls`](Self::pending_calls)
     /// so it also knows which tool each call belongs to.
@@ -3246,6 +3277,8 @@ impl StreamCtx {
 
         let search = self.search.as_mut()?;
         search.commit(&served.renders);
+        // What a search found becomes callable on the round that follows it.
+        search.reveal_found(&served.renders);
         search.filter = ServerCallFilter::default();
 
         // The model's own view of the turn: it called the functions, these
@@ -8230,6 +8263,214 @@ mod tests {
 
         let bodies = strong.lock().unwrap();
         assert_eq!(bodies[0]["model"], "s", "the entry's model picks the advisor");
+    }
+
+    /// The whole point of deferring: the model searches, and what it finds is
+    /// in the body it is asked to answer from. The first upstream call carries
+    /// the reserved function alone; the second carries the tool the search
+    /// revealed, and the client never sees a `pxy_` name.
+    #[tokio::test]
+    async fn tool_search_reveals_its_match_into_the_continuation() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    let searched = body["messages"].to_string().contains("get_weather");
+                    sink.lock().unwrap().push(body);
+                    let sse = if searched {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_tool_search\",\"arguments\":\"{\\\"pattern\\\":\\\"weather\\\"}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "tool_search_reveal",
+        );
+        let deferred = |name: &str, description: &str| {
+            json!({"type": "function", "function": {
+                "name": name,
+                "description": description,
+                "parameters": {"type": "object", "properties": {}},
+                "defer_loading": true,
+            }})
+        };
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what is it like out?"}],
+            "tools": [
+                {"type": "pxy:tool_search"},
+                deferred("get_weather", "Conditions for a city."),
+                deferred("send_email", "Deliver a note."),
+            ],
+        });
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let text = String::from_utf8_lossy(
+            &axum::body::to_bytes(body, 1 << 20).await.unwrap(),
+        )
+        .to_string();
+        assert!(text.contains("final answer"), "{text}");
+        assert!(!text.contains("pxy_"), "no reserved name may reach the client: {text}");
+        assert!(text.contains("\"tool_search_requests\":1"), "{text}");
+
+        let bodies = seen.lock().unwrap();
+        let offered = |body: &Value| -> Vec<String> {
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(offered(&bodies[0]), vec!["pxy_tool_search"], "{}", bodies[0]);
+        // The match is revealed; the tool the model did not search for waits.
+        assert_eq!(
+            offered(&bodies[1]),
+            vec!["pxy_tool_search", "get_weather"],
+            "{}",
+            bodies[1]
+        );
+    }
+
+    /// An Anthropic Messages client gets the search as the official block
+    /// shapes. A pattern the engine rejects is an error block the model can
+    /// learn from, not a failed turn, so it searches again and gets the
+    /// result block.
+    #[tokio::test]
+    async fn tool_search_renders_both_result_blocks_on_the_messages_dialect() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    let history = body["messages"].to_string();
+                    sink.lock().unwrap().push(body);
+                    let call = |pattern: &str| {
+                        format!(
+                            concat!(
+                                "data: {{\"id\":\"c1\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[",
+                                "{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                                "\"function\":{{\"name\":\"pxy_tool_search\",\"arguments\":\"{{\\\"pattern\\\":\\\"{pattern}\\\"}}\"}}}}]}}}}]}}\n\n",
+                                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                                "data: [DONE]\n\n",
+                            ),
+                            pattern = pattern
+                        )
+                    };
+                    let sse = if history.contains("get_weather") {
+                        concat!(
+                            "data: {\"id\":\"c3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                        .to_string()
+                    } else if history.contains("invalid regular expression") {
+                        // Second try, with a pattern that compiles.
+                        call("weather")
+                    } else {
+                        // First try: an unclosed group.
+                        call("get_(")
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "tool_search_messages",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "what is it like out?"}],
+            "tools": [
+                {"type": "tool_search_tool_regex_20251119", "name": "tool_search"},
+                {
+                    "name": "get_weather",
+                    "description": "Conditions for a city.",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "defer_loading": true,
+                },
+            ],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let text = String::from_utf8_lossy(
+            &axum::body::to_bytes(body, 1 << 20).await.unwrap(),
+        )
+        .to_string();
+        assert!(text.contains("final answer"), "{text}");
+        assert!(text.contains("\"server_tool_use\""), "{text}");
+        assert!(text.contains("tool_search_tool_regex"), "{text}");
+        assert!(text.contains("tool_search_tool_result_error"), "{text}");
+        assert!(text.contains("invalid_tool_input"), "{text}");
+        assert!(text.contains("tool_search_tool_search_result"), "{text}");
+        assert!(text.contains("\"tool_name\":\"get_weather\""), "{text}");
+        assert!(!text.contains("pxy_"), "no reserved name may reach the client: {text}");
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "a bad pattern costs a round, not the turn");
+        let last = bodies[2]["tools"].as_array().unwrap();
+        assert!(
+            last.iter().any(|t| t["function"]["name"] == "get_weather"),
+            "the revealed tool must be callable: {}",
+            bodies[2]
+        );
     }
 
     /// An advisor model that does not resolve must not fail the outer turn:
