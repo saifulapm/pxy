@@ -6421,8 +6421,13 @@ mod tests {
             post(move |axum::Json(body): axum::Json<Value>| {
                 let sink = sink.clone();
                 async move {
-                    let tool_error =
-                        body["messages"].to_string().contains("Every panel member failed");
+                    // The follow-up turn carries the served-tool result as a
+                    // `role: "tool"` message; the first ask has none. Keying on
+                    // the role, not the failure wording, keeps the mock honest
+                    // if that wording changes.
+                    let tool_error = body["messages"]
+                        .as_array()
+                        .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
                     sink.lock().unwrap().push(body);
                     let sse = if tool_error {
                         concat!(

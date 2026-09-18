@@ -1742,6 +1742,39 @@ mod tests {
         assert!(out.get("analysis").is_none(), "a failed analyst adds no analysis: {out}");
     }
 
+    /// An all-failed panel is a tool error the outer model reads, not an `ok`
+    /// with an empty analysis: every member's failure rides back labelled and
+    /// the status tells the dialect layer to render an error.
+    #[tokio::test]
+    async fn fusion_reports_error_when_every_panel_member_fails() {
+        let app = mock_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/c"
+            models = ["m"]
+            [server_tools]
+            fusion_panel = ["missing/one", "missing/two"]
+            "#,
+            "fusion_all_fail",
+        );
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::Fusion
+            .execute(&ctx, &json!({"prompt": "which is best?"}))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "error", "{out}");
+        let panel = out["panel"].as_array().expect("every failure rides along");
+        assert_eq!(panel.len(), 2, "{out}");
+        assert!(panel.iter().all(|a| a["error"].is_string()), "{out}");
+        assert!(
+            out["error"].as_str().is_some_and(|e| e.contains("Every panel member failed")),
+            "{out}"
+        );
+        assert_eq!(ran.client.marker["status"], "error", "the dialect layer reads the marker");
+    }
+
     /// A minimal app for the executor tests, mirroring `router`'s test app.
     fn mock_app(cfg_toml: &str, name: &str) -> std::sync::Arc<App> {
         let cfg: crate::config::Config = toml::from_str(cfg_toml).unwrap();

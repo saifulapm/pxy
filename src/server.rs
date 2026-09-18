@@ -1344,9 +1344,6 @@ async fn fetch_balance(
 mod tests {
     use super::*;
 
-    /// Only codex gets the manifest dialect, and it announces itself with
-    /// `originator` — `codex_cli_rs` in the TUI, `codex_exec` under
-    /// `codex exec`. Every other client keeps the OpenAI list.
     /// aihubmix reports quota in units of 1/500000 USD, and reports what is
     /// LEFT rather than what was granted — reading `quota` as dollars would
     /// show a $10 balance as $10,000,000.
@@ -1363,10 +1360,6 @@ mod tests {
         assert!(newapi_balance(&json!({"data": {"total_credits": 10.0}})).is_none());
     }
 
-    /// DeepSeek reports money as strings and usability as a separate flag.
-    /// Reading the number alone is the trap: an account whose grant expired
-    /// still reports a total while refusing every call.
-    #[test]
     /// The documented ZenMux payg body, and the collisions it must NOT cause:
     /// `total_credits` means "left" here but "granted" at OpenRouter.
     #[test]
@@ -1421,6 +1414,9 @@ mod tests {
         assert!(amd_balance(&json!({"balance_infos": [{"currency": "USD"}]})).is_none());
     }
 
+    /// DeepSeek reports money as strings and usability as a separate flag.
+    /// Reading the number alone is the trap: an account whose grant expired
+    /// still reports a total while refusing every call.
     #[test]
     fn deepseek_balance_reads_strings_and_leads_with_usability() {
         let ok = deepseek_balance(&json!({
@@ -1456,6 +1452,9 @@ mod tests {
         assert!(deepseek_balance(&json!({"data": {"total_credits": 10.0}})).is_none());
     }
 
+    /// Only codex gets the manifest dialect, and it announces itself with
+    /// `originator` — `codex_cli_rs` in the TUI, `codex_exec` under
+    /// `codex exec`. Every other client keeps the OpenAI list.
     #[test]
     fn codex_is_recognised_by_originator() {
         assert!(is_codex(&headers(&[("originator", "codex_cli_rs")])));
@@ -1634,6 +1633,72 @@ mod tests {
         let out = models(State(app), HeaderMap::new()).await;
         assert_eq!(out.0["object"], "list", "other clients keep the OpenAI shape");
         assert_eq!(out.0["data"][0]["object"], "model");
+    }
+
+    /// A live fusion call served to a /v1/responses client: the router keys the
+    /// marker chunk `pxy_fusion`, and the Responses translator must swallow it,
+    /// so the client sees its own items and the model's answer, never a pxy_*
+    /// name or the raw marker object.
+    #[tokio::test]
+    async fn responses_client_never_sees_the_fusion_marker() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/c",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                // The follow-up turn carries the fusion result as a tool
+                // message; the first ask declares the tool instead.
+                let follow_up = body["messages"]
+                    .as_array()
+                    .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
+                let sse = if follow_up {
+                    concat!(
+                        "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                } else {
+                    concat!(
+                        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                        "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                        "\"function\":{\"name\":\"pxy_fusion\",\"arguments\":\"{\\\"prompt\\\":\\\"why?\\\"}\"}}]}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                };
+                axum::http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["m"]
+                [server_tools]
+                fusion_panel = ["missing/one", "missing/two"]
+                "#
+            ),
+            "responses_fusion",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "input": "why is the sky blue?",
+            "stream": true,
+            "tools": [{"type": "pxy:fusion"}],
+        });
+        let out = responses(State(app.clone()), HeaderMap::new(), Json(payload)).await;
+        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("final answer"), "the turn must complete: {text}");
+        assert!(!text.contains("pxy_fusion"), "the marker must not leak: {text}");
+        assert!(!text.contains("pxy_"), "no reserved name may reach the client: {text}");
     }
 
     #[test]
