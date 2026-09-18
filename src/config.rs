@@ -1141,10 +1141,38 @@ mod tests {
         let jina = &cfg.providers["jina"];
         assert_eq!(jina.base_url.as_deref(), Some("https://api.jina.ai/v1/chat/completions"));
         assert!(jina.models.iter().any(|m| m.spec().id == "jina-ocr-v1"));
-        // Commented out like the other defaults, but the spelling has to be
-        // right for the line to work when it is uncommented.
+        // Commented out like the other defaults, so the parser never sees it:
+        // read the model off the line by hand and hold it to the rule the
+        // block states, that describe_image is sent the real image and so
+        // cannot name an entry that 400s on one.
         assert!(src.contains("# [server_tools.defaults.describe_image]"), "{src}");
         assert!(src.contains("# ocr_model = \"jina/jina-ocr-v1\""), "{src}");
+        let block = src.split("# [server_tools.defaults.describe_image]").nth(1).unwrap();
+        let named: Vec<String> = block
+            .lines()
+            // The first line is what followed the header on its own line.
+            .skip(1)
+            .take_while(|l| l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(key, value)| (key.trim_matches(['#', ' ']), value.trim().trim_matches('"')))
+            .filter(|(key, _)| *key == "model" || *key == "ocr_model")
+            .map(|(_, value)| value.to_string())
+            .collect();
+        assert_eq!(named.len(), 2, "both models must be read off the block: {named:?}");
+        for id in named {
+            let (provider, model) = id.split_once('/').expect("provider/model");
+            let spec = cfg.providers[provider]
+                .models
+                .iter()
+                .map(|m| m.spec())
+                .find(|s| s.id == model)
+                .unwrap_or_else(|| panic!("{id} is not a model this config declares"));
+            assert_ne!(
+                spec.vision,
+                Some(false),
+                "{id} cannot see, so it would answer every describe_image call with a 400"
+            );
+        }
     }
 
     #[test]

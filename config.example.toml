@@ -1,8 +1,9 @@
 # pxy example config.
 #
 # This file is a REFERENCE, not a working setup: every provider, model id and
-# URL below is fictional. Copy the blocks you need into
-# ~/.config/pxy/config.toml and edit them.
+# URL below is fictional, with one exception, `[providers.jina]`, which names a
+# real endpoint because describe_image's `ocr_model` wants one that exists.
+# Copy the blocks you need into ~/.config/pxy/config.toml and edit them.
 #
 # config.toml is the whole catalog. A model is served exactly when a provider
 # below declares it under `models = [...]`. `models.toml` (written by
@@ -54,7 +55,8 @@ max_age_secs = 86400
 # datetime, search_models, image_generation, advisor, subagent, fusion,
 # tool_search, describe_image — as `pxy:<tool>` or OpenRouter's
 # `openrouter:<tool>` spelling, with the `parameters` OpenRouter documents for
-# each (describe_image is pxy's own, so it has only the `pxy:` spelling).
+# each. describe_image is pxy's own: one `pxy:` spelling, and its parameters
+# are pxy's too.
 [server_tools]
 # Which tools may be served. A tool missing from this list is treated as
 # unservable: dropped on a multi-candidate walk, or the request refused on a
@@ -94,6 +96,8 @@ max_tool_calls = 10
 # used for `mode = "ocr"` and falls back to `model`.
 # The model named here must be one that CAN see: it is sent the real image,
 # and a `vision = false` entry would answer every call with its own 400.
+# Uncommenting a defaults block also means adding that tool to `enabled`
+# above, or startup fails: a default naming a disabled tool is a hard error.
 # [server_tools.defaults.describe_image]
 # model = "beta/model-large"
 # ocr_model = "jina/jina-ocr-v1"
@@ -202,11 +206,15 @@ models = [
     # Asserted capabilities. `tool_call = false` IS read by routing: the model
     # is skipped on a tools walk. Omit to fail open.
     tool_call = true,
-    # `free`, `reasoning` and `vision` are display/capability metadata;
-    # routing never reads them. `vision = false` asserts that this upstream
-    # 400s on an image part, so pxy swaps each image in the transcript for an
-    # `[image N]` placeholder and only describe_image can look at it. Omit it
-    # when nobody knows, and images pass through as they always did.
+    # `reasoning` is capability metadata routing never reads. `free` IS read:
+    # it picks the candidates behind the `auto/free` virtual id, so a wrong
+    # one sends real traffic to a paid model. `vision = false` asserts that
+    # this upstream 400s on an image part, and pxy then swaps each image in
+    # the transcript for an `[image N]` placeholder that only describe_image
+    # can look at. The swap reads the chat body after translation, so it takes
+    # effect for an OpenAI-wire candidate; an Anthropic-format upstream is
+    # still sent the image as it was. Omit the key when nobody knows, and
+    # images pass through as they always did.
     free = false,
     reasoning = true,
     vision = false,

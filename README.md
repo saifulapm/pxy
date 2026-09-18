@@ -85,12 +85,13 @@ offers the model a plain function, runs the call itself, and feeds the result
 back into the same streamed turn. Claude Code gets the `server_tool_use`
 blocks it expects. Ten tools are served: web_search, web_fetch, datetime,
 search_models, image_generation, advisor, subagent, fusion, tool_search and
-describe_image, each taking the parameters OpenRouter documents for it. A
-client with more tools than one turn can afford marks the spare ones
-`defer_loading` and declares tool_search: pxy keeps them out of the upstream
-body, and the model gets back the ones it asks for by searching. A model that
-cannot take an image at all is marked `vision = false`: pxy puts `[image 1]`
-in the transcript where the image was, and the model hands that number to
+describe_image. Each takes the parameters OpenRouter documents for it, bar
+describe_image, which is pxy's own and takes pxy's. A client with more tools
+than one turn can afford marks the spare ones `defer_loading` and declares
+tool_search: pxy keeps them out of the upstream body, and the model gets back
+the ones it asks for by searching. A model that cannot take an image at all is
+marked `vision = false`: on an OpenAI-format upstream pxy puts `[image 1]` in
+the transcript where the image was, and the model hands that number to
 describe_image, which asks a model that can see. The `[server_tools]` table in
 `config.toml` decides which are served, how many tool-call steps one turn
 may take, and, through `[server_tools.defaults.<tool>]`, which ride every
