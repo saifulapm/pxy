@@ -25,6 +25,7 @@ pub enum Tool {
     ImageGeneration,
     Advisor,
     Subagent,
+    Fusion,
 }
 
 impl Tool {
@@ -40,6 +41,7 @@ impl Tool {
             Tool::ImageGeneration,
             Tool::Advisor,
             Tool::Subagent,
+            Tool::Fusion,
         ]
     }
 
@@ -54,6 +56,7 @@ impl Tool {
             Tool::ImageGeneration => "image_generation",
             Tool::Advisor => "advisor",
             Tool::Subagent => "subagent",
+            Tool::Fusion => "fusion",
         }
     }
 
@@ -61,7 +64,7 @@ impl Tool {
     /// router. A meta-tool is stripped from a sub-request, so recursion stops
     /// at one level.
     pub fn is_meta(self) -> bool {
-        matches!(self, Tool::Advisor | Tool::Subagent)
+        matches!(self, Tool::Advisor | Tool::Subagent | Tool::Fusion)
     }
 
     /// Run one call for this tool. `Err` means the call could not be served at
@@ -77,6 +80,7 @@ impl Tool {
             Tool::ImageGeneration => run_image_generation(ctx, args).await,
             Tool::Advisor => run_advisor(ctx, args).await,
             Tool::Subagent => run_subagent(ctx, args).await,
+            Tool::Fusion => run_fusion(ctx, args).await,
         }
     }
 
@@ -99,8 +103,10 @@ impl Tool {
             Tool::Datetime => true,
             Tool::SearchModels => true,
             Tool::ImageGeneration => crate::media::image_chain_can_return_urls(&app.cfg),
-            // A meta-tool needs only the router it is already in.
+            // A meta-tool needs only the router it is already in; fusion
+            // additionally needs a panel to convene.
             Tool::Advisor | Tool::Subagent => true,
+            Tool::Fusion => !app.cfg.server_tools.fusion_panel.is_empty(),
         }
     }
 
@@ -249,6 +255,7 @@ pub async fn run_analyst(
     model: &str,
     prompt: &str,
     answers: &[(String, Result<String, String>)],
+    params: &Value,
 ) -> Result<Value, String> {
     let mut panel = String::new();
     for (name, answer) in answers {
@@ -264,8 +271,89 @@ pub async fn run_analyst(
             "content": format!("Question:\n{prompt}\n\nPanel answers:\n{panel}"),
         }),
     ];
-    let text = run_internal_chat(app, model, messages, json!({})).await?;
+    let text = run_internal_chat(app, model, messages, params.clone()).await?;
     serde_json::from_str(&text).map_err(|e| format!("analyst returned non-JSON: {e}"))
+}
+
+/// The declaration's options that ride a meta-tool's sub-request: the served
+/// tools it lists, so the sub-request can use them, and the token, sampling
+/// and step caps. `run_internal_chat` owns `model`, `messages` and `stream`.
+fn leg_params(declaration: &Value) -> Value {
+    let mut params = json!({});
+    if let Some(tools) = declaration["tools"].as_array().filter(|t| !t.is_empty()) {
+        params["tools"] = Value::Array(tools.clone());
+    }
+    for key in ["max_tool_calls", "max_completion_tokens", "temperature", "reasoning"] {
+        if !declaration[key].is_null() {
+            params[key] = declaration[key].clone();
+        }
+    }
+    params
+}
+
+/// Run one fusion call: every configured panel member answers the same prompt
+/// at once, one analyst compares the answers, and the outer model writes the
+/// final answer from the analysis. Panel and analyst are config, never the
+/// model's choice. Degradation is deliberate — a failed analyst leaves the raw
+/// panel intact, and only an all-failed panel is an error.
+async fn run_fusion(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let prompt = args["prompt"].as_str().filter(|p| !p.is_empty()).ok_or("missing prompt")?;
+    let panel = ctx.app.cfg.server_tools.fusion_panel.clone();
+    let analyst = ctx
+        .app
+        .cfg
+        .server_tools
+        .resolved_fusion_analyst()
+        .ok_or("no fusion panel configured")?
+        .to_string();
+    let params = leg_params(&ctx.params);
+
+    let answers = run_panel(ctx.app, &panel, prompt, &params).await;
+    if answers.iter().all(|(_, answer)| answer.is_err()) {
+        let first = answers
+            .iter()
+            .find_map(|(_, answer)| answer.as_ref().err())
+            .cloned()
+            .unwrap_or_default();
+        warn!(panel = panel.len(), "fusion panel failed");
+        return Ok(Ran {
+            model_output: json!({
+                "status": "error",
+                "panel": panel_answers(&answers),
+                "error": format!("Every panel member failed: {first}"),
+            })
+            .to_string(),
+            client: fusion_render(ctx.call_id, "error"),
+        });
+    }
+
+    let mut result = json!({"status": "ok", "panel": panel_answers(&answers)});
+    match run_analyst(ctx.app, &analyst, prompt, &answers, &params).await {
+        Ok(analysis) => result["analysis"] = analysis,
+        Err(e) => warn!(%analyst, error = %e, "fusion analyst failed; returning the panel"),
+    }
+    info!(panel = panel.len(), "fusion served");
+    Ok(Ran { model_output: result.to_string(), client: fusion_render(ctx.call_id, "ok") })
+}
+
+/// The panel's answers as the model sees them: one entry per member, labelled
+/// by model, carrying its answer or its failure.
+fn panel_answers(answers: &[(String, Result<String, String>)]) -> Value {
+    Value::Array(
+        answers
+            .iter()
+            .map(|(model, answer)| match answer {
+                Ok(text) => json!({"model": model, "answer": text}),
+                Err(e) => json!({"model": model, "error": e}),
+            })
+            .collect(),
+    )
+}
+
+/// Fusion's client material. No dialect documents a fusion result block, so
+/// the marker carries the status for the dialect layer to read.
+fn fusion_render(call_id: &str, status: &str) -> ClientRender {
+    ClientRender { blocks: Vec::new(), marker: json!({"id": call_id, "status": status}) }
 }
 
 /// The request's declaration of this tool, when it carries one. A `function`
@@ -296,6 +384,7 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "openrouter:image_generation" | "pxy:image_generation" => Some(Tool::ImageGeneration),
         "openrouter:advisor" | "pxy:advisor" => Some(Tool::Advisor),
         "openrouter:subagent" | "pxy:subagent" => Some(Tool::Subagent),
+        "openrouter:fusion" | "pxy:fusion" => Some(Tool::Fusion),
         // The Anthropic native advisor is dated, like its other server tools.
         t if t.starts_with("advisor_") => Some(Tool::Advisor),
         t if t.starts_with("web_search") => Some(Tool::WebSearch),
@@ -451,6 +540,25 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                         },
                     },
                     "required": ["task_name", "task_description"],
+                },
+            },
+        }),
+        Tool::Fusion => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::Fusion),
+                "description": "Convene a panel of models on one question and get a \
+                    structured comparison of their answers. Use it when a question \
+                    deserves several independent attempts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "The question for the panel."
+                        },
+                    },
+                    "required": ["prompt"],
                 },
             },
         }),
@@ -801,18 +909,10 @@ async fn run_subagent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         messages.push(json!({"role": "system", "content": instructions}));
     }
     messages.push(json!({"role": "user", "content": task}));
-    let mut params = json!({});
     // The worker's own served tools ride the sub-request: the loop injects and
     // serves them there, exactly as it does for a client turn. `tool_depth` 1
     // strips any meta-tool, so a worker can never re-enter one.
-    if let Some(tools) = ctx.params["tools"].as_array().filter(|t| !t.is_empty()) {
-        params["tools"] = Value::Array(tools.clone());
-    }
-    for key in ["max_tool_calls", "max_completion_tokens", "temperature", "reasoning"] {
-        if !ctx.params[key].is_null() {
-            params[key] = ctx.params[key].clone();
-        }
-    }
+    let params = leg_params(&ctx.params);
     match run_internal_chat(ctx.app, model, messages, params).await {
         Ok(outcome) => {
             info!(%model, %task_name, "subagent served");
@@ -1542,7 +1642,7 @@ mod tests {
         );
         let models = vec!["p/a".to_string(), "p/b".to_string(), "p/c".to_string()];
         let answers = run_panel(&app, &models, "which is best?", &json!({})).await;
-        let analysis = run_analyst(&app, "p/an", "which is best?", &answers).await.unwrap();
+        let analysis = run_analyst(&app, "p/an", "which is best?", &answers, &json!({})).await.unwrap();
         assert_eq!(analysis["summary"], "they agree");
 
         let bodies = seen.lock().unwrap();
@@ -1588,8 +1688,58 @@ mod tests {
             "analyst_non_json",
         );
         let answers = vec![("p/a".to_string(), Ok("hi".to_string()))];
-        let err = run_analyst(&app, "p/an", "q", &answers).await.unwrap_err();
+        let err = run_analyst(&app, "p/an", "q", &answers, &json!({})).await.unwrap_err();
         assert!(err.contains("non-JSON"), "{err}");
+    }
+
+    /// Fusion runs the configured panel and analyst, and an analyst that
+    /// fails does not fail the call: the raw panel answers come back with no
+    /// analysis field, so the outer model can still answer.
+    #[tokio::test]
+    async fn fusion_returns_the_panel_when_the_analyst_fails() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/c",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                let content = if body["model"] == "an" {
+                    "prose, not json".to_string()
+                } else {
+                    format!("answer from {}", body["model"].as_str().unwrap_or("?"))
+                };
+                axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["a", "b", "an"]
+                [server_tools]
+                fusion_panel = ["p/a", "p/b"]
+                fusion_analyst = "p/an"
+                "#
+            ),
+            "fusion_analyst_failure",
+        );
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::Fusion
+            .execute(&ctx, &json!({"prompt": "which is best?"}))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "ok", "{out}");
+        let panel = out["panel"].as_array().expect("the panel answers ride along");
+        assert_eq!(panel.len(), 2, "{out}");
+        assert!(panel.iter().any(|a| a["answer"] == "answer from a"), "{out}");
+        assert!(panel.iter().any(|a| a["answer"] == "answer from b"), "{out}");
+        assert!(out.get("analysis").is_none(), "a failed analyst adds no analysis: {out}");
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.

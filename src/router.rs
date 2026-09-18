@@ -3554,20 +3554,29 @@ mod tests {
         let payload = json!({"tools": [
             {"type": "web_search_20250305", "name": "web_search"},
             {"type": "openrouter:web_search"},
-            {"type": "openrouter:fusion"},
+            {"type": "openrouter:web_fetch"},
         ]});
-        let default = ServerToolsConfig::default();
-        assert_eq!(
-            openai_unservable_server_tools(&payload, &default),
-            vec!["openrouter:fusion"]
+        // Every declared spelling pxy implements is served by default.
+        assert!(
+            openai_unservable_server_tools(&payload, &ServerToolsConfig::default()).is_empty()
         );
-        let none = ServerToolsConfig { enabled: vec![], ..default };
+        // Dropping web_fetch from `enabled` makes its spelling unservable,
+        // whatever dialect declared it.
+        let without_fetch = ServerToolsConfig {
+            enabled: vec!["web_search".to_string()],
+            ..ServerToolsConfig::default()
+        };
+        assert_eq!(
+            openai_unservable_server_tools(&payload, &without_fetch),
+            vec!["openrouter:web_fetch"]
+        );
+        let none = ServerToolsConfig { enabled: vec![], ..without_fetch };
         assert_eq!(
             openai_unservable_server_tools(&payload, &none),
             vec![
                 "web_search",
                 "openrouter:web_search",
-                "openrouter:fusion"
+                "openrouter:web_fetch"
             ]
         );
     }
@@ -6528,7 +6537,7 @@ mod tests {
 
         // Alone on an OpenAI candidate there is no peer to hand a spelling pxy
         // cannot inject to: 400, with no upstream call spent.
-        for ty in ["openrouter:fusion"] {
+        for ty in ["openrouter:code_execution"] {
             let payload = json!({
                 "model": "free/small", "max_tokens": 100,
                 "messages": [{"role": "user", "content": "x"}],
@@ -6548,7 +6557,7 @@ mod tests {
         let payload = json!({
             "model": "auto", "max_tokens": 100,
             "messages": [{"role": "user", "content": "fetch"}],
-            "tools": [{"type": "openrouter:fusion"}],
+            "tools": [{"type": "openrouter:code_execution"}],
         });
         let out =
             handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
@@ -6561,7 +6570,7 @@ mod tests {
         assert!(
             bodies[0]["tools"]
                 .as_array()
-                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "openrouter:fusion")),
+                .is_some_and(|ts| ts.iter().any(|t| t["type"] == "openrouter:code_execution")),
             "the unservable tool must reach the Anthropic peer intact: {:?}",
             bodies[0]["tools"]
         );
