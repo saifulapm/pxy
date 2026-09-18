@@ -177,22 +177,6 @@ pub struct ServerToolsConfig {
     pub defaults: BTreeMap<String, toml::Value>,
 }
 
-impl ServerToolsConfig {
-    /// The model that analyses the panel: the configured analyst, or the
-    /// first panel member when the key is absent. `None` when no panel is
-    /// configured.
-    pub fn resolved_fusion_analyst(&self) -> Option<&str> {
-        // No panel means there is nothing to analyse, whatever the analyst
-        // key says.
-        if self.fusion_panel.is_empty() {
-            return None;
-        }
-        self.fusion_analyst
-            .as_deref()
-            .or_else(|| self.fusion_panel.first().map(String::as_str))
-    }
-}
-
 impl Default for ServerToolsConfig {
     fn default() -> Self {
         Self {
@@ -1116,46 +1100,24 @@ mod tests {
     }
 
     /// Fusion's panel is config, not a vendor preset: empty until the user
-    /// names one, and the analyst falls back to the first panel member.
+    /// names one; the analyst key is optional and read by the executor.
     #[test]
-    fn fusion_analyst_defaults_to_the_first_panel_member() {
+    fn fusion_panel_and_analyst_are_plain_config() {
         let cfg: Config = toml::from_str(
             r#"
             [server]
             [server_tools]
             fusion_panel = ["aaa", "glm"]
+            fusion_analyst = "big"
             "#,
         )
         .unwrap();
         assert_eq!(cfg.server_tools.fusion_panel, vec!["aaa", "glm"]);
-        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), Some("aaa"));
+        assert_eq!(cfg.server_tools.fusion_analyst.as_deref(), Some("big"));
 
-        let cfg: Config = toml::from_str(
-            r#"
-            [server]
-            [server_tools]
-            fusion_panel = ["aaa", "glm"]
-            fusion_analyst = "big"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), Some("big"));
-
-        // No panel means fusion has nothing to run and the tool is unservable,
-        // even if an analyst was named without one.
         let cfg: Config = toml::from_str("[server]").unwrap();
         assert!(cfg.server_tools.fusion_panel.is_empty());
-        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), None);
-
-        let cfg: Config = toml::from_str(
-            r#"
-            [server]
-            [server_tools]
-            fusion_analyst = "big"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), None);
+        assert!(cfg.server_tools.fusion_analyst.is_none());
     }
 }
 

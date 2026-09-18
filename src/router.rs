@@ -2502,6 +2502,7 @@ async fn serve_calls(
         ctx.session = loop_.session.clone();
         ctx.outer_model = loop_.outer_model.clone();
         ctx.results_used = loop_.results_served + batch_hits;
+        ctx.transcript = loop_.body["messages"].as_array().cloned().unwrap_or_default();
         match tool.execute(&ctx, &args).await {
             Ok(ran) => {
                 batch_hits += ran.client.marker["hits"].as_u64().unwrap_or(0);
@@ -8041,7 +8042,7 @@ mod tests {
         let bodies = seen.lock().unwrap();
         assert_eq!(bodies.len(), 2, "ask, then answer");
         assert!(
-            bodies[1]["messages"].to_string().contains("Every panel member failed"),
+            bodies[1]["messages"].to_string().contains("all panel models failed"),
             "the model must read the failure: {}",
             bodies[1]["messages"]
         );

@@ -178,6 +178,9 @@ pub struct ToolCtx<'a> {
     /// Search results already returned to the model this turn, for
     /// web_search's `max_total_results`.
     pub results_used: u64,
+    /// The turn's conversation as the upstream sees it, for an advisor
+    /// declared with `forward_transcript`.
+    pub transcript: Vec<Value>,
 }
 
 impl<'a> ToolCtx<'a> {
@@ -191,7 +194,17 @@ impl<'a> ToolCtx<'a> {
             session: None,
             outer_model: String::new(),
             results_used: 0,
+            transcript: Vec::new(),
         }
+    }
+
+    /// The declaration's model, else the client's own: OpenRouter's fallback
+    /// for every meta-tool. `None` when neither names one.
+    fn declared_or_outer_model(&self) -> Option<&str> {
+        self.params["model"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .or_else(|| Some(self.outer_model.as_str()).filter(|m| !m.is_empty()))
     }
 
     /// The context a sub-request through pxy's router runs under: the
@@ -277,13 +290,24 @@ pub async fn run_panel(
 /// is the system turn of every analyst sub-request.
 const ANALYST_INSTRUCTIONS: &str = "You are the analyst of a panel of models. \
 Compare the panel's answers to the question and reply with a single JSON \
-object and nothing else. Name where they agree, where they differ, and which \
-answer is best supported, so a writer can produce a final answer from it.";
+object and nothing else, with exactly these keys: \
+\"consensus\" (points all or most answers agree on, as strings), \
+\"contradictions\" (objects with \"topic\" and \"stances\", each stance an \
+object with \"model\" and \"stance\"), \
+\"partial_coverage\" (objects with \"models\" and \"point\", for points only \
+some answers covered), \
+\"unique_insights\" (objects with \"model\" and \"insight\", for what only one \
+answer raised) and \
+\"blind_spots\" (topics no answer addressed, as strings). \
+Treat what most agree on as higher-confidence, keep every contradiction, and \
+never merge the answers into one: a writer produces the final answer from \
+your analysis.";
 
 /// Have one model analyse the panel's answers. The analyst sees the original
 /// question and every leg's answer, labelled by the model that gave it; a leg
-/// that failed is shown as a failure, not hidden. Its reply must be JSON — a
-/// reply that will not parse is an error, and the caller keeps the raw panel.
+/// that failed is shown as a failure, not hidden. It always runs at
+/// temperature 0. Its reply must be a JSON object — a reply that will not
+/// parse is an error, and the caller keeps the raw panel.
 pub async fn run_analyst(
     app: &SharedApp,
     model: &str,
@@ -306,17 +330,29 @@ pub async fn run_analyst(
             "content": format!("Question:\n{prompt}\n\nPanel answers:\n{panel}"),
         }),
     ];
-    let text = run_internal_chat(app, model, messages, params.clone(), caller).await?;
-    serde_json::from_str(&text).map_err(|e| format!("analyst returned non-JSON: {e}"))
+    let mut params = params.clone();
+    params["temperature"] = json!(0);
+    let text = run_internal_chat(app, model, messages, params, caller).await?;
+    let analysis: Value =
+        serde_json::from_str(text.trim()).map_err(|e| format!("analyst returned non-JSON: {e}"))?;
+    if !analysis.is_object() {
+        return Err("analyst returned JSON that is not an object".to_string());
+    }
+    Ok(analysis)
 }
 
 /// The declaration's options that ride a meta-tool's sub-request: the served
-/// tools it lists, so the sub-request can use them, and the token, sampling
-/// and step caps. `run_internal_chat` owns `model`, `messages` and `stream`.
-fn leg_params(declaration: &Value) -> Value {
+/// tools it lists (or `default_tools` when it lists none at all), so the
+/// sub-request can use them, and the token, sampling and step caps.
+/// `run_internal_chat` owns `model`, `messages` and `stream`.
+fn leg_params(declaration: &Value, default_tools: &[Tool]) -> Value {
     let mut params = json!({});
-    if let Some(tools) = declaration["tools"].as_array().filter(|t| !t.is_empty()) {
-        params["tools"] = Value::Array(tools.clone());
+    let tools: Vec<Value> = match declaration["tools"].as_array() {
+        Some(listed) => listed.clone(),
+        None => default_tools.iter().map(|t| json!({"type": format!("pxy:{}", t.name())})).collect(),
+    };
+    if !tools.is_empty() {
+        params["tools"] = Value::Array(tools);
     }
     for key in ["max_tool_calls", "max_completion_tokens", "temperature", "reasoning"] {
         if !declaration[key].is_null() {
@@ -326,64 +362,107 @@ fn leg_params(declaration: &Value) -> Value {
     params
 }
 
-/// Run one fusion call: every configured panel member answers the same prompt
-/// at once, one analyst compares the answers, and the outer model writes the
-/// final answer from the analysis. Panel and analyst are config, never the
-/// model's choice. Degradation is deliberate — a failed analyst leaves the raw
-/// panel intact, and only an all-failed panel is an error.
+/// The output budget a fusion leg gets when its declaration sets none:
+/// OpenRouter's default, sized so a reasoning-heavy panelist still produces
+/// visible text.
+const FUSION_LEG_MAX_COMPLETION_TOKENS: u64 = 16_000;
+
+/// How many models a declaration may put on the panel.
+const FUSION_PANEL_MAX: usize = 8;
+
+/// OpenRouter's typed reason for a fusion run that produced nothing useful,
+/// read off the legs' failures.
+fn fusion_failure_reason(errors: &[&String]) -> &'static str {
+    let any = |needle: &[&str]| errors.iter().any(|e| needle.iter().any(|n| e.contains(n)));
+    if any(&["(402)", "insufficient credit", "insufficient_credits", "Insufficient credit"]) {
+        "insufficient_credits"
+    } else if any(&["(429)", "rate limit", "rate_limit", "Rate limit"]) {
+        "rate_limited"
+    } else {
+        "all_panels_failed"
+    }
+}
+
+/// Run one fusion call: every panel member answers the same prompt at once,
+/// one analyst compares the answers, and the outer model writes the final
+/// answer from the analysis. The panel is the declaration's
+/// `analysis_models` (at most eight) over `[server_tools] fusion_panel`; the
+/// analyst is the declaration's `model` over `fusion_analyst`, over the
+/// client's own model, over the first panel member. The model calling the
+/// tool never chooses either. Every leg has web_search and web_fetch unless
+/// the declaration lists `tools` itself. Degradation is deliberate — a failed
+/// analyst leaves the raw panel intact, a failed member is listed beside the
+/// answers, and only an all-failed panel is an error, with a typed reason.
 async fn run_fusion(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let prompt = args["prompt"].as_str().filter(|p| !p.is_empty()).ok_or("missing prompt")?;
-    let panel = ctx.app.cfg.server_tools.fusion_panel.clone();
-    let analyst = ctx
-        .app
-        .cfg
-        .server_tools
-        .resolved_fusion_analyst()
-        .ok_or("no fusion panel configured")?
-        .to_string();
-    let params = leg_params(&ctx.params);
+    let declared: Vec<String> = ctx.params["analysis_models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut panel = if declared.is_empty() {
+        ctx.app.cfg.server_tools.fusion_panel.clone()
+    } else {
+        declared
+    };
+    panel.truncate(FUSION_PANEL_MAX);
+    if panel.is_empty() {
+        return Err("no fusion panel configured".to_string());
+    }
+    let analyst = ctx.params["model"]
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| ctx.app.cfg.server_tools.fusion_analyst.clone())
+        .or_else(|| Some(ctx.outer_model.clone()).filter(|m| !m.is_empty()))
+        .unwrap_or_else(|| panel[0].clone());
+    let mut params = leg_params(&ctx.params, &[Tool::WebSearch, Tool::WebFetch]);
+    if params["max_completion_tokens"].is_null() {
+        params["max_completion_tokens"] = json!(FUSION_LEG_MAX_COMPLETION_TOKENS);
+    }
 
     let caller = ctx.sub_context();
     let answers = run_panel(ctx.app, &panel, prompt, &params, &caller).await;
-    if answers.iter().all(|(_, answer)| answer.is_err()) {
-        let first = answers
-            .iter()
-            .find_map(|(_, answer)| answer.as_ref().err())
-            .cloned()
-            .unwrap_or_default();
+    let responses: Vec<Value> = answers
+        .iter()
+        .filter_map(|(model, answer)| {
+            answer.as_ref().ok().map(|content| json!({"model": model, "content": content}))
+        })
+        .collect();
+    let failed_models: Vec<Value> = answers
+        .iter()
+        .filter_map(|(model, answer)| {
+            answer.as_ref().err().map(|error| json!({"model": model, "error": error}))
+        })
+        .collect();
+    if responses.is_empty() {
+        let errors: Vec<&String> = answers.iter().filter_map(|(_, a)| a.as_ref().err()).collect();
         warn!(panel = panel.len(), "fusion panel failed");
         return Ok(Ran {
             model_output: json!({
                 "status": "error",
-                "panel": panel_answers(&answers),
-                "error": format!("Every panel member failed: {first}"),
+                "error": "all panel models failed",
+                "failure_reason": fusion_failure_reason(&errors),
+                "failed_models": failed_models,
             })
             .to_string(),
             client: fusion_render(ctx.call_id, "error"),
         });
     }
 
-    let mut result = json!({"status": "ok", "panel": panel_answers(&answers)});
+    let mut result = json!({"status": "ok", "responses": responses});
+    if !failed_models.is_empty() {
+        result["failed_models"] = Value::Array(failed_models);
+    }
     match run_analyst(ctx.app, &analyst, prompt, &answers, &params, &caller).await {
         Ok(analysis) => result["analysis"] = analysis,
         Err(e) => warn!(%analyst, error = %e, "fusion analyst failed; returning the panel"),
     }
     info!(panel = panel.len(), "fusion served");
     Ok(Ran { model_output: result.to_string(), client: fusion_render(ctx.call_id, "ok") })
-}
-
-/// The panel's answers as the model sees them: one entry per member, labelled
-/// by model, carrying its answer or its failure.
-fn panel_answers(answers: &[(String, Result<String, String>)]) -> Value {
-    Value::Array(
-        answers
-            .iter()
-            .map(|(model, answer)| match answer {
-                Ok(text) => json!({"model": model, "answer": text}),
-                Err(e) => json!({"model": model, "error": e}),
-            })
-            .collect(),
-    )
 }
 
 /// Fusion's client material. No dialect documents a fusion result block, so
@@ -930,25 +1009,90 @@ pub fn declared_parameters(payload: &Value, tool: Tool) -> Value {
     params
 }
 
+/// The turn's conversation as prose an advisor can read without the tools
+/// that produced it: system turns stay, text turns stay, an assistant's tool
+/// calls become bracketed lines in its text, and a tool result becomes a
+/// user turn. No tool needs declaring on the advisor's request, so any
+/// upstream accepts it.
+fn transcript_as_prose(messages: &[Value]) -> Vec<Value> {
+    let text_of = |content: &Value| -> String {
+        match content {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or("user");
+        let mut text = text_of(&m["content"]);
+        match role {
+            "system" | "developer" => {
+                out.push(json!({"role": "system", "content": text}));
+                continue;
+            }
+            "assistant" => {
+                for call in m["tool_calls"].as_array().into_iter().flatten() {
+                    let name = call["function"]["name"].as_str().unwrap_or("?");
+                    let args = call["function"]["arguments"].as_str().unwrap_or("");
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("[tool call {name} {args}]"));
+                }
+            }
+            "tool" => {
+                let id = m["tool_call_id"].as_str().unwrap_or("");
+                text = format!("[tool result {id}] {text}");
+            }
+            _ => {}
+        }
+        if text.is_empty() {
+            continue;
+        }
+        let role = if role == "assistant" { "assistant" } else { "user" };
+        out.push(json!({"role": role, "content": text}));
+    }
+    out
+}
+
 /// Run one advisor call: the model's `prompt` goes to the advisor as a user
 /// turn, the declaration's `instructions` as the system turn, and the
-/// advisor's answer comes back as the tool result. The advisor sees only that
-/// — pxy keeps no conversation, so cross-request memory is out of scope. A
-/// failure is reported to the outer model, which continues without the advice.
+/// advisor's answer comes back as the tool result. The advisor model is the
+/// declaration's, else the call's own, else the client's model. With
+/// `forward_transcript` the advisor also sees the turn's conversation as
+/// prose, and the prompt becomes optional. A failure is reported to the outer
+/// model, which continues without the advice.
 async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
-    let prompt = args["prompt"].as_str().filter(|p| !p.is_empty()).ok_or("missing prompt")?;
+    let forward = ctx.params["forward_transcript"].as_bool().unwrap_or(false);
+    let prompt = args["prompt"].as_str().filter(|p| !p.is_empty());
+    if prompt.is_none() && !forward {
+        return Err("missing prompt".to_string());
+    }
+    let prompt = prompt.unwrap_or("");
     // The declaration's model wins; the call's own is honoured only when the
-    // declaration pins none.
+    // declaration pins none; the client's own model is the last resort.
     let model = ctx.params["model"]
         .as_str()
         .or_else(|| args["model"].as_str())
         .filter(|m| !m.is_empty())
+        .or_else(|| Some(ctx.outer_model.as_str()).filter(|m| !m.is_empty()))
         .ok_or("no advisor model")?;
     let mut messages: Vec<Value> = Vec::new();
     if let Some(instructions) = ctx.params["instructions"].as_str().filter(|s| !s.is_empty()) {
         messages.push(json!({"role": "system", "content": instructions}));
     }
-    messages.push(json!({"role": "user", "content": prompt}));
+    if forward {
+        messages.extend(transcript_as_prose(&ctx.transcript));
+    }
+    if !prompt.is_empty() {
+        messages.push(json!({"role": "user", "content": prompt}));
+    }
+    let knobs = leg_params(&ctx.params, &[]);
     let failed = |e: String| Ran {
         model_output: json!({"status": "error", "error": format!("Advisor call failed: {e}")})
             .to_string(),
@@ -957,7 +1101,7 @@ async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
             marker: json!({"id": ctx.call_id, "model": model, "prompt": prompt}),
         },
     };
-    match run_internal_chat(ctx.app, model, messages, json!({}), &ctx.sub_context()).await {
+    match run_internal_chat(ctx.app, model, messages, knobs, &ctx.sub_context()).await {
         Ok(advice) => {
             info!(%model, "advisor served");
             Ok(Ran {
@@ -1030,8 +1174,9 @@ async fn run_subagent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("missing task_description")?;
-    // The worker is fixed by the declaration; the model does not choose it.
-    let model = ctx.params["model"].as_str().filter(|m| !m.is_empty()).ok_or("no subagent model")?;
+    // The worker is fixed by the declaration, else it is the client's own
+    // model; the delegating model does not choose it.
+    let model = ctx.declared_or_outer_model().ok_or("no subagent model")?;
     let mut messages: Vec<Value> = Vec::new();
     if let Some(instructions) = ctx.params["instructions"].as_str().filter(|s| !s.is_empty()) {
         messages.push(json!({"role": "system", "content": instructions}));
@@ -1040,7 +1185,7 @@ async fn run_subagent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     // The worker's own served tools ride the sub-request: the loop injects and
     // serves them there, exactly as it does for a client turn. `tool_depth` 1
     // strips any meta-tool, so a worker can never re-enter one.
-    let params = leg_params(&ctx.params);
+    let params = leg_params(&ctx.params, &[]);
     match run_internal_chat(ctx.app, model, messages, params, &ctx.sub_context()).await {
         Ok(outcome) => {
             info!(%model, %task_name, "subagent served");
@@ -2050,11 +2195,87 @@ mod tests {
             .unwrap();
         let out: Value = serde_json::from_str(&ran.model_output).unwrap();
         assert_eq!(out["status"], "ok", "{out}");
-        let panel = out["panel"].as_array().expect("the panel answers ride along");
+        let panel = out["responses"].as_array().expect("the panel answers ride along");
         assert_eq!(panel.len(), 2, "{out}");
-        assert!(panel.iter().any(|a| a["answer"] == "answer from a"), "{out}");
-        assert!(panel.iter().any(|a| a["answer"] == "answer from b"), "{out}");
+        assert!(panel.iter().any(|a| a["content"] == "answer from a"), "{out}");
+        assert!(panel.iter().any(|a| a["content"] == "answer from b"), "{out}");
         assert!(out.get("analysis").is_none(), "a failed analyst adds no analysis: {out}");
+        assert!(out.get("failed_models").is_none(), "nobody failed: {out}");
+    }
+
+    /// The declaration's `analysis_models` and `model` win over the
+    /// configured panel and analyst; every leg is offered web_search and
+    /// web_fetch; the analyst runs at temperature 0 and its JSON object is
+    /// the `analysis`; a member that fails is listed beside the answers.
+    #[tokio::test]
+    async fn fusion_honours_the_declared_panel_and_analyst() {
+        use axum::routing::post;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body.clone());
+                    let content = if body["model"] == "an" {
+                        json!({"consensus": ["x"], "contradictions": [], "partial_coverage": [],
+                               "unique_insights": [], "blind_spots": []}).to_string()
+                    } else {
+                        format!("answer from {}", body["model"].as_str().unwrap_or("?"))
+                    };
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["a", "x", "an"]
+                [server_tools]
+                fusion_panel = ["p/a"]
+                fusion_analyst = "p/a"
+                "#
+            ),
+            "fusion_declared",
+        );
+        // Every leg is offered web_search and web_fetch unless the
+        // declaration lists tools itself (none are servable in this app, so
+        // the router strips them before the mock sees the body).
+        let legs = leg_params(&json!({}), &[Tool::WebSearch, Tool::WebFetch]);
+        assert_eq!(legs["tools"], json!([{"type": "pxy:web_search"}, {"type": "pxy:web_fetch"}]));
+        let listed = leg_params(&json!({"tools": []}), &[Tool::WebSearch, Tool::WebFetch]);
+        assert!(listed.get("tools").is_none(), "an explicit empty list means none: {listed}");
+        let ctx = ToolCtx {
+            params: json!({
+                "analysis_models": ["p/x", "missing/y"],
+                "model": "p/an",
+                "temperature": 0.7,
+            }),
+            ..ToolCtx::new(&app, "call_1")
+        };
+        let ran = Tool::Fusion.execute(&ctx, &json!({"prompt": "why?"})).await.unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(out["responses"], json!([{"model": "p/x", "content": "answer from x"}]), "{out}");
+        assert_eq!(out["failed_models"][0]["model"], "missing/y", "{out}");
+        assert_eq!(out["analysis"]["consensus"], json!(["x"]), "{out}");
+
+        let bodies = seen.lock().unwrap();
+        let leg = bodies.iter().find(|b| b["model"] == "x").expect("the declared panel member ran");
+        assert_eq!(leg["temperature"], 0.7, "{leg}");
+        assert_eq!(leg["max_tokens"].as_u64().or(leg["max_completion_tokens"].as_u64()), Some(16_000), "{leg}");
+        let analyst = bodies.iter().find(|b| b["model"] == "an").expect("the declared analyst ran");
+        assert_eq!(analyst["temperature"], 0, "{analyst}");
+        assert!(bodies.iter().all(|b| b["model"] != "a"), "the configured panel is overridden");
     }
 
     /// An all-failed panel is a tool error the outer model reads, not an `ok`
@@ -2080,14 +2301,146 @@ mod tests {
             .unwrap();
         let out: Value = serde_json::from_str(&ran.model_output).unwrap();
         assert_eq!(out["status"], "error", "{out}");
-        let panel = out["panel"].as_array().expect("every failure rides along");
+        let panel = out["failed_models"].as_array().expect("every failure rides along");
         assert_eq!(panel.len(), 2, "{out}");
         assert!(panel.iter().all(|a| a["error"].is_string()), "{out}");
-        assert!(
-            out["error"].as_str().is_some_and(|e| e.contains("Every panel member failed")),
-            "{out}"
-        );
+        assert_eq!(out["error"], "all panel models failed", "{out}");
+        assert_eq!(out["failure_reason"], "all_panels_failed", "{out}");
         assert_eq!(ran.client.marker["status"], "error", "the dialect layer reads the marker");
+    }
+
+    /// A panel whose every failure was a rate limit or a credit exhaustion
+    /// says so with OpenRouter's typed reason.
+    #[test]
+    fn fusion_failure_reason_is_typed() {
+        let rl = "sub-request failed (429): slow down".to_string();
+        let credit = "sub-request failed (402): insufficient credits".to_string();
+        let other = "sub-request failed (500): boom".to_string();
+        assert_eq!(fusion_failure_reason(&[&other]), "all_panels_failed");
+        assert_eq!(fusion_failure_reason(&[&other, &rl]), "rate_limited");
+        assert_eq!(fusion_failure_reason(&[&rl, &credit]), "insufficient_credits");
+    }
+
+    /// The advisor consults the client's own model when neither the
+    /// declaration nor the call names one, and forwards the declaration's
+    /// sampling knobs to that leg.
+    #[tokio::test]
+    async fn advisor_falls_back_to_the_outer_model_and_forwards_knobs() {
+        use axum::routing::post;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "advice"},
+                        "finish_reason": "stop"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["m"]
+                "#
+            ),
+            "advisor_outer",
+        );
+        let ctx = ToolCtx {
+            outer_model: "p/m".into(),
+            params: json!({"temperature": 0.3, "max_completion_tokens": 99, "reasoning": {"effort": "low"}}),
+            ..ToolCtx::new(&app, "call_1")
+        };
+        let ran = Tool::Advisor.execute(&ctx, &json!({"prompt": "how?"})).await.unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(out["model"], "p/m", "{out}");
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["model"], "m", "{body}");
+        assert_eq!(body["temperature"], 0.3, "{body}");
+        assert_eq!(body["max_tokens"].as_u64().or(body["max_completion_tokens"].as_u64()), Some(99), "{body}");
+        assert_eq!(body["reasoning"]["effort"], "low", "{body}");
+
+        // No model anywhere is a call pxy cannot serve.
+        let bare = ToolCtx::new(&app, "call_2");
+        assert!(Tool::Advisor.execute(&bare, &json!({"prompt": "how?"})).await.is_err());
+
+        // The subagent falls back the same way.
+        let worker = ToolCtx { outer_model: "p/m".into(), ..ToolCtx::new(&app, "call_3") };
+        let ran = Tool::Subagent
+            .execute(&worker, &json!({"task_name": "t", "task_description": "do it"}))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["model"], "p/m", "{out}");
+    }
+
+    /// `forward_transcript` hands the advisor the turn's conversation as
+    /// prose — tool calls and results included, as bracketed text — and makes
+    /// the prompt optional.
+    #[tokio::test]
+    async fn advisor_forwards_the_transcript_as_prose() {
+        use axum::routing::post;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "advice"},
+                        "finish_reason": "stop"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["m"]
+                "#
+            ),
+            "advisor_transcript",
+        );
+        let ctx = ToolCtx {
+            params: json!({"model": "p/m", "instructions": "be terse", "forward_transcript": true}),
+            transcript: vec![
+                json!({"role": "system", "content": "you are helpful"}),
+                json!({"role": "user", "content": [{"type": "text", "text": "build a pool"}]}),
+                json!({"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "pxy_datetime", "arguments": "{}"}}]}),
+                json!({"role": "tool", "tool_call_id": "c1", "content": "noon"}),
+            ],
+            ..ToolCtx::new(&app, "call_1")
+        };
+        let ran = Tool::Advisor.execute(&ctx, &json!({})).await.expect("no prompt needed");
+        assert!(ran.model_output.contains("advice"));
+        let body = seen.lock().unwrap()[0].clone();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"], "be terse", "{body}");
+        assert_eq!(msgs[1]["content"], "you are helpful", "{body}");
+        assert_eq!(msgs[2]["content"], "build a pool", "{body}");
+        assert_eq!(msgs[3]["role"], "assistant", "{body}");
+        assert!(msgs[3]["content"].as_str().unwrap().contains("[tool call pxy_datetime {}]"), "{body}");
+        assert_eq!(msgs[4]["role"], "user", "{body}");
+        assert!(msgs[4]["content"].as_str().unwrap().contains("[tool result c1] noon"), "{body}");
+        assert!(body.get("tools").is_none(), "prose needs no tools: {body}");
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
