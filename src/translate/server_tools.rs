@@ -332,7 +332,17 @@ pub async fn run_analyst(
     ];
     let mut params = params.clone();
     params["temperature"] = json!(0);
-    let text = run_internal_chat(app, model, messages, params, caller).await?;
+    let text = match run_internal_chat(app, model, messages.clone(), params.clone(), caller).await {
+        Ok(text) => text,
+        // A reasoning model that refuses the parameter outright (gpt-5.6:
+        // "'temperature' is not supported with this model") still makes a
+        // fine analyst at its own default.
+        Err(e) if e.contains("temperature") => {
+            params.as_object_mut().map(|p| p.remove("temperature"));
+            run_internal_chat(app, model, messages, params, caller).await?
+        }
+        Err(e) => return Err(e),
+    };
     let analysis: Value =
         serde_json::from_str(text.trim()).map_err(|e| format!("analyst returned non-JSON: {e}"))?;
     if !analysis.is_object() {
@@ -518,7 +528,7 @@ pub fn function_name(tool: Tool) -> String {
 /// tool. `params` is the declaration's own `parameters`, when it carries one;
 /// neither tool's model-facing call takes anything from it yet — `web_search`
 /// models only its query, `web_fetch` only its URL.
-pub fn tool_def(tool: Tool, _params: &Value) -> Value {
+pub fn tool_def(tool: Tool, params: &Value) -> Value {
     match tool {
         Tool::WebSearch => web_search::tool_def(),
         Tool::WebFetch => json!({
@@ -535,22 +545,34 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                 },
             },
         }),
-        Tool::Datetime => json!({
-            "type": "function",
-            "function": {
-                "name": function_name(Tool::Datetime),
-                "description": "The current date and time, optionally in an IANA timezone.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "timezone": {
-                            "type": "string",
-                            "description": "IANA timezone name, e.g. America/New_York. Default UTC."
-                        }
+        Tool::Datetime => {
+            // The model reads the default zone off the description: told
+            // "default UTC" it asked for UTC, and the configured zone was
+            // never used.
+            let zone = params["timezone"].as_str().filter(|z| !z.is_empty()).unwrap_or("UTC");
+            json!({
+                "type": "function",
+                "function": {
+                    "name": function_name(Tool::Datetime),
+                    "description": format!(
+                        "The current date and time. Called with no arguments it answers in \
+                         the default zone, {zone}; pass timezone only when a different zone \
+                         is wanted."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "timezone": {
+                                "type": "string",
+                                "description": format!(
+                                    "IANA timezone name, e.g. America/New_York. Omit for {zone}."
+                                )
+                            }
+                        },
                     },
                 },
-            },
-        }),
+            })
+        }
         Tool::SearchModels => json!({
             "type": "function",
             "function": {
@@ -584,6 +606,10 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
                         "free": {
                             "type": "boolean",
                             "description": "true for free models only, false to exclude them."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Skip this many matches, to page through a long result."
                         },
                     },
                 },
@@ -934,6 +960,8 @@ fn run_search_models(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let mut matches = matching_models(&ctx.app.catalog, args);
     let total_results = matches.len();
     let max_results = ctx.params["max_results"].as_u64().unwrap_or(10).clamp(1, 50) as usize;
+    let offset = (args["offset"].as_u64().unwrap_or(0) as usize).min(matches.len());
+    matches.drain(..offset);
     matches.truncate(max_results);
     let output = json!({
         "models": matches,
@@ -1390,6 +1418,12 @@ mod tests {
         assert_eq!(def["function"]["name"], "pxy_datetime");
         assert_eq!(def["function"]["parameters"]["properties"]["timezone"]["type"], "string");
         assert!(def["function"]["parameters"].get("required").is_none());
+        assert!(def["function"]["description"].as_str().unwrap().contains("UTC"));
+        // The declared default zone is what the model is told, so it does
+        // not ask for UTC out of habit.
+        let dhaka = tool_def(Tool::Datetime, &json!({"timezone": "Asia/Dhaka"}));
+        assert!(dhaka["function"]["description"].as_str().unwrap().contains("Asia/Dhaka"), "{dhaka}");
+        assert!(!dhaka["function"]["description"].as_str().unwrap().contains("UTC"), "{dhaka}");
     }
 
     /// Each tool's own `max_uses` caps its calls: Anthropic spells it at the
@@ -1683,11 +1717,18 @@ mod tests {
         assert!(ids.is_empty(), "{out}");
         assert_eq!(out["total_results"], 0, "{out}");
 
-        // The declaration's `max_results` caps what is shown, not what matched.
+        // The declaration's `max_results` caps what is shown, not what matched,
+        // and the call's `offset` pages through the rest.
         let (out, ids) = search(json!({}), json!({"max_results": 1})).await;
         assert_eq!(ids.len(), 1, "{out}");
         assert_eq!(out["total_results"], 3, "{out}");
         assert_eq!(out["showing"], 1, "{out}");
+        let (_, first) = search(json!({}), json!({"max_results": 2})).await;
+        let (out, paged) = search(json!({"offset": 2}), json!({"max_results": 2})).await;
+        assert_eq!(paged.len(), 1, "{out}");
+        assert!(!first.contains(&paged[0]), "{first:?} vs {paged:?}");
+        let (out, none) = search(json!({"offset": 99}), json!({})).await;
+        assert!(none.is_empty(), "{out}");
     }
 
     /// image_generation runs the image media walk and hands the model the URL
@@ -2116,6 +2157,39 @@ mod tests {
             assert!(text.contains(answer), "the analyst must see {answer}: {text}");
         }
         assert!(text.contains("which is best?"), "the question rides along: {text}");
+    }
+
+    /// A model that rejects `temperature` outright still serves as the
+    /// analyst: the leg is retried once without it.
+    #[tokio::test]
+    async fn analyst_retries_without_temperature_when_the_model_refuses_it() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/c",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                if !body["temperature"].is_null() {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error": {"message": "Unsupported parameter: 'temperature' is not supported with this model."}})),
+                    );
+                }
+                (axum::http::StatusCode::OK, axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "{\"consensus\":[]}"},
+                    "finish_reason": "stop"}]})))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!("[server]\n[providers.p]\nbase_url = \"http://{addr}/c\"\nmodels = [\"an\"]\n"),
+            "analyst_no_temperature",
+        );
+        let answers = vec![("p/a".to_string(), Ok("hi".to_string()))];
+        let analysis = run_analyst(&app, "p/an", "q", &answers, &json!({}), &ClientContext::default())
+            .await
+            .unwrap();
+        assert_eq!(analysis["consensus"], json!([]));
     }
 
     /// An analyst that answers prose instead of JSON is a failure, so the

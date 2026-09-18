@@ -113,7 +113,10 @@ pub fn request(anthropic: &Value, reasoning_replay: bool) -> Value {
             {
                 continue;
             }
-            reserved.push(server_tools::tool_def(tool, &t["input_schema"]));
+            // The OpenRouter shape carries the declaration's options under
+            // `parameters`; a native Anthropic entry has none of them.
+            let params = if t["parameters"].is_object() { &t["parameters"] } else { &t["input_schema"] };
+            reserved.push(server_tools::tool_def(tool, params));
         }
         reserved.extend(mapped);
         let mapped = reserved;

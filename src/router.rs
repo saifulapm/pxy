@@ -2283,6 +2283,13 @@ struct StreamCtx {
     /// upstream that dies mid-body leaves exactly that hole, so `finish()`
     /// closes it.
     client_done: bool,
+    /// The client's turn has been closed (`[DONE]` forwarded, or the
+    /// Anthropic message stopped). Some upstreams send one more chunk after
+    /// their own `[DONE]` (opencode-go: `{"choices":[],"cost":"0"}`); read as
+    /// a fresh chunk it would open a second, empty message on an Anthropic
+    /// client and corrupt a non-streaming re-assembly. Nothing follows a
+    /// closed turn.
+    terminated: bool,
 }
 
 /// Accumulates the model's calls to a reserved `pxy_*` server function while
@@ -2980,7 +2987,11 @@ impl Drop for StreamCtx {
 impl StreamCtx {
     /// Process one upstream chunk; returns bytes for the client.
     fn process(&mut self, bytes: &Bytes) -> Bytes {
-        let Self { parser, kind, think, tooltext, usage, search, client_done, .. } = self;
+        if self.terminated {
+            return Bytes::new();
+        }
+        let Self { parser, kind, think, tooltext, usage, search, client_done, terminated, .. } =
+            self;
         let events = parser.feed(bytes);
         match kind {
             StreamKind::OpenaiPass => {
@@ -3032,6 +3043,8 @@ impl StreamCtx {
                                 out.push_str(openai_terminator());
                                 *client_done = true;
                             }
+                            *terminated = true;
+                            break;
                         }
                     } else {
                         let mut data = ev.data.clone();
@@ -3091,6 +3104,8 @@ impl StreamCtx {
                         // here would strand the answer the model still owes.
                         if search.as_ref().is_none_or(|s| !s.has_replay()) {
                             out.push_str(&state.on_data(&ev.data));
+                            *terminated = true;
+                            break;
                         }
                     } else {
                         let mut data = ev.data.clone();
@@ -3161,6 +3176,15 @@ impl StreamCtx {
                 "tool_calls": served.tool_calls,
             }));
             messages.extend(served.tool_results);
+        }
+        // A choice that forced this call must not force it again on every
+        // replay, or the model calls the tool until the budget is gone.
+        let forced = search.body["tool_choice"] == "required"
+            || search.body["tool_choice"]["function"]["name"]
+                .as_str()
+                .is_some_and(|n| server_tools::Tool::from_function_name(n).is_some());
+        if forced {
+            search.body["tool_choice"] = json!("auto");
         }
         // Budget spent: the model is asked to answer, not to call again.
         if search.uses_left == 0 {
@@ -3448,6 +3472,7 @@ async fn stream_outcome(
         search,
         responses_client,
         client_done: false,
+        terminated: false,
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
@@ -4586,6 +4611,89 @@ mod tests {
         assert_eq!(over["status"], "error", "{over}");
         assert!(over["error"].as_str().unwrap().contains("budget"), "{over}");
         assert!(bodies[1].get("tools").is_none(), "budget spent: no reserved function may be offered: {}", bodies[1]);
+    }
+
+    /// A `tool_choice` that forced the served call is reset to `auto` on the
+    /// replay: forced once, not on every continuation until the budget is
+    /// gone.
+    #[tokio::test]
+    async fn forced_tool_choice_is_not_replayed() {
+        let first = calls_sse(&[("call_1", "pxy_datetime", "{}")]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let app = test_app(
+            &format!("[server]\n[providers.p]\nbase_url = \"{base}/m\"\nmodels = [\"m\"]\n"),
+            "forced_choice",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "date?"}],
+            "tools": [{"type": "pxy:datetime"}],
+            "tool_choice": {"type": "function", "function": {"name": "datetime"}},
+        });
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let text = String::from_utf8_lossy(&axum::body::to_bytes(body, 1 << 20).await.unwrap()).into_owned();
+        assert!(text.contains("done"), "{text}");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies[0]["tool_choice"]["function"]["name"], "pxy_datetime", "{}", bodies[0]);
+        assert_eq!(bodies[1]["tool_choice"], "auto", "{}", bodies[1]);
+    }
+
+    /// An upstream that sends one more chunk after its `[DONE]` (opencode-go
+    /// appends `{"choices":[],"cost":"0"}`) must not open a second message on
+    /// an Anthropic client, nor leak past the terminator on an OpenAI one.
+    #[tokio::test]
+    async fn chunks_after_done_are_ignored() {
+        const TRAILING: &str = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+        );
+        let (base, _seen) = scripted_upstream(vec![(200, TRAILING)]).await;
+        // An advisor default rides the Messages turn, so the non-streaming
+        // request runs through the stream machinery, as it does live.
+        let app = test_app(
+            &format!(
+                "[server]\n[providers.p]\nbase_url = \"{base}/m\"\nmodels = [\"m\"]\n\
+                 [server_tools.defaults.advisor]\nmodel = \"p/m\"\n"
+            ),
+            "after_done",
+        );
+        let out = handle_chat(
+            app.clone(),
+            ClientFormat::Anthropic,
+            json!({"model": "p/m", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}),
+            ClientContext::default(),
+        )
+        .await;
+        let Outcome::Json { body, .. } = out else { panic!("expected JSON") };
+        assert_eq!(body["content"][0]["text"], "hi", "{body}");
+
+        let out = handle_chat(
+            app.clone(),
+            ClientFormat::Anthropic,
+            json!({"model": "p/m", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "x"}]}),
+            ClientContext::default(),
+        )
+        .await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let text = String::from_utf8_lossy(&axum::body::to_bytes(body, 1 << 20).await.unwrap()).into_owned();
+        assert_eq!(text.matches("message_start").count(), 2, "one event line, one data line: {text}");
+        assert_eq!(text.matches("message_stop").count(), 2, "{text}");
+
+        let out = handle_chat(
+            app.clone(),
+            ClientFormat::Openai,
+            json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "x"}], "tools": [{"type": "pxy:datetime"}]}),
+            ClientContext::default(),
+        )
+        .await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let text = String::from_utf8_lossy(&axum::body::to_bytes(body, 1 << 20).await.unwrap()).into_owned();
+        assert!(text.trim_end().ends_with("data: [DONE]"), "nothing after the terminator: {text}");
     }
 
     /// A continuation the upstream refuses cannot change the stream's status
@@ -6522,6 +6630,60 @@ mod tests {
             "the search function must be offered on a non-streaming turn too: {:?}",
             bodies[0]["tools"]
         );
+    }
+
+    /// A NON-streaming Messages client whose turn ran a served tool gets the
+    /// whole re-assembled message: the server_tool_use pair pxy spliced in
+    /// and the model's answer after the continuation.
+    #[tokio::test]
+    async fn non_streaming_messages_client_keeps_the_served_turn_content() {
+        // A reasoning model thinks before it calls, as deepseek does live.
+        let first = format!(
+            "data: {}\n\n{}",
+            json!({"id": "c1", "choices": [{"index": 0, "delta": {"reasoning_content": "Let me search."}}]}),
+            calls_sse(&[("call_1", "pxy_web_search", "{\"query\":\"ripgrep\"}")])
+        );
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [providers.q]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m", "q/m"]
+                [[search.providers]]
+                name = "brave"
+                kind = "brave"
+                api_key = "k"
+                base_url = "http://127.0.0.1:1/search"
+                "#
+            ),
+            "nonstream_messages_served",
+        );
+        let payload = json!({
+            "model": "free",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "what is ripgrep?"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Json { status, body, .. } = out else { panic!("expected JSON") };
+        assert_eq!(status, 200);
+        let content = body["content"].as_array().unwrap();
+        let types: Vec<&str> = content.iter().filter_map(|b| b["type"].as_str()).collect();
+        assert!(types.contains(&"server_tool_use"), "{body}");
+        assert!(types.contains(&"web_search_tool_result"), "{body}");
+        assert!(content.iter().any(|b| b["text"] == "done"), "the answer must survive: {body}");
+        assert_eq!(body["stop_reason"], "end_turn", "{body}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     /// The §2.1 guard, non-streaming edition: with NO search provider the
