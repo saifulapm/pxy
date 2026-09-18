@@ -158,6 +158,31 @@ pub struct ServerToolsConfig {
     /// overrides it.
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: u64,
+    /// Fusion's panel: model ids or group names, in the order they are asked.
+    /// Empty by default — no vendor preset is hardcoded, so a config that
+    /// never names a panel has no fusion to serve.
+    #[serde(default)]
+    pub fusion_panel: Vec<String>,
+    /// The model that compares the panel's answers. Defaults to the first
+    /// panel member.
+    #[serde(default)]
+    pub fusion_analyst: Option<String>,
+}
+
+impl ServerToolsConfig {
+    /// The model that analyses the panel: the configured analyst, or the
+    /// first panel member when the key is absent. `None` when no panel is
+    /// configured.
+    pub fn resolved_fusion_analyst(&self) -> Option<&str> {
+        // No panel means there is nothing to analyse, whatever the analyst
+        // key says.
+        if self.fusion_panel.is_empty() {
+            return None;
+        }
+        self.fusion_analyst
+            .as_deref()
+            .or_else(|| self.fusion_panel.first().map(String::as_str))
+    }
 }
 
 impl Default for ServerToolsConfig {
@@ -165,6 +190,8 @@ impl Default for ServerToolsConfig {
         Self {
             enabled: default_server_tool_names(),
             max_tool_calls: default_max_tool_calls(),
+            fusion_panel: Vec::new(),
+            fusion_analyst: None,
         }
     }
 }
@@ -1014,6 +1041,49 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.server_tools.enabled, vec!["web_fetch".to_string()]);
         assert_eq!(cfg.server_tools.max_tool_calls, 3);
+    }
+
+    /// Fusion's panel is config, not a vendor preset: empty until the user
+    /// names one, and the analyst falls back to the first panel member.
+    #[test]
+    fn fusion_analyst_defaults_to_the_first_panel_member() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [server_tools]
+            fusion_panel = ["aaa", "glm"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server_tools.fusion_panel, vec!["aaa", "glm"]);
+        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), Some("aaa"));
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [server_tools]
+            fusion_panel = ["aaa", "glm"]
+            fusion_analyst = "big"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), Some("big"));
+
+        // No panel means fusion has nothing to run and the tool is unservable,
+        // even if an analyst was named without one.
+        let cfg: Config = toml::from_str("[server]").unwrap();
+        assert!(cfg.server_tools.fusion_panel.is_empty());
+        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), None);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [server_tools]
+            fusion_analyst = "big"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server_tools.resolved_fusion_analyst(), None);
     }
 }
 

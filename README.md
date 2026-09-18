@@ -83,7 +83,9 @@ function, runs the call through the search providers you configure, and feeds
 the results back into the same streamed turn. Claude Code gets the
 `server_tool_use` blocks it expects. The `[server_tools]` table in
 `config.toml` decides which tools pxy serves this way and how many tool-call
-steps one turn may take.
+steps one turn may take. A model can also convene a `fusion` panel of several
+models answering the same question at once, with one analyst comparing their
+answers; name the panel in `fusion_panel`.
 
 The living spec is this project's mem wiki (`mem wiki` lists the pages). Design
 history is in the git log.

@@ -60,6 +60,12 @@ enabled = ["web_search"]
 # Tool-call steps allowed in one turn. A request-level `max_tool_calls`
 # overrides it; a tool's own per-call cap still wins for that tool.
 max_tool_calls = 10
+# Fusion: a panel of models answers the same prompt at once and one analyst
+# compares their answers. Both are model ids or group names, in answer order.
+# The panel is empty by default, so `fusion` is unservable until you name one;
+# the analyst defaults to the first panel member.
+# fusion_panel = ["aaa", "glm"]
+# fusion_analyst = "aaa"
 
 # ---------------------------------------------------------------------------
 # Groups: named failover chains. A group name is itself a routable model id.
