@@ -233,6 +233,41 @@ pub async fn run_panel(
     futures_util::future::join_all(legs).await
 }
 
+/// The analyst's standing instruction: compare the panel, answer in JSON. It
+/// is the system turn of every analyst sub-request.
+const ANALYST_INSTRUCTIONS: &str = "You are the analyst of a panel of models. \
+Compare the panel's answers to the question and reply with a single JSON \
+object and nothing else. Name where they agree, where they differ, and which \
+answer is best supported, so a writer can produce a final answer from it.";
+
+/// Have one model analyse the panel's answers. The analyst sees the original
+/// question and every leg's answer, labelled by the model that gave it; a leg
+/// that failed is shown as a failure, not hidden. Its reply must be JSON — a
+/// reply that will not parse is an error, and the caller keeps the raw panel.
+pub async fn run_analyst(
+    app: &SharedApp,
+    model: &str,
+    prompt: &str,
+    answers: &[(String, Result<String, String>)],
+) -> Result<Value, String> {
+    let mut panel = String::new();
+    for (name, answer) in answers {
+        match answer {
+            Ok(text) => panel.push_str(&format!("### {name}\n{text}\n\n")),
+            Err(e) => panel.push_str(&format!("### {name}\n[failed: {e}]\n\n")),
+        }
+    }
+    let messages = vec![
+        json!({"role": "system", "content": ANALYST_INSTRUCTIONS}),
+        json!({
+            "role": "user",
+            "content": format!("Question:\n{prompt}\n\nPanel answers:\n{panel}"),
+        }),
+    ];
+    let text = run_internal_chat(app, model, messages, json!({})).await?;
+    serde_json::from_str(&text).map_err(|e| format!("analyst returned non-JSON: {e}"))
+}
+
 /// The request's declaration of this tool, when it carries one. A `function`
 /// field means an ordinary function tool that merely shares the name, and is
 /// left alone.
@@ -1464,6 +1499,97 @@ mod tests {
         assert_eq!(results[1].1.as_ref().unwrap(), "answer from b");
         assert_eq!(results[2].0, "p/c");
         assert_eq!(results[2].1.as_ref().unwrap(), "answer from c");
+    }
+
+    /// The analyst is shown the question and every panel answer, labelled by
+    /// the model that gave it, and its JSON reply comes back parsed.
+    #[tokio::test]
+    async fn analyst_receives_every_answer_and_parses_its_json() {
+        use std::sync::{Arc, Mutex};
+        use axum::routing::post;
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body.clone());
+                    let content = if body["model"] == "an" {
+                        r#"{"summary":"they agree","differences":[]}"#.to_string()
+                    } else {
+                        format!("answer from {}", body["model"].as_str().unwrap_or("?"))
+                    };
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["a", "b", "c", "an"]
+                "#
+            ),
+            "analyst",
+        );
+        let models = vec!["p/a".to_string(), "p/b".to_string(), "p/c".to_string()];
+        let answers = run_panel(&app, &models, "which is best?", &json!({})).await;
+        let analysis = run_analyst(&app, "p/an", "which is best?", &answers).await.unwrap();
+        assert_eq!(analysis["summary"], "they agree");
+
+        let bodies = seen.lock().unwrap();
+        let ask = bodies.iter().find(|b| b["model"] == "an").expect("the analyst ran");
+        let text = ask["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for answer in ["answer from a", "answer from b", "answer from c", "p/a", "p/b", "p/c"] {
+            assert!(text.contains(answer), "the analyst must see {answer}: {text}");
+        }
+        assert!(text.contains("which is best?"), "the question rides along: {text}");
+    }
+
+    /// An analyst that answers prose instead of JSON is a failure, so the
+    /// caller can fall back to the raw panel answers.
+    #[tokio::test]
+    async fn analyst_non_json_is_a_failure() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/c",
+            post(|| async {
+                axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "not json at all"},
+                    "finish_reason": "stop"}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["an"]
+                "#
+            ),
+            "analyst_non_json",
+        );
+        let answers = vec![("p/a".to_string(), Ok("hi".to_string()))];
+        let err = run_analyst(&app, "p/an", "q", &answers).await.unwrap_err();
+        assert!(err.contains("non-JSON"), "{err}");
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
