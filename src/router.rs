@@ -19,7 +19,7 @@ use crate::translate::server_tools;
 use crate::translate::sse::SseParser;
 use crate::translate::think::ThinkFilter;
 use crate::translate::tool_text::ToolTextFilter;
-use crate::translate::{anthropic_to_openai, estimate_tokens, openai_to_anthropic, TokenUsage};
+use crate::translate::{anthropic_to_openai, estimate_tokens, openai_to_anthropic, responses_upstream, TokenUsage};
 use crate::usage::current_windows;
 
 pub struct App {
@@ -481,7 +481,7 @@ async fn handle_chat_inner(
             .cfg
             .providers
             .get(&cand.provider)
-            .is_some_and(|p| cand.format(p) == WireFormat::Openai);
+            .is_some_and(|p| cand.format(p) != WireFormat::Anthropic);
         if openai_bound {
             return error_outcome(
                 client_format,
@@ -984,7 +984,7 @@ fn check_candidate(
     // the tool_call rule, single-candidate is NOT exempt (handle_chat 400s it
     // before the walk): the drop happens in pxy's own translation, so the
     // upstream never gets to answer for itself.
-    if multi_candidate && unservable_server_tools && cand.format(provider) == WireFormat::Openai {
+    if multi_candidate && unservable_server_tools && cand.format(provider) != WireFormat::Anthropic {
         return Err("server tools unsupported on this upstream".into());
     }
 
@@ -1116,7 +1116,11 @@ async fn try_candidate_inner(
     multi: bool,
 ) -> AttemptResult {
     let provider_cfg = app.cfg.providers.get(&cand.provider).unwrap();
-    let upstream_format = cand.format(provider_cfg);
+    // A Responses upstream is an OpenAI upstream to everything in here; only
+    // the wire differs, and that is handled at the send and the read.
+    let wire = cand.format(provider_cfg);
+    let responses_upstream = wire == WireFormat::Responses;
+    let upstream_format = if responses_upstream { WireFormat::Openai } else { wire };
 
     // Build the upstream body.
     let mut body = match (client_format, upstream_format) {
@@ -1130,6 +1134,7 @@ async fn try_candidate_inner(
             cand.model.max_output_tokens,
             provider_cfg.requires_reasoning_replay,
         ),
+        (_, WireFormat::Responses) => unreachable!("responses wire is folded into openai"),
     };
     // Anthropic validates history strictly (thinking signatures, tool
     // pairing, empty blocks) and the passthrough path replays whatever the
@@ -1287,11 +1292,18 @@ async fn try_candidate_inner(
             .iter()
             .find(|a| &a.name == name)
     });
-    let prepared =
+    let mut prepared =
         match crate::providers::prepare(&cand.provider, provider_cfg, &app.secrets, account) {
             Ok(p) => p,
             Err(e) => return AttemptResult::Skip(format!("prepare failed: {e:#}")),
         };
+    // One provider, two endpoints: a model on the Responses wire lives next to
+    // the chat one (opencode-go's /zen/go/v1/{chat/completions,responses}).
+    if responses_upstream {
+        if let Some(base) = prepared.url.strip_suffix("/chat/completions") {
+            prepared.url = format!("{base}/responses");
+        }
+    }
 
     // Tool names as the client declared them: some upstreams (Gemini, several
     // gateways) lowercase them, and a client matches a call by name.
@@ -1359,6 +1371,7 @@ async fn try_candidate_inner(
         headers: upstream_headers.clone(),
         body: body.clone(),
         timeout: Duration::from_secs(provider_cfg.timeout_secs),
+        responses_upstream,
     });
 
     app.state.rpm_increment(&cand.state_provider());
@@ -1372,11 +1385,18 @@ async fn try_candidate_inner(
     // Opt-in artifact capture: the client request and the exact upstream
     // request body, before the wire.
     cap.add("client-request", payload);
+    let wire_body;
+    let send_body: &Value = if responses_upstream {
+        wire_body = responses_upstream::request(&body);
+        &wire_body
+    } else {
+        &body
+    };
     cap.add(
         "upstream-request",
-        &json!({"candidate": cand.full_id(), "url": &prepared.url, "body": &body}),
+        &json!({"candidate": cand.full_id(), "url": &prepared.url, "body": send_body}),
     );
-    let send = req.json(&body).send();
+    let send = req.json(send_body).send();
     let resp = if multi && (stream || force_stream) {
         match tokio::time::timeout(HEADERS_DEADLINE, send).await {
             Ok(r) => r,
@@ -1475,6 +1495,7 @@ async fn try_candidate_inner(
             // relay `retry-after` on a stream that died before committing.
             fwd_headers.clone(),
             ctx.responses,
+            responses_upstream,
         )
         .await
         {
@@ -1550,12 +1571,18 @@ async fn try_candidate_inner(
             let mut events = parser.feed(&bytes);
             // Flush a final event the upstream didn't terminate with \n\n.
             events.extend(parser.feed(b"\n\n"));
+            if responses_upstream {
+                events = responses_upstream::chat_events(&events);
+            }
             match upstream_format {
-                WireFormat::Openai => crate::translate::aggregate::openai(&events),
+                WireFormat::Openai | WireFormat::Responses => {
+                    crate::translate::aggregate::openai(&events)
+                }
                 WireFormat::Anthropic => crate::translate::aggregate::anthropic(&events),
             }
         } else {
             match resp.json().await {
+                Ok(v) if responses_upstream => responses_upstream::response(&v),
                 Ok(v) => v,
                 Err(e) => {
                     // A 200 with an unparseable body counts as a request and
@@ -1581,7 +1608,9 @@ async fn try_candidate_inner(
         }
         cap.add("upstream-response", &upstream_body);
         let usage = match upstream_format {
-            WireFormat::Openai => TokenUsage::from_openai(&upstream_body["usage"]),
+            WireFormat::Openai | WireFormat::Responses => {
+                TokenUsage::from_openai(&upstream_body["usage"])
+            }
             WireFormat::Anthropic => TokenUsage::from_anthropic(&upstream_body["usage"]),
         };
         record_tokens(app, agent, &cand.state_provider(), &cand.provider, &cand.model.id, usage);
@@ -1598,6 +1627,7 @@ async fn try_candidate_inner(
             (ClientFormat::Openai, WireFormat::Anthropic) => {
                 openai_to_anthropic::response(&upstream_body, &cand.full_id(), declared_names.as_ref())
             }
+            (_, WireFormat::Responses) => unreachable!("responses wire is folded into openai"),
         };
         AttemptResult::Done(Outcome::Json {
             status: 200,
@@ -2237,6 +2267,10 @@ struct ServerToolLoop {
     headers: Vec<(String, String)>,
     body: Value,
     timeout: Duration,
+    /// The upstream speaks the Responses wire: the replayed body is
+    /// translated out and the continuation's events back in, as on the first
+    /// call.
+    responses_upstream: bool,
 }
 
 impl ServerToolLoop {
@@ -2860,7 +2894,14 @@ impl StreamCtx {
         for (k, v) in &search.headers {
             req = req.header(k, v);
         }
-        let resp = match tokio::time::timeout(search.timeout, req.json(&search.body).send()).await {
+        let wire_body;
+        let send_body: &Value = if search.responses_upstream {
+            wire_body = responses_upstream::request(&search.body);
+            &wire_body
+        } else {
+            &search.body
+        };
+        let resp = match tokio::time::timeout(search.timeout, req.json(send_body).send()).await {
             Ok(Ok(r)) if r.status().is_success() => r,
             // No second call means no answer, so the turn ends here rather
             // than hanging: the client still gets the results it can read.
@@ -2875,7 +2916,11 @@ impl StreamCtx {
                 return None;
             }
         };
-        self.upstream = resp.bytes_stream().boxed();
+        self.upstream = if search.responses_upstream {
+            responses_upstream::chat_stream(resp.bytes_stream().boxed())
+        } else {
+            resp.bytes_stream().boxed()
+        };
         self.parser = SseParser::new();
         record_request(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model);
 
@@ -3045,6 +3090,7 @@ async fn stream_outcome(
     search: Option<ServerToolLoop>,
     fwd_headers: Headers,
     responses_client: bool,
+    responses_upstream: bool,
 ) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
@@ -3055,6 +3101,8 @@ async fn stream_outcome(
         (ClientFormat::Openai, WireFormat::Anthropic) => StreamKind::ToOpenai(
             openai_to_anthropic::StreamState::new(&cand.full_id(), declared_names),
         ),
+        // Folded into Openai by the caller; the wire is translated below.
+        (_, WireFormat::Responses) => unreachable!("responses wire is folded into openai"),
     };
 
     let parse_think = app
@@ -3082,7 +3130,11 @@ async fn stream_outcome(
         state_provider: cand.state_provider(),
         model: cand.model.id.clone(),
         app,
-        upstream: resp.bytes_stream().boxed(),
+        upstream: if responses_upstream {
+            responses_upstream::chat_stream(resp.bytes_stream().boxed())
+        } else {
+            resp.bytes_stream().boxed()
+        },
         done: false,
         stall,
         search,
@@ -3435,6 +3487,7 @@ mod tests {
             headers: Vec::new(),
             body: Value::Null,
             timeout: Duration::from_secs(1),
+            responses_upstream: false,
         };
         // The captured search WOULD run...
         loop_.filter.saw_other = false;
@@ -3459,6 +3512,7 @@ mod tests {
             headers: Vec::new(),
             body: Value::Null,
             timeout: Duration::from_secs(1),
+            responses_upstream: false,
         };
         let render = || server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null };
         loop_.commit(&[(ws.clone(), render()), (ws.clone(), render())]);
@@ -3499,6 +3553,7 @@ mod tests {
             headers: Vec::new(),
             body: Value::Null,
             timeout: Duration::from_secs(1),
+            responses_upstream: false,
         };
         let pending = loop_.pending();
         assert_eq!(
@@ -3617,6 +3672,7 @@ mod tests {
             headers: Vec::new(),
             body: Value::Null,
             timeout: Duration::from_secs(1),
+            responses_upstream: false,
         };
         assert!(!loop_.pending().is_empty());
         loop_.uses_left = 0;
@@ -4653,6 +4709,143 @@ mod tests {
         assert_eq!(seen.len(), 2, "two upstream calls: {seen:?}");
         assert!(seen[0].is_some(), "first call carries the session id");
         assert_eq!(seen[0], seen[1], "the continuation carries the same id: {seen:?}");
+    }
+
+    /// A `format = "responses"` model: the body goes out as a Responses
+    /// request on the `/responses` sibling of the provider's chat URL, the
+    /// events come back as chat chunks, and a served tool's continuation
+    /// takes the same wire. Event shapes are Zen Go's, captured live.
+    #[tokio::test]
+    async fn responses_upstream_is_translated_at_the_wire() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let counter = calls.clone();
+        let sink = seen.clone();
+        let router = axum::Router::new()
+            .route("/v1/chat/completions", post(|| async { "wrong wire" }))
+            .route(
+                "/v1/responses",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let counter = counter.clone();
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body.clone());
+                        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if body["stream"] != true {
+                            return axum::Json(json!({
+                                "id": "resp_j", "object": "response", "created_at": 5, "status": "completed",
+                                "model": "luna", "output": [{"type": "message", "content": [
+                                    {"type": "output_text", "text": "plain"}]}],
+                                "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5}
+                            }))
+                            .into_response();
+                        }
+                        let sse = if n == 0 {
+                            concat!(
+                                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"luna\",\"created_at\":7}}\n\n",
+                                "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"pxy_datetime\",\"call_id\":\"call_1\",\"arguments\":\"\"}}\n\n",
+                                "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n",
+                                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"luna\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"pxy_datetime\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\n",
+                            )
+                        } else {
+                            concat!(
+                                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"model\":\"luna\",\"created_at\":8}}\n\n",
+                                "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"delta\":\"clock\"}\n\n",
+                                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"It is now.\"}\n\n",
+                                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"model\":\"luna\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}\n\n",
+                            )
+                        };
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .unwrap()
+                            .into_response()
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/v1/chat/completions"
+                models = [{{ id = "luna", format = "responses" }}]
+                [groups.free]
+                models = ["p/luna"]
+                "#
+            ),
+            "responses_upstream",
+        );
+
+        // Streaming, with a served tool: two calls on the Responses wire.
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "max_tokens": 50,
+            "reasoning_effort": "low",
+            "messages": [{"role": "system", "content": "Be brief."},
+                         {"role": "user", "content": "what time is it?"}],
+            "tools": [{"type": "pxy:datetime"}],
+        });
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        let text = match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        };
+        assert!(text.contains("\"reasoning_content\":\"clock\""), "{text}");
+        assert!(text.contains("\"content\":\"It is now.\""), "{text}");
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(text.contains("data: [DONE]"), "{text}");
+        assert!(!text.contains("pxy_datetime"), "reserved call leaked: {text}");
+        assert!(!text.contains("response.output_text"), "raw Responses event leaked: {text}");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            let first = &seen[0];
+            assert_eq!(first["stream"], true);
+            assert_eq!(first["store"], false);
+            assert_eq!(first["max_output_tokens"], 50);
+            assert_eq!(first["reasoning"]["effort"], "low");
+            assert_eq!(first["instructions"], "Be brief.");
+            assert_eq!(first["input"][0]["role"], "user");
+            assert_eq!(first["tools"][0]["name"], "pxy_datetime");
+            assert!(first.get("messages").is_none(), "chat body reached the Responses wire");
+            // The continuation replays the call and its output as items.
+            let second = &seen[1];
+            let items = second["input"].as_array().unwrap();
+            assert_eq!(items[1]["type"], "function_call");
+            assert_eq!(items[1]["call_id"], "call_1");
+            assert!(items[1].get("id").is_none());
+            assert_eq!(items[2]["type"], "function_call_output");
+            assert_eq!(items[2]["call_id"], "call_1");
+        }
+        // Both legs were metered from the translated usage.
+        let usage = app.state.model_usage_rows().unwrap();
+        let row = usage.iter().find(|r| r.model == "luna").expect("usage row");
+        assert_eq!(row.input_tokens, 30);
+        assert_eq!(row.output_tokens, 5);
+
+        // Non-streaming: the JSON body is translated to a chat completion.
+        let payload = json!({"model": "p/luna", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { status, body, .. } => {
+                assert_eq!(status, 200, "{body}");
+                assert_eq!(body["object"], "chat.completion");
+                assert_eq!(body["choices"][0]["message"]["content"], "plain");
+                assert_eq!(body["choices"][0]["finish_reason"], "stop");
+                assert_eq!(body["usage"]["prompt_tokens"], 4);
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
     }
 
     /// The continuation after a served tool call is a stream too, and the

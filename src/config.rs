@@ -510,6 +510,11 @@ pub enum WireFormat {
     Openai,
     /// Anthropic messages
     Anthropic,
+    /// OpenAI Responses API. Translated at the wire only: the pipeline treats
+    /// it as OpenAI, and `translate/responses_upstream.rs` converts the body
+    /// out and the events back in. `base_url` ending in `/chat/completions`
+    /// is rewritten to `/responses` for such a model.
+    Responses,
 }
 
 impl Default for WireFormat {
