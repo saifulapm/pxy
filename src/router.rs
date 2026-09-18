@@ -17,6 +17,7 @@ use crate::secrets::Secrets;
 use crate::state::State;
 use crate::translate::server_tools;
 use crate::translate::sse::SseParser;
+use crate::translate::tool_search;
 use crate::translate::think::ThinkFilter;
 use crate::translate::tool_text::ToolTextFilter;
 use crate::translate::{anthropic_to_openai, estimate_tokens, openai_to_anthropic, responses_upstream, TokenUsage};
@@ -1247,6 +1248,19 @@ async fn try_candidate_inner(
         Vec::new()
     };
     let search_served = !servable.is_empty();
+
+    // The client's deferred tools are held back while pxy is offering the
+    // search that can reveal them again, and pxy's own `defer_loading` key
+    // comes off either way. Before `settle_tool_choice` below, which would
+    // delete a choice naming a tool that had just left the body.
+    let deferred = defer_loading_tools(
+        &mut body,
+        payload,
+        client_format,
+        upstream_format,
+        servable.contains(&server_tools::Tool::ToolSearch),
+    );
+
     if !injected.is_empty() {
         // Offering a function nobody will intercept hands the client a
         // tool_use for a tool it never declared, which wedges the turn. Drop
@@ -1402,6 +1416,7 @@ async fn try_candidate_inner(
             .unwrap_or_else(|| app.cfg.default_route()),
         served: std::collections::BTreeMap::new(),
         results_served: 0,
+        deferred,
     });
 
     app.state.rpm_increment(&cand.state_provider());
@@ -2342,6 +2357,9 @@ struct ServerToolLoop {
     /// Search hits returned to the model this turn, for web_search's
     /// `max_total_results`.
     results_served: u64,
+    /// The client function definitions held out of the upstream body, for
+    /// tool_search to match against and reveal into the replay.
+    deferred: Vec<Value>,
 }
 
 impl ServerToolLoop {
@@ -2509,6 +2527,7 @@ async fn serve_calls(
         ctx.session = loop_.session.clone();
         ctx.outer_model = loop_.outer_model.clone();
         ctx.results_used = loop_.results_served + batch_hits;
+        ctx.deferred = loop_.deferred.clone();
         ctx.transcript = loop_.body["messages"].as_array().cloned().unwrap_or_default();
         match tool.execute(&ctx, &args).await {
             Ok(ran) => {
@@ -2727,6 +2746,69 @@ fn swap_declared_served_tools(body: &mut Value) {
         })
         .collect();
     body["tools"] = Value::Array(converted);
+}
+
+/// Hold the client's `defer_loading` function tools out of the upstream body,
+/// returning the definitions taken out for the loop to reveal as the model
+/// searches for them.
+///
+/// Nothing is deferred unless pxy is offering `pxy_tool_search` on this body:
+/// a client that defers tools without declaring the search would lose them
+/// with no way to ask for them back. An Anthropic-format upstream is left
+/// alone entirely, since it cannot run the loop and has native deferral of
+/// its own (wiki:tool-search).
+fn defer_loading_tools(
+    body: &mut Value,
+    payload: &Value,
+    client: ClientFormat,
+    upstream: WireFormat,
+    search_offered: bool,
+) -> Vec<Value> {
+    if upstream != WireFormat::Openai {
+        return Vec::new();
+    }
+    let mut deferred = Vec::new();
+    if search_offered {
+        let mut revealed = tool_search::revealed_in_history(payload, client);
+        // Read before `settle_tool_choice` runs: a choice naming a tool that
+        // just left the body would be deleted there, so the choice is
+        // evidence that its tool has to go up.
+        revealed.extend(body["tool_choice"]["function"]["name"].as_str().map(str::to_string));
+        if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            tools.retain(|t| {
+                if !is_deferred(t) {
+                    return true;
+                }
+                if revealed.contains(t["function"]["name"].as_str().unwrap_or("")) {
+                    return true;
+                }
+                let mut definition = t.clone();
+                strip_defer_loading(&mut definition);
+                deferred.push(definition);
+                false
+            });
+        }
+    }
+    // Whether or not anything was deferred: the key is pxy's own, and such
+    // upstreams reject an unknown key on a function entry.
+    for tool in body.get_mut("tools").and_then(|t| t.as_array_mut()).into_iter().flatten() {
+        strip_defer_loading(tool);
+    }
+    deferred
+}
+
+/// Whether the client asked for this tool to be held back. The translators
+/// write the flag onto the chat entry's `function`; a Chat Completions client
+/// writes it itself, and may put it beside `type` instead, so both spellings
+/// count.
+fn is_deferred(tool: &Value) -> bool {
+    tool["function"]["defer_loading"] == true || tool["defer_loading"] == true
+}
+
+/// Take pxy's own `defer_loading` key off one tool entry, both spellings.
+fn strip_defer_loading(tool: &mut Value) {
+    tool.as_object_mut().map(|o| o.remove("defer_loading"));
+    tool.get_mut("function").and_then(|f| f.as_object_mut()).map(|o| o.remove("defer_loading"));
 }
 
 /// Make `tool_choice` name a function the body still offers. A choice naming
@@ -3826,6 +3908,7 @@ mod tests {
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
             results_served: 0,
+            deferred: Vec::new(),
         };
         // The captured search WOULD run...
         loop_.filter.saw_other = false;
@@ -3856,6 +3939,7 @@ mod tests {
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
             results_served: 0,
+            deferred: Vec::new(),
         };
         let render = || server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null };
         loop_.commit(&[(ws.clone(), render()), (ws.clone(), render())]);
@@ -3902,6 +3986,7 @@ mod tests {
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
             results_served: 0,
+            deferred: Vec::new(),
         };
         let pending = loop_.pending();
         assert_eq!(
@@ -3974,6 +4059,7 @@ mod tests {
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
             results_served: 0,
+            deferred: Vec::new(),
         };
         let served = serve_calls(&app, calls, Vec::new(), &bare).await.expect("two answerable calls");
         // The unknown name is left out; the other two are answered with an
@@ -4057,6 +4143,7 @@ mod tests {
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
             results_served: 0,
+            deferred: Vec::new(),
         };
         assert!(!loop_.pending().is_empty());
         loop_.uses_left = 0;
@@ -7161,6 +7248,104 @@ mod tests {
         drop_hosted_server_tools(&mut only_hosted);
         assert!(only_hosted.get("tools").is_none(), "{only_hosted}");
         assert!(only_hosted.get("tool_choice").is_none(), "{only_hosted}");
+    }
+
+    /// A client may declare far more tools than a turn can afford. The ones
+    /// marked `defer_loading` are held out of the upstream body when pxy is
+    /// offering the search that can reveal them again, and only then: a
+    /// client that defers without declaring the search would otherwise lose
+    /// them with no way to ask for them back.
+    #[test]
+    fn deferred_tools_are_held_back_only_when_the_search_can_reveal_them() {
+        let search = server_tools::function_name(server_tools::Tool::ToolSearch);
+        let thirty = || -> Vec<Value> {
+            (0..30)
+                .map(|i| {
+                    json!({"type": "function", "function": {
+                        "name": format!("tool_{i}"),
+                        "description": "A client tool.",
+                        "defer_loading": true,
+                    }})
+                })
+                .collect()
+        };
+        let declared = || {
+            let mut tools = thirty();
+            tools.insert(0, json!({"type": "function", "function": {"name": &search}}));
+            json!({"tools": tools, "tool_choice": {"type": "function", "function": {"name": "tool_9"}}})
+        };
+        // The turn is already mid-call on three of them.
+        let payload = json!({"messages": [{"role": "assistant", "tool_calls": [
+            {"function": {"name": "tool_1"}},
+            {"function": {"name": "tool_2"}},
+            {"function": {"name": "tool_3"}},
+        ]}]});
+        let offered = |body: &Value| -> Vec<String> {
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let mut body = declared();
+        let deferred = defer_loading_tools(
+            &mut body,
+            &payload,
+            ClientFormat::Openai,
+            WireFormat::Openai,
+            true,
+        );
+        // The search itself, the three the model is already calling, and the
+        // one `tool_choice` names. The other twenty-six wait to be found.
+        assert_eq!(
+            offered(&body),
+            vec![search.as_str(), "tool_1", "tool_2", "tool_3", "tool_9"],
+            "{body}"
+        );
+        assert_eq!(deferred.len(), 26);
+        // `defer_loading` is pxy's own key: an OpenAI upstream 400s on an
+        // unknown key, and a revealed definition is replayed as it stands.
+        assert!(
+            body["tools"].as_array().unwrap().iter().all(|t| t["function"]["defer_loading"].is_null()),
+            "{body}"
+        );
+        assert!(
+            deferred.iter().all(|t| t["function"]["defer_loading"].is_null()),
+            "{deferred:?}"
+        );
+        // The choice survives the deferral, because the tool it names did.
+        settle_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"]["function"]["name"], "tool_9", "{body}");
+
+        // Nothing offers the search: every tool goes up as an ordinary
+        // function, minus the key no upstream knows.
+        let mut plain = json!({"tools": thirty()});
+        let none = defer_loading_tools(
+            &mut plain,
+            &json!({}),
+            ClientFormat::Openai,
+            WireFormat::Openai,
+            false,
+        );
+        assert!(none.is_empty());
+        assert_eq!(offered(&plain).len(), 30);
+        assert!(plain["tools"].as_array().unwrap().iter().all(|t| t["function"]["defer_loading"].is_null()));
+
+        // An Anthropic upstream runs no loop and has deferral of its own, so
+        // its body is passed through exactly as built, key included.
+        let mut anthropic = declared();
+        let untouched = anthropic.clone();
+        let nothing = defer_loading_tools(
+            &mut anthropic,
+            &payload,
+            ClientFormat::Anthropic,
+            WireFormat::Anthropic,
+            true,
+        );
+        assert!(nothing.is_empty());
+        assert_eq!(anthropic, untouched, "an anthropic body is not pxy's to edit");
     }
 
     /// `tool_choice` must name a function the body offers: a served tool's
