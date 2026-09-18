@@ -174,9 +174,14 @@ pub fn request(payload: &Value) -> Value {
     out.insert("messages".into(), json!(messages));
 
     if let Some(tools) = payload["tools"].as_array() {
-        // One reserved function per served tool, however many spellings
-        // declared it: a second identical def risks an upstream 400 and hands
-        // the model two indistinguishable functions to choose from.
+        // A served tool's declaration survives as declared: the router swaps
+        // it for the reserved function at the wire (`swap_declared_served_tools`)
+        // and the loop reads its `parameters` and `max_uses` off the chat
+        // payload, exactly as for a Chat Completions client. Converting it here
+        // lost the declaration — the advisor's model, the subagent's worker —
+        // and the loop saw a bare function. One entry per served tool, however
+        // many spellings declared it: a second identical def risks an
+        // upstream 400 and hands the model two indistinguishable functions.
         let mut served: Vec<server_tools::Tool> = Vec::new();
         let converted: Vec<Value> = tools
             .iter()
@@ -186,6 +191,7 @@ pub fn request(payload: &Value) -> Value {
                         return None;
                     }
                     served.push(tool);
+                    return Some(t.clone());
                 }
                 convert_tool(t)
             })
@@ -338,11 +344,10 @@ fn convert_tool(tool: &Value) -> Option<Value> {
                 "required": ["command"],
             },
         }})),
-        // Hosted tools the registry can serve (`codex --search` turns on the
-        // Responses API's web_search) become the reserved function pxy
-        // intercepts and answers itself, whatever spelling declared them.
-        // image_generation / other hosted tools have no equivalent.
-        ty => server_tools::from_type(ty?).map(|t| server_tools::tool_def(t, &tool["parameters"])),
+        // Hosted tools the registry serves are kept as declared by the caller
+        // above and never reach here; any other hosted tool (image_generation,
+        // code_interpreter) has no chat equivalent.
+        _ => None,
     }
 }
 
@@ -935,17 +940,16 @@ mod tests {
         assert_eq!(tools.len(), 3);
         assert_eq!(tools[0]["function"]["name"], "get");
         assert_eq!(tools[1]["function"]["name"], "shell");
-        // hosted web_search -> the function pxy answers itself, whatever
-        // spelling the client declared
-        let reserved = server_tools::function_name(server_tools::Tool::WebSearch);
-        assert_eq!(tools[2]["function"]["name"], reserved);
+        // hosted web_search stays as declared: the router swaps it for the
+        // function pxy answers itself at the wire
+        assert_eq!(server_tools::from_type(tools[2]["type"].as_str().unwrap()), Some(server_tools::Tool::WebSearch));
     }
 
-    /// One served tool is one OpenAI function, however many spellings declared
-    /// it. Forwarding the reserved def twice risks an upstream 400 and leaves
-    /// the model a choice between two identical functions.
+    /// One served tool is one entry, however many spellings declared it.
+    /// Forwarding the reserved def twice risks an upstream 400 and leaves the
+    /// model a choice between two identical functions.
     #[test]
-    fn duplicate_server_tool_spellings_inject_one_function() {
+    fn duplicate_server_tool_spellings_keep_one_entry() {
         let chat = request(&json!({
             "input": [],
             "tools": [
@@ -954,29 +958,37 @@ mod tests {
                 {"type": "pxy:web_search"},
             ],
         }));
-        let reserved = server_tools::function_name(server_tools::Tool::WebSearch);
         let tools = chat["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1, "{chat}");
-        assert_eq!(tools[0]["function"]["name"], reserved);
+        assert_eq!(tools[0]["type"], "web_search");
     }
 
-    /// Each declared served tool becomes exactly one reserved function in the
-    /// chat body the router runs, whatever spelling declared it — the request
-    /// half of "one rendering path per tool per dialect".
+    /// Each declared served tool survives exactly once in the chat body,
+    /// as declared, whatever spelling declared it: the router swaps it for the
+    /// reserved function at the wire, and the loop reads the declaration's
+    /// parameters and call cap off this payload.
     #[test]
-    fn catalog_and_image_tools_convert_to_their_reserved_functions() {
+    fn served_tools_keep_their_declaration_once() {
         let chat = request(&json!({
             "input": [],
             "tools": [
-                {"type": "pxy:search_models"},
+                {"type": "pxy:search_models", "parameters": {"max_results": 3}},
                 {"type": "openrouter:experimental__search_models"},
-                {"type": "pxy:image_generation"},
+                {"type": "pxy:advisor", "parameters": {"model": "x", "max_uses": 2}},
             ],
         }));
         let tools = chat["tools"].as_array().unwrap();
-        let names: Vec<&str> =
-            tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect();
-        assert_eq!(names, vec!["pxy_search_models", "pxy_image_generation"], "{chat}");
+        let types: Vec<&str> = tools.iter().filter_map(|t| t["type"].as_str()).collect();
+        assert_eq!(types, vec!["pxy:search_models", "pxy:advisor"], "{chat}");
+        assert_eq!(
+            server_tools::declared_parameters(&chat, server_tools::Tool::Advisor),
+            json!({"model": "x", "max_uses": 2})
+        );
+        assert_eq!(server_tools::Tool::Advisor.max_uses(&chat), 2);
+        assert_eq!(
+            server_tools::declared_parameters(&chat, server_tools::Tool::SearchModels)["max_results"],
+            3
+        );
     }
 
     /// image_generation and friends still have no equivalent, and a hosted

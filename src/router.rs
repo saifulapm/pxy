@@ -7228,6 +7228,112 @@ mod tests {
         assert_eq!(sub["messages"][1]["content"], "how?", "{sub}");
     }
 
+    /// A Responses client (codex) declares the advisor with its parameters in
+    /// the Responses shape. The translator must not lose that declaration on
+    /// the way to the loop: the upstream sees exactly one reserved function,
+    /// and the consultation goes to the declared model with the declared
+    /// instructions — the same as for a Chat Completions client.
+    #[tokio::test]
+    async fn responses_declaration_reaches_the_loop() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let outer_seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let strong: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let outer_sink = outer_seen.clone();
+        let sink = strong.clone();
+        let router = axum::Router::new()
+            .route(
+                "/outer",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let outer_sink = outer_sink.clone();
+                    async move {
+                        let replay = body["messages"].to_string().contains("advice text");
+                        outer_sink.lock().unwrap().push(body);
+                        let sse = if replay {
+                            concat!(
+                                "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                                "data: [DONE]\n\n",
+                            )
+                        } else {
+                            concat!(
+                                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                                "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                                "\"function\":{\"name\":\"pxy_advisor\",\"arguments\":\"{\\\"prompt\\\":\\\"how?\\\"}\"}}]}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                                "data: [DONE]\n\n",
+                            )
+                        };
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .unwrap()
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/strong",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "advice text"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2}}))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.outer]
+                base_url = "{base}/outer"
+                models = ["m"]
+                [providers.strong]
+                base_url = "{base}/strong"
+                models = ["s"]
+                "#
+            ),
+            "responses_declaration",
+        );
+        // The Responses request as codex sends it, through the same
+        // translation /v1/responses applies before routing.
+        let payload = crate::translate::responses::request(&json!({
+            "model": "outer/m",
+            "stream": true,
+            "input": [{"type": "message", "role": "user", "content": "build a pool"}],
+            "tools": [
+                {"type": "function", "name": "mine", "parameters": {"type": "object", "properties": {}}},
+                {"type": "openrouter:advisor", "parameters": {"model": "strong/s", "instructions": "be terse"}},
+                {"type": "pxy:advisor"},
+            ],
+        }));
+        let ctx = ClientContext { responses: true, ..ClientContext::default() };
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("final answer"), "{text}");
+
+        let outer = outer_seen.lock().unwrap();
+        let names: Vec<&str> = outer[0]["tools"]
+            .as_array()
+            .map(|ts| ts.iter().filter_map(|t| t["function"]["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, vec!["mine", "pxy_advisor"], "{}", outer[0]["tools"]);
+
+        let bodies = strong.lock().unwrap();
+        let sub = bodies.first().expect("the advisor sub-request must reach the strong provider");
+        assert_eq!(sub["model"], "s", "the declared model, not the outer one: {sub}");
+        assert_eq!(sub["messages"][0]["content"], "be terse", "{sub}");
+        assert_eq!(sub["messages"][1]["content"], "how?", "{sub}");
+    }
+
     /// An Anthropic Messages client gets the consultation as the official
     /// block shapes: a `server_tool_use` naming the advisor, then an
     /// `advisor_tool_result` carrying the advice. No `pxy_*` name reaches it.
