@@ -308,6 +308,12 @@ fn convert_tool(tool: &Value) -> Option<Value> {
             if !tool["strict"].is_null() {
                 f.insert("strict".into(), tool["strict"].clone());
             }
+            // `defer_loading` sits beside the flat `name` on a Responses
+            // entry; carried onto the chat entry it is what the router reads
+            // to hold the tool back (wiki:tool-search).
+            if tool["defer_loading"] == true {
+                f.insert("defer_loading".into(), json!(true));
+            }
             Some(json!({"type": "function", "function": f}))
         }
         // Custom/freeform tools (codex apply_patch): model must produce
@@ -1009,6 +1015,38 @@ mod tests {
         );
     }
 
+    /// A Responses client puts `defer_loading` beside the flat `name`; the
+    /// chat entry this builds has to carry it, or the router has nothing to
+    /// defer. The search declaration itself survives as declared, so the wire
+    /// still reads its `max_results`.
+    #[test]
+    fn defer_loading_and_the_search_declaration_survive_translation() {
+        let chat = request(&json!({
+            "input": [],
+            "tools": [
+                {"type": "tool_search", "parameters": {"max_results": 3}},
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Conditions for a city.",
+                    "parameters": {"type": "object"},
+                    "defer_loading": true,
+                },
+            ],
+        }));
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "tool_search", "the declaration survives: {chat}");
+        assert_eq!(tools[1]["function"]["name"], "shell");
+        assert!(tools[1]["function"]["defer_loading"].is_null());
+        assert_eq!(tools[2]["function"]["name"], "get_weather");
+        assert_eq!(tools[2]["function"]["defer_loading"], true);
+        assert_eq!(
+            server_tools::declared_parameters(&chat, server_tools::Tool::ToolSearch)["max_results"],
+            3
+        );
+    }
+
     /// image_generation and friends still have no equivalent, and a hosted
     /// tool mapped to a function would reach the client as a call it can't run.
     #[test]
@@ -1151,6 +1189,7 @@ mod tests {
             ("pxy_search_models", false),
             ("pxy_image_generation", false),
             ("pxy_fusion", false),
+            ("pxy_tool_search", false),
         ] {
             let mut st = StreamState::new(1);
             st.on_data(r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#);

@@ -8,8 +8,12 @@
 //! Anthropic blocks the client's transcript records; the deferral itself and
 //! the reveal are the router's.
 
+use std::collections::BTreeSet;
+
 use regex::RegexBuilder;
 use serde_json::{Value, json};
+
+use crate::router::ClientFormat;
 
 /// The per-call result cap an absent `max_results` falls back to
 /// (OpenRouter's default, read 2026-09-18).
@@ -70,6 +74,51 @@ fn searchable_text(function: &Value) -> Vec<&str> {
     text
 }
 
+/// The deferred tools this request already shows the model using, read off the
+/// client's own payload before translation.
+///
+/// Such a tool is sent up front rather than held back: the model is mid-call,
+/// and a definition it has already used must not vanish under it. A tool
+/// revealed stays revealed for the turn, so the history is what carries it
+/// into the next one.
+pub fn revealed_in_history(payload: &Value, client: ClientFormat) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let messages = payload["messages"].as_array().into_iter().flatten();
+    match client {
+        ClientFormat::Anthropic => {
+            for block in messages.flat_map(|m| m["content"].as_array().into_iter().flatten()) {
+                match block["type"].as_str() {
+                    Some("tool_use") => names.extend(block["name"].as_str().map(str::to_string)),
+                    // pxy's own result block from an earlier turn: the names it
+                    // revealed then are the names the model still expects.
+                    Some("tool_search_tool_result") => {
+                        let references =
+                            block["content"]["tool_references"].as_array().into_iter().flatten();
+                        names.extend(
+                            references.filter_map(|r| r["tool_name"].as_str().map(str::to_string)),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Chat Completions and Responses share this format but not their
+        // history's shape: an assistant turn's `tool_calls` for one, a
+        // `function_call` item in `input` for the other.
+        ClientFormat::Openai => {
+            for call in messages.flat_map(|m| m["tool_calls"].as_array().into_iter().flatten()) {
+                names.extend(call["function"]["name"].as_str().map(str::to_string));
+            }
+            for item in payload["input"].as_array().into_iter().flatten() {
+                if item["type"] == "function_call" {
+                    names.extend(item["name"].as_str().map(str::to_string));
+                }
+            }
+        }
+    }
+    names
+}
+
 // ---------------------------------------------------------------------------
 // Client-facing blocks
 // ---------------------------------------------------------------------------
@@ -111,6 +160,38 @@ pub fn error_block(id: &str, message: &str) -> Value {
             "error_message": message,
         },
     })
+}
+
+/// Flatten the blocks pxy emitted back into prose when the client replays them
+/// in a later turn. An OpenAI upstream has no notion of a server tool, and
+/// dropping the pair would leave the model's own search unaccounted for.
+pub fn flatten_history_block(block: &Value) -> Option<String> {
+    match block["type"].as_str()? {
+        "server_tool_use" if block["name"] == ANTHROPIC_NAME => {
+            let pattern = block["input"]["pattern"].as_str().unwrap_or("");
+            Some(format!("[tool search: {pattern}]"))
+        }
+        "tool_search_tool_result" => {
+            let content = &block["content"];
+            if let Some(message) = content["error_message"].as_str() {
+                return Some(format!("[tool search failed] {message}"));
+            }
+            let names: Vec<&str> = content["tool_references"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["tool_name"].as_str())
+                .collect();
+            if names.is_empty() {
+                return Some("[tool search found nothing]".into());
+            }
+            Some(format!(
+                "[tools revealed]\n{}",
+                names.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n")
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +278,71 @@ mod tests {
         assert!(long.starts_with("invalid regular expression: "), "{long}");
         // The limit itself is usable.
         assert!(search_deferred(&deferred(), &"a".repeat(MAX_PATTERN_CHARS), 10).is_ok());
+    }
+
+    fn names(payload: Value, client: ClientFormat) -> Vec<String> {
+        revealed_in_history(&payload, client).into_iter().collect()
+    }
+
+    /// A tool the model is already using must go up whole, whatever dialect
+    /// the request arrived in.
+    #[test]
+    fn revealed_in_history_reads_calls_tool_use_blocks_and_references() {
+        // Chat Completions: an assistant turn's tool_calls.
+        let chat = json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ]});
+        assert_eq!(names(chat, ClientFormat::Openai), vec!["get_weather"]);
+
+        // Responses: a function_call item in the input.
+        let responses = json!({"input": [
+            {"type": "message", "role": "user", "content": "list them"},
+            {"type": "function_call", "call_id": "c1", "name": "list_files", "arguments": "{}"},
+        ]});
+        assert_eq!(names(responses, ClientFormat::Openai), vec!["list_files"]);
+
+        // Messages: a tool_use block, and the names pxy's own result block
+        // revealed last turn.
+        let anthropic = json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "get_weather", "input": {}},
+                result_block("srvtoolu_1", &["send_email".to_string()]),
+            ]},
+        ]});
+        assert_eq!(names(anthropic, ClientFormat::Anthropic), vec!["get_weather", "send_email"]);
+
+        // A request with no history reveals nothing.
+        assert!(names(json!({"messages": []}), ClientFormat::Openai).is_empty());
+    }
+
+    #[test]
+    fn history_blocks_flatten_to_prose() {
+        let use_block = server_tool_use_block("srvtoolu_1", "weather|forecast", 5);
+        assert_eq!(
+            flatten_history_block(&use_block).unwrap(),
+            "[tool search: weather|forecast]"
+        );
+
+        let found = result_block("srvtoolu_1", &["get_weather".to_string()]);
+        assert_eq!(flatten_history_block(&found).unwrap(), "[tools revealed]\n- get_weather");
+
+        let empty = result_block("srvtoolu_1", &[]);
+        assert_eq!(flatten_history_block(&empty).unwrap(), "[tool search found nothing]");
+
+        let failed = error_block("srvtoolu_1", "invalid regular expression: bad");
+        assert_eq!(
+            flatten_history_block(&failed).unwrap(),
+            "[tool search failed] invalid regular expression: bad"
+        );
+
+        // Another tool's blocks are not this tool's to flatten.
+        let advisor = json!({"type": "server_tool_use", "name": "advisor", "input": {"prompt": "?"}});
+        assert!(flatten_history_block(&advisor).is_none());
+        assert!(flatten_history_block(&json!({"type": "text", "text": "hi"})).is_none());
     }
 
     #[test]

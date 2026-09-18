@@ -5,6 +5,7 @@ use serde_json::{json, Map, Value};
 
 use super::server_tools;
 use super::sse::format_event;
+use super::tool_search;
 use super::web_search;
 use super::TokenUsage;
 
@@ -84,14 +85,18 @@ pub fn request(anthropic: &Value, reasoning_replay: bool) -> Value {
                 if params.get("properties").is_none() {
                     params["properties"] = json!({});
                 }
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t["name"],
-                        "description": t["description"].as_str().unwrap_or(""),
-                        "parameters": params,
-                    }
-                })
+                let mut function = json!({
+                    "name": t["name"],
+                    "description": t["description"].as_str().unwrap_or(""),
+                    "parameters": params,
+                });
+                // `defer_loading` sits beside `input_schema` on a Messages
+                // entry; carried onto the chat entry it is what the router
+                // reads to hold the tool back (wiki:tool-search).
+                if t["defer_loading"] == true {
+                    function["defer_loading"] = json!(true);
+                }
+                json!({"type": "function", "function": function})
             })
             .collect();
         // Server tools pxy can run itself become the reserved function the
@@ -257,8 +262,15 @@ fn push_assistant_turn(messages: &mut Vec<Value>, blocks: &[Value], reasoning_re
             // The search and advisor blocks pxy emitted last turn come back
             // here. The upstream has no notion of a server tool, so they replay
             // as prose — dropping them would lose what was found or advised.
-            Some("server_tool_use") | Some("web_search_tool_result") | Some("advisor_tool_result") => {
+            Some("server_tool_use")
+            | Some("web_search_tool_result")
+            | Some("advisor_tool_result")
+            | Some("tool_search_tool_result") => {
+                // Order matters: web_search's flattener answers for any
+                // `server_tool_use`, so the tools that name themselves get
+                // their turn first.
                 let line = server_tools::flatten_advisor_history_block(block)
+                    .or_else(|| tool_search::flatten_history_block(block))
                     .or_else(|| web_search::flatten_history_block(block));
                 if let Some(line) = line {
                     if !text.is_empty() {
@@ -801,6 +813,57 @@ mod tests {
             out["tools"][0]["function"]["parameters"]["required"],
             json!(["query"])
         );
+    }
+
+    /// A Messages client puts `defer_loading` beside `input_schema`; the chat
+    /// entry this builds has to carry it, or the router has nothing to defer.
+    /// The native search spelling becomes the reserved function like any other
+    /// served tool, and the blocks pxy emitted last turn come back as prose.
+    #[test]
+    fn defer_loading_and_the_search_entry_survive_translation() {
+        let reserved = server_tools::function_name(server_tools::Tool::ToolSearch);
+        let req = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "tool_search_tool_regex_20251119", "name": "tool_search"},
+                {"name": "Bash", "input_schema": {"type": "object", "properties": {}}},
+                {
+                    "name": "get_weather",
+                    "description": "Conditions for a city.",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "defer_loading": true,
+                },
+            ],
+        });
+        let out = request(&req, false);
+        let tools = out["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec![reserved.as_str(), "Bash", "get_weather"]);
+        assert_eq!(tools[2]["function"]["defer_loading"], true);
+        // A tool that did not ask to be deferred says nothing at all, rather
+        // than carrying a false the upstream would have to tolerate.
+        assert!(tools[1]["function"]["defer_loading"].is_null());
+    }
+
+    /// The search pair pxy emitted last turn replays as prose, not as blocks
+    /// an OpenAI upstream would reject.
+    #[test]
+    fn replayed_tool_search_blocks_become_history_text() {
+        let req = json!({
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    tool_search::server_tool_use_block("srvtoolu_1", "weather", 5),
+                    tool_search::result_block("srvtoolu_1", &["get_weather".to_string()]),
+                    {"type": "text", "text": "Let me check."},
+                ]},
+            ],
+        });
+        let out = request(&req, false);
+        let replayed = out["messages"][1]["content"].as_str().unwrap();
+        assert!(replayed.contains("[tool search: weather]"), "{replayed}");
+        assert!(replayed.contains("[tools revealed]\n- get_weather"), "{replayed}");
+        assert!(replayed.contains("Let me check."), "{replayed}");
     }
 
     /// Non-streaming requests get the function too: the router runs them
