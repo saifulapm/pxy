@@ -111,7 +111,8 @@ impl Tool {
     pub fn served_on(self, client: ClientFormat) -> bool {
         match client {
             ClientFormat::Openai => true,
-            ClientFormat::Anthropic => self == Tool::WebSearch,
+            // The advisor has an Anthropic result block; the subagent does not.
+            ClientFormat::Anthropic => matches!(self, Tool::WebSearch | Tool::Advisor),
         }
     }
 
@@ -237,6 +238,8 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "openrouter:image_generation" | "pxy:image_generation" => Some(Tool::ImageGeneration),
         "openrouter:advisor" | "pxy:advisor" => Some(Tool::Advisor),
         "openrouter:subagent" | "pxy:subagent" => Some(Tool::Subagent),
+        // The Anthropic native advisor is dated, like its other server tools.
+        t if t.starts_with("advisor_") => Some(Tool::Advisor),
         t if t.starts_with("web_search") => Some(Tool::WebSearch),
         _ => None,
     }
@@ -623,10 +626,14 @@ fn models_for_model(matches: &[Value], total: usize) -> String {
 /// carries one. The loop hands it to the executor through [`ToolCtx::params`],
 /// where the meta-tools read their configured model and instructions.
 pub fn declared_parameters(payload: &Value, tool: Tool) -> Value {
-    declaration(payload, tool)
-        .and_then(|t| t.get("parameters"))
-        .cloned()
-        .unwrap_or(Value::Null)
+    let Some(t) = declaration(payload, tool) else { return Value::Null };
+    let mut params = t.get("parameters").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+    // The Anthropic native advisor shape carries its model on the entry itself,
+    // not nested under `parameters`.
+    if params["model"].is_null() && !t["model"].is_null() {
+        params["model"] = t["model"].clone();
+    }
+    params
 }
 
 /// Run one advisor call: the model's `prompt` goes to the advisor as a user
@@ -663,7 +670,12 @@ async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
                 model_output: json!({"status": "ok", "model": model, "advice": advice})
                     .to_string(),
                 client: ClientRender {
-                    blocks: Vec::new(),
+                    // The documented Anthropic pair: the consultation, then the
+                    // advice. Other dialects read the marker instead.
+                    blocks: vec![
+                        advisor_server_tool_use_block(ctx.call_id, prompt),
+                        advisor_result_block(ctx.call_id, &advice),
+                    ],
                     marker: json!({"id": ctx.call_id, "model": model, "advice": advice}),
                 },
             })
@@ -672,6 +684,43 @@ async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
             warn!(%model, error = %e, "advisor failed");
             Ok(failed(e))
         }
+    }
+}
+
+/// `server_tool_use` naming the advisor, as the Anthropic transcript records a
+/// consultation. The id prefix mirrors the real API's `srvtoolu_`.
+fn advisor_server_tool_use_block(id: &str, prompt: &str) -> Value {
+    json!({
+        "type": "server_tool_use",
+        "id": id,
+        "name": "advisor",
+        "input": {"prompt": prompt},
+    })
+}
+
+/// `advisor_tool_result` carrying the advice, the documented Anthropic shape.
+fn advisor_result_block(id: &str, advice: &str) -> Value {
+    json!({
+        "type": "advisor_tool_result",
+        "tool_use_id": id,
+        "content": {"type": "advisor_result", "text": advice},
+    })
+}
+
+/// Flatten the advisor blocks back into prose when a client replays them in a
+/// later turn. An OpenAI upstream has no notion of a server tool, but dropping
+/// them would lose what the advisor said.
+pub fn flatten_advisor_history_block(block: &Value) -> Option<String> {
+    match block["type"].as_str()? {
+        "server_tool_use" if block["name"] == "advisor" => {
+            let prompt = block["input"]["prompt"].as_str().unwrap_or("");
+            Some(format!("[advisor consulted: {prompt}]"))
+        }
+        "advisor_tool_result" => {
+            let text = block["content"]["text"].as_str().unwrap_or("");
+            Some(format!("[advisor advice] {text}"))
+        }
+        _ => None,
     }
 }
 
@@ -973,16 +1022,19 @@ mod tests {
         assert!(Tool::Datetime.servable(&disabled));
     }
 
-    /// No tool gets a client result block of its own on Anthropic Messages, so
-    /// web_fetch and datetime are not offered there.
+    /// On Anthropic Messages only the tools with a documented result block are
+    /// offered: web_search and the advisor. web_fetch, datetime, search_models,
+    /// image_generation and the subagent have none.
     #[test]
-    fn anthropic_messages_is_offered_only_web_search() {
+    fn anthropic_messages_is_offered_web_search_and_advisor() {
         for tool in Tool::implemented() {
             assert!(tool.served_on(ClientFormat::Openai), "{tool:?}");
         }
         assert!(Tool::WebSearch.served_on(ClientFormat::Anthropic));
+        assert!(Tool::Advisor.served_on(ClientFormat::Anthropic));
         assert!(!Tool::WebFetch.served_on(ClientFormat::Anthropic));
         assert!(!Tool::Datetime.served_on(ClientFormat::Anthropic));
+        assert!(!Tool::Subagent.served_on(ClientFormat::Anthropic));
     }
 
     /// The web_fetch executor runs the same provider walk `/v1/fetch` runs,
@@ -1193,6 +1245,22 @@ mod tests {
         let app = mock_app("[server]", "image_generation_no_prompt");
         let ctx = ToolCtx::new(&app, "c");
         assert!(Tool::ImageGeneration.execute(&ctx, &json!({})).await.is_err());
+    }
+
+    /// A replayed advisor consultation flattens to prose for an OpenAI
+    /// upstream, and the flattener must leave a web_search block alone so its
+    /// own flattener handles it.
+    #[test]
+    fn advisor_history_blocks_flatten_to_prose() {
+        let q = json!({"type": "server_tool_use", "id": "s1", "name": "advisor",
+            "input": {"prompt": "how?"}});
+        assert_eq!(flatten_advisor_history_block(&q).unwrap(), "[advisor consulted: how?]");
+        let r = json!({"type": "advisor_tool_result", "tool_use_id": "s1",
+            "content": {"type": "advisor_result", "text": "like this"}});
+        assert_eq!(flatten_advisor_history_block(&r).unwrap(), "[advisor advice] like this");
+        let ws = json!({"type": "server_tool_use", "id": "s2", "name": "web_search",
+            "input": {"query": "rust"}});
+        assert!(flatten_advisor_history_block(&ws).is_none());
     }
 
     /// The meta-tools issue their sub-request through pxy's own router, so a

@@ -251,11 +251,13 @@ fn push_assistant_turn(messages: &mut Vec<Value>, blocks: &[Value], reasoning_re
                     }
                 }));
             }
-            // The search blocks pxy emitted last turn come back here. The
-            // upstream has no notion of a server tool, so they replay as prose
-            // — dropping them would lose what the search found.
-            Some("server_tool_use") | Some("web_search_tool_result") => {
-                if let Some(line) = web_search::flatten_history_block(block) {
+            // The search and advisor blocks pxy emitted last turn come back
+            // here. The upstream has no notion of a server tool, so they replay
+            // as prose — dropping them would lose what was found or advised.
+            Some("server_tool_use") | Some("web_search_tool_result") | Some("advisor_tool_result") => {
+                let line = server_tools::flatten_advisor_history_block(block)
+                    .or_else(|| web_search::flatten_history_block(block));
+                if let Some(line) = line {
                     if !text.is_empty() {
                         text.push('\n');
                     }

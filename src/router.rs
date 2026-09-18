@@ -6229,6 +6229,94 @@ mod tests {
         assert_eq!(sub["messages"][1]["content"], "how?", "{sub}");
     }
 
+    /// An Anthropic Messages client gets the consultation as the official
+    /// block shapes: a `server_tool_use` naming the advisor, then an
+    /// `advisor_tool_result` carrying the advice. No `pxy_*` name reaches it.
+    #[tokio::test]
+    async fn advisor_renders_on_the_anthropic_dialect() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let strong: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = strong.clone();
+        let router = axum::Router::new()
+            .route(
+                "/m",
+                post(move |axum::Json(body): axum::Json<Value>| async move {
+                    let sse = if body["messages"].to_string().contains("advice text") {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_advisor\",\"arguments\":\"{\\\"prompt\\\":\\\"how?\\\"}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }),
+            )
+            .route(
+                "/strong",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "advice text"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2}}))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [providers.strong]
+                base_url = "{base}/strong"
+                models = ["s"]
+                "#
+            ),
+            "advisor_anthropic",
+        );
+        // The Anthropic native shape: the model rides the entry itself.
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "build a pool"}],
+            "tools": [{"type": "advisor_20260301", "name": "advisor", "model": "strong/s"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Anthropic, payload, ClientContext::default())
+                .await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("final answer"), "{text}");
+        assert!(text.contains("\"server_tool_use\""), "{text}");
+        assert!(text.contains("\"name\":\"advisor\""), "{text}");
+        assert!(text.contains("\"advisor_tool_result\""), "{text}");
+        assert!(text.contains("advice text"), "{text}");
+        assert!(!text.contains("pxy_"), "no reserved name may reach the client: {text}");
+
+        let bodies = strong.lock().unwrap();
+        assert_eq!(bodies[0]["model"], "s", "the entry's model picks the advisor");
+    }
+
     #[tokio::test]
     async fn server_tool_servability_follows_the_registry() {
         use axum::routing::post;
