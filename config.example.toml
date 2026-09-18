@@ -52,8 +52,9 @@ max_age_secs = 86400
 # the model a reserved function, runs the call and feeds the result back in the
 # same turn. The client implements nothing. Tools served: web_search, web_fetch,
 # datetime, search_models, image_generation, advisor, subagent, fusion,
-# tool_search — as `pxy:<tool>` or OpenRouter's `openrouter:<tool>` spelling,
-# with the `parameters` OpenRouter documents for each.
+# tool_search, describe_image — as `pxy:<tool>` or OpenRouter's
+# `openrouter:<tool>` spelling, with the `parameters` OpenRouter documents for
+# each (describe_image is pxy's own, so it has only the `pxy:` spelling).
 [server_tools]
 # Which tools may be served. A tool missing from this list is treated as
 # unservable: dropped on a multi-candidate walk, or the request refused on a
@@ -73,8 +74,8 @@ max_tool_calls = 10
 # harness needs a plugin to get them. Each table is the tool's `parameters`
 # (the OpenRouter names); an empty table declares the tool with none. A client
 # that declares the tool itself keeps its own declaration. Best effort: a
-# default the turn cannot use (no search pool, a dialect without the tool, an
-# Anthropic-format upstream, a model that cannot tool-call) is left out.
+# default the turn cannot use (no search pool, an Anthropic-format upstream, a
+# model that cannot tool-call) is left out.
 # [server_tools.defaults.datetime]
 # [server_tools.defaults.web_search]
 # max_results = 5
@@ -87,6 +88,13 @@ max_tool_calls = 10
 # caps one search (default 5, at most 50).
 # [server_tools.defaults.tool_search]
 # max_results = 5
+# describe_image is how a model with no image input still sees one: pxy swaps
+# each image in the transcript for `[image N]` for a `vision = false` model,
+# and this tool sends the real image to the model named here. `ocr_model` is
+# used for `mode = "ocr"` and falls back to `model`.
+# [server_tools.defaults.describe_image]
+# model = "alpha/model-thinking"
+# ocr_model = "jina/jina-ocr-v1"
 
 # ---------------------------------------------------------------------------
 # Groups: named failover chains. A group name is itself a routable model id.
@@ -192,10 +200,14 @@ models = [
     # Asserted capabilities. `tool_call = false` IS read by routing: the model
     # is skipped on a tools walk. Omit to fail open.
     tool_call = true,
-    # `free` and `reasoning` are display/capability metadata; routing never
-    # reads them.
+    # `free`, `reasoning` and `vision` are display/capability metadata;
+    # routing never reads them. `vision = false` asserts that this upstream
+    # 400s on an image part, so pxy swaps each image in the transcript for an
+    # `[image N]` placeholder and only describe_image can look at it. Omit it
+    # when nobody knows, and images pass through as they always did.
     free = false,
     reasoning = true,
+    vision = false,
     # The thinking levels this model accepts, in canonical order:
     # none, minimal, low, medium, high, xhigh, max.
     effort = ["low", "high", "max"],
@@ -258,6 +270,16 @@ name = "secondary"
 api_key = { pass = "AI/gamma/secondary" }
 # A second credential blob form is also legal per account.
 # credentials = { pass = "AI/gamma/secondary-creds" }
+
+# A real provider, named here because describe_image's `ocr_model` wants one:
+# jina-ocr-v1 is an ordinary chat model that takes image parts and answers in
+# Markdown. It replies 503 while it is cold, for up to a minute, and pxy does
+# not wait for it; put a general vision model after it in a group if a cold
+# start must not be visible.
+[providers.jina]
+base_url = "https://api.jina.ai/v1/chat/completions"
+api_key = { pass = "AI/jina/main" }
+models = ["jina-ocr-v1"]
 
 # ---------------------------------------------------------------------------
 # Media: non-chat capabilities. Usage is counted under "provider#media" and

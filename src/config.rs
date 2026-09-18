@@ -1121,6 +1121,32 @@ mod tests {
         assert!(disabled.unwrap_err().contains("not in [server_tools] enabled"));
     }
 
+    /// The example config is what a new install is pasted from, so it has to
+    /// load: every key it annotates is a key pxy still takes, and the entries
+    /// describe_image needs are actually there to copy.
+    #[test]
+    fn the_example_config_parses_and_shows_the_vision_entries() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+                .unwrap();
+        let cfg: Config = toml::from_str(&src).unwrap();
+        cfg.validate().unwrap();
+
+        let specs: Vec<ModelSpec> =
+            cfg.providers.values().flat_map(|p| p.models.iter().map(|m| m.spec())).collect();
+        assert!(
+            specs.iter().any(|s| s.vision == Some(false)),
+            "a vision = false entry is the one people copy"
+        );
+        let jina = &cfg.providers["jina"];
+        assert_eq!(jina.base_url.as_deref(), Some("https://api.jina.ai/v1/chat/completions"));
+        assert!(jina.models.iter().any(|m| m.spec().id == "jina-ocr-v1"));
+        // Commented out like the other defaults, but the spelling has to be
+        // right for the line to work when it is uncommented.
+        assert!(src.contains("# [server_tools.defaults.describe_image]"), "{src}");
+        assert!(src.contains("# ocr_model = \"jina/jina-ocr-v1\""), "{src}");
+    }
+
     #[test]
     fn server_tools_section_overrides_the_defaults() {
         let cfg: Config = toml::from_str(
