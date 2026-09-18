@@ -51,9 +51,9 @@ max_age_secs = 86400
 # Server tools pxy runs itself. A client declares one by its `type`; pxy offers
 # the model a reserved function, runs the call and feeds the result back in the
 # same turn. The client implements nothing. Tools served: web_search, web_fetch,
-# datetime, search_models, image_generation, advisor, subagent, fusion — as
-# `pxy:<tool>` or OpenRouter's `openrouter:<tool>` spelling, with the
-# `parameters` OpenRouter documents for each.
+# datetime, search_models, image_generation, advisor, subagent, fusion,
+# tool_search — as `pxy:<tool>` or OpenRouter's `openrouter:<tool>` spelling,
+# with the `parameters` OpenRouter documents for each.
 [server_tools]
 # Which tools may be served. A tool missing from this list is treated as
 # unservable: dropped on a multi-candidate walk, or the request refused on a
