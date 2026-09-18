@@ -479,6 +479,12 @@ async fn handle_chat_inner(
         + estimate_tokens(&payload["tools"]);
     let wants_tools = payload["tools"].as_array().is_some_and(|a| !a.is_empty());
     let server_tools = openai_unservable_server_tools(&payload, &app.cfg.server_tools);
+    // Config-declared server tools ride every client turn. After the two
+    // reads above on purpose: a default never makes a candidate unservable
+    // and never turns a toolless request into a tools request for routing.
+    if ctx.tool_depth == 0 {
+        inject_default_server_tools(&mut payload, &app, client_format);
+    }
 
     let mut skipped: Vec<String> = Vec::new();
     let multi = candidates.len() > 1;
@@ -1156,6 +1162,11 @@ async fn try_candidate_inner(
     // pairing, empty blocks) and the passthrough path replays whatever the
     // client accumulated — repair it at the one choke point.
     if upstream_format == WireFormat::Anthropic {
+        // The served-tool loop needs an OpenAI upstream, and no upstream
+        // knows pxy's own `pxy:*` spelling: it would 400 here. The
+        // `openrouter:*` spelling passes through, as it always has — the
+        // upstream may be OpenRouter itself, which serves it natively.
+        drop_hosted_server_tools(&mut body);
         crate::translate::anthropic_sanitize::sanitize(&mut body);
         // Prompt-cache breakpoints for clients whose dialect can't set them
         // after the sanitizer so markers land on blocks
@@ -1227,6 +1238,10 @@ async fn try_candidate_inner(
             // A sub-request may not re-enter a meta-tool: at depth 1 the
             // advisor and subagent are dropped like a tool pxy cannot serve.
             .filter(|t| !(ctx.tool_depth >= 1 && t.is_meta()))
+            // A model asserted unable to tool-call is offered nothing: the
+            // walk only skips such a model when the CLIENT declared tools,
+            // and a config default must not fail a toolless turn there.
+            .filter(|_| cand.model.tool_call != Some(false))
             .collect()
     } else {
         Vec::new()
@@ -2577,6 +2592,62 @@ fn swap_declared_served_tools(body: &mut Value) {
         })
         .collect();
     body["tools"] = Value::Array(converted);
+}
+
+/// Declare `[server_tools.defaults]` on this turn as if the client had sent
+/// them: one `{"type":"pxy:<tool>","parameters":{..}}` entry per default the
+/// request can use. A tool the client declared itself is left to the client's
+/// declaration, whatever spelling it used. Only a tool this app can serve on
+/// this dialect is added — a default is an offer, and offering a function
+/// nobody intercepts hands the client a tool_use it never declared.
+fn inject_default_server_tools(payload: &mut Value, app: &App, client: ClientFormat) {
+    if app.cfg.server_tools.defaults.is_empty() {
+        return;
+    }
+    let declared: Vec<server_tools::Tool> = payload["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["type"].as_str().and_then(server_tools::from_type))
+        .collect();
+    let mut added: Vec<Value> = Vec::new();
+    for (name, params) in &app.cfg.server_tools.defaults {
+        let Some(tool) = server_tools::from_type(&format!("pxy:{name}")) else { continue };
+        if declared.contains(&tool) || !tool.servable(app) || !tool.served_on(client) {
+            continue;
+        }
+        let mut entry = json!({"type": format!("pxy:{name}")});
+        let params = serde_json::to_value(params).unwrap_or(Value::Null);
+        if params.as_object().is_some_and(|o| !o.is_empty()) {
+            entry["parameters"] = params;
+        }
+        added.push(entry);
+    }
+    if added.is_empty() {
+        return;
+    }
+    match payload["tools"].as_array_mut() {
+        Some(tools) => tools.extend(added),
+        None => payload["tools"] = Value::Array(added),
+    }
+}
+
+/// Remove every `pxy:*` tool entry from a body bound for an Anthropic-format
+/// upstream: that spelling is pxy's own, and the loop that serves it needs an
+/// OpenAI upstream. Every other spelling (`openrouter:*`, `web_search_20250305`)
+/// passes through for the upstream to answer for itself.
+fn drop_hosted_server_tools(body: &mut Value) {
+    let Some(tools) = body["tools"].as_array_mut() else { return };
+    let hosted = |t: &Value| t["type"].as_str().is_some_and(|ty| ty.starts_with("pxy:"));
+    if !tools.iter().any(hosted) {
+        return;
+    }
+    tools.retain(|t| !hosted(t));
+    if tools.is_empty() {
+        let body = body.as_object_mut().expect("tools was indexed on an object");
+        body.remove("tools");
+        body.remove("tool_choice");
+    }
 }
 
 /// The step budget for one turn: a request-level `max_tool_calls` over
@@ -6332,6 +6403,238 @@ mod tests {
             "the step budget is pxy's, not an upstream field: {}",
             bodies[0]
         );
+    }
+
+    /// `[server_tools.defaults.<tool>]` declares the tool on a turn whose
+    /// client sent no tools at all: the upstream is offered the reserved
+    /// function, the model's call is served, and the client sees one answer
+    /// with no `pxy_*` name, exactly as if it had declared the tool itself.
+    #[tokio::test]
+    async fn default_server_tools_are_declared_on_a_toolless_chat_turn() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let counter = calls.clone();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let counter = counter.clone();
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sse = if n == 0 {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_datetime\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"It is now.\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                [server_tools.defaults.datetime]
+                timezone = "Asia/Dhaka"
+                "#
+            ),
+            "default_tools_chat",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what time is it?"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("It is now."), "{text}");
+        assert!(!text.contains("pxy_"), "a Chat Completions client must see no pxy_* name: {text}");
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "one call to ask, one to answer");
+        let names: Vec<&str> = bodies[0]["tools"]
+            .as_array()
+            .map(|ts| ts.iter().filter_map(|t| t["function"]["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, vec!["pxy_datetime"], "{:?}", bodies[0]["tools"]);
+        assert!(bodies[1]["messages"].to_string().contains("pxy_datetime"));
+    }
+
+    /// A client's own declaration wins over the config default for the same
+    /// tool, whatever spelling it used; a default the client did not declare
+    /// is appended with its configured parameters.
+    #[test]
+    fn default_server_tools_yield_to_the_client_declaration() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/m"
+            models = ["m"]
+            [server_tools.defaults.datetime]
+            timezone = "UTC"
+            [server_tools.defaults.search_models]
+            "#,
+            "default_tools_yield",
+        );
+        let mut payload = json!({"tools": [
+            {"type": "function", "function": {"name": "mine", "parameters": {}}},
+            {"type": "openrouter:datetime", "parameters": {"timezone": "Asia/Dhaka"}},
+        ]});
+        inject_default_server_tools(&mut payload, &app, ClientFormat::Openai);
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3, "{tools:?}");
+        assert_eq!(tools[1]["parameters"]["timezone"], "Asia/Dhaka");
+        assert_eq!(tools[2], json!({"type": "pxy:search_models"}));
+        assert_eq!(
+            server_tools::declared_parameters(&payload, server_tools::Tool::Datetime)["timezone"],
+            "Asia/Dhaka"
+        );
+    }
+
+    /// A default is an offer, not a demand: one the app cannot serve (no
+    /// search pool) or the dialect is not offered (datetime on Messages) is
+    /// left out rather than declared and dropped.
+    #[test]
+    fn default_server_tools_respect_dialect_and_executor() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/m"
+            models = ["m"]
+            [server_tools.defaults.datetime]
+            [server_tools.defaults.web_search]
+            [server_tools.defaults.advisor]
+            model = "p/m"
+            "#,
+            "default_tools_dialect",
+        );
+        let mut anthropic = json!({"messages": []});
+        inject_default_server_tools(&mut anthropic, &app, ClientFormat::Anthropic);
+        let types: Vec<&str> = anthropic["tools"]
+            .as_array()
+            .map(|ts| ts.iter().filter_map(|t| t["type"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(types, vec!["pxy:advisor"], "{anthropic}");
+
+        let mut openai = json!({"messages": []});
+        inject_default_server_tools(&mut openai, &app, ClientFormat::Openai);
+        let types: Vec<&str> = openai["tools"]
+            .as_array()
+            .map(|ts| ts.iter().filter_map(|t| t["type"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(types, vec!["pxy:advisor", "pxy:datetime"], "web_search has no pool: {openai}");
+    }
+
+    /// An Anthropic-format upstream never sees a `pxy:*` entry: the loop
+    /// cannot run there and no upstream knows the spelling. The `openrouter:*`
+    /// spelling, native spellings and function tools stay (the upstream may
+    /// be OpenRouter itself); an emptied list takes tool_choice with it.
+    #[test]
+    fn hosted_server_tools_are_dropped_for_anthropic_upstreams() {
+        let mut body = json!({"tools": [
+            {"type": "pxy:datetime"},
+            {"type": "openrouter:web_search", "parameters": {"max_results": 3}},
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "mine", "input_schema": {"type": "object"}},
+        ], "tool_choice": {"type": "auto"}});
+        drop_hosted_server_tools(&mut body);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3, "{tools:?}");
+        assert_eq!(tools[0]["type"], "openrouter:web_search");
+        assert_eq!(tools[1]["type"], "web_search_20250305");
+        assert_eq!(tools[2]["name"], "mine");
+        assert!(body["tool_choice"].is_object());
+
+        let mut only_hosted = json!({"tools": [{"type": "pxy:datetime"}], "tool_choice": {"type": "any"}});
+        drop_hosted_server_tools(&mut only_hosted);
+        assert!(only_hosted.get("tools").is_none(), "{only_hosted}");
+        assert!(only_hosted.get("tool_choice").is_none(), "{only_hosted}");
+    }
+
+    /// A model asserted `tool_call = false` is offered no reserved function
+    /// for a config default, and a toolless client turn still routes to it.
+    #[tokio::test]
+    async fn default_server_tools_skip_a_model_that_cannot_tool_call() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    let sse = concat!(
+                        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = [{{ id = "m", tool_call = false }}]
+                [groups.free]
+                models = ["p/m"]
+                [server_tools.defaults.datetime]
+                "#
+            ),
+            "default_tools_no_tool_call",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream, the model must still be routed to") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("hi"));
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].get("tools").is_none(), "{}", bodies[0]);
     }
 
     /// search_models and image_generation render through the same Chat

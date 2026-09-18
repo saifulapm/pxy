@@ -66,6 +66,18 @@ max_tool_calls = 10
 # the analyst defaults to the first panel member.
 # fusion_panel = ["aaa", "glm"]
 # fusion_analyst = "aaa"
+# Tools declared on every client turn, as if the client had sent them, so no
+# harness needs a plugin to get them. Each table is the tool's `parameters`
+# (the OpenRouter names); an empty table declares the tool with none. A client
+# that declares the tool itself keeps its own declaration. Best effort: a
+# default the turn cannot use (no search pool, a dialect without the tool, an
+# Anthropic-format upstream, a model that cannot tool-call) is left out.
+# [server_tools.defaults.datetime]
+# [server_tools.defaults.web_search]
+# max_results = 5
+# [server_tools.defaults.advisor]
+# model = "aaa"
+# instructions = "You are a senior engineer. Be decisive."
 
 # ---------------------------------------------------------------------------
 # Groups: named failover chains. A group name is itself a routable model id.

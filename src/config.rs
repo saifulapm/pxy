@@ -167,6 +167,14 @@ pub struct ServerToolsConfig {
     /// panel member.
     #[serde(default)]
     pub fusion_analyst: Option<String>,
+    /// Tools declared on every client turn as if the client had sent them:
+    /// `[server_tools.defaults.<tool>]` is that tool's `parameters` table (an
+    /// empty table declares it with none). A client that declares the tool
+    /// itself keeps its own declaration. Best effort: a default the request
+    /// cannot be served (no executor, a dialect without the tool, an
+    /// Anthropic upstream) is dropped, never refused.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, toml::Value>,
 }
 
 impl ServerToolsConfig {
@@ -192,6 +200,7 @@ impl Default for ServerToolsConfig {
             max_tool_calls: default_max_tool_calls(),
             fusion_panel: Vec::new(),
             fusion_analyst: None,
+            defaults: BTreeMap::new(),
         }
     }
 }
@@ -463,6 +472,22 @@ impl Config {
                         "group '{group}': model '{entry}' references unknown provider '{prov}'"
                     );
                 }
+            }
+        }
+        // A default naming a tool pxy does not implement, or one left out of
+        // `enabled`, would be injected into every turn and dropped from every
+        // turn: a config that silently does nothing is a config that lies.
+        for (tool, params) in &self.server_tools.defaults {
+            let known = crate::translate::server_tools::from_type(&format!("pxy:{tool}"))
+                .is_some_and(|t| t.name() == tool);
+            if !known {
+                anyhow::bail!("[server_tools.defaults.{tool}]: pxy implements no such tool");
+            }
+            if !self.server_tools.enabled.iter().any(|n| n == tool) {
+                anyhow::bail!("[server_tools.defaults.{tool}]: '{tool}' is not in [server_tools] enabled");
+            }
+            if !params.is_table() {
+                anyhow::bail!("[server_tools.defaults.{tool}] must be a table of parameters");
             }
         }
         Ok(())
@@ -1033,6 +1058,48 @@ mod tests {
     }
 
     /// An explicit section replaces both defaults.
+    /// `[server_tools.defaults.<tool>]` declares a tool on every turn; its
+    /// table is the declaration's `parameters`. An unknown or disabled tool
+    /// is a load error, not a silent no-op.
+    #[test]
+    fn server_tools_defaults_parse_and_validate() {
+        let load = |t: &str| {
+            toml::from_str::<Config>(t)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map_err(|e| e.to_string()).map(|_| c))
+        };
+        let cfg = load(
+            r#"
+            [server]
+            [server_tools.defaults.datetime]
+            [server_tools.defaults.web_search]
+            max_results = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server_tools.defaults.len(), 2);
+        assert!(cfg.server_tools.defaults["datetime"].is_table());
+        assert_eq!(cfg.server_tools.defaults["web_search"]["max_results"].as_integer(), Some(3));
+
+        let unknown = load(
+            r#"
+            [server]
+            [server_tools.defaults.shell]
+            "#,
+        );
+        assert!(unknown.unwrap_err().contains("no such tool"));
+
+        let disabled = load(
+            r#"
+            [server]
+            [server_tools]
+            enabled = ["web_search"]
+            [server_tools.defaults.datetime]
+            "#,
+        );
+        assert!(disabled.unwrap_err().contains("not in [server_tools] enabled"));
+    }
+
     #[test]
     fn server_tools_section_overrides_the_defaults() {
         let cfg: Config = toml::from_str(
