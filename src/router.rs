@@ -2179,6 +2179,12 @@ struct StreamCtx {
     /// served-tool marker chunks. A Chat Completions client must not be sent
     /// one: it has no item for a served tool and would see a `pxy_*` name.
     responses_client: bool,
+    /// The OpenAI-dialect client already received a terminal `finish_reason`.
+    /// A Chat Completions stream that ends without one is a protocol error to
+    /// every client (pi: "Stream ended without finish_reason"), and an
+    /// upstream that dies mid-body leaves exactly that hole, so `finish()`
+    /// closes it.
+    client_done: bool,
 }
 
 /// Accumulates the model's calls to a reserved `pxy_*` server function while
@@ -2557,6 +2563,23 @@ fn rewrite_chunk_tools(data: &str, filter: &mut ToolTextFilter) -> String {
     v.to_string()
 }
 
+/// Does this OpenAI-dialect chunk carry the client's terminal signal? A
+/// non-null `finish_reason` is the only thing a Chat Completions client treats
+/// as "the turn is over"; `null` (and the usage-only final chunk) means still
+/// streaming. The cheap `contains` guard keeps this off the hot path.
+fn chunk_is_final(data: &str) -> bool {
+    data.contains("\"finish_reason\"")
+        && serde_json::from_str::<Value>(data)
+            .is_ok_and(|v| v["choices"][0]["finish_reason"].is_string())
+}
+
+/// Close an OpenAI-dialect client stream the upstream left open. `[DONE]`
+/// alone is not a terminator: clients (pi, the official SDKs) require a
+/// non-null `finish_reason` and report a protocol error without one.
+fn openai_terminator() -> &'static str {
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+}
+
 /// Leftover buffered text at stream end (an opener that never closed).
 fn tooltext_flush_chunk(filter: &mut ToolTextFilter) -> Option<String> {
     let rest = filter.flush()?;
@@ -2624,7 +2647,7 @@ impl Drop for StreamCtx {
 impl StreamCtx {
     /// Process one upstream chunk; returns bytes for the client.
     fn process(&mut self, bytes: &Bytes) -> Bytes {
-        let Self { parser, kind, think, tooltext, usage, search, .. } = self;
+        let Self { parser, kind, think, tooltext, usage, search, client_done, .. } = self;
         let events = parser.feed(bytes);
         match kind {
             StreamKind::OpenaiPass => {
@@ -2643,7 +2666,14 @@ impl StreamCtx {
                         }
                     }
                 }
-                if think.is_none() && tooltext.is_none() && search.is_none() {
+                // A `[DONE]` batch must be rewritten even with no filter so a
+                // missing terminal reason can be inserted before it; every
+                // other unfiltered batch passes through verbatim.
+                let has_done = events.iter().any(|ev| ev.data.trim() == "[DONE]");
+                if think.is_none() && tooltext.is_none() && search.is_none() && !has_done {
+                    if events.iter().any(|ev| chunk_is_final(&ev.data)) {
+                        *client_done = true;
+                    }
                     return bytes.clone();
                 }
                 // Any active filter forces chunk rewriting even in passthrough.
@@ -2663,7 +2693,12 @@ impl StreamCtx {
                         // Held back while a search is queued: this ends the
                         // upstream call, not the client's turn.
                         if search.as_ref().is_none_or(|s| s.pending().is_empty()) {
-                            out.push_str("data: [DONE]\n\n");
+                            if *client_done {
+                                out.push_str("data: [DONE]\n\n");
+                            } else {
+                                out.push_str(openai_terminator());
+                                *client_done = true;
+                            }
                         }
                     } else {
                         let mut data = ev.data.clone();
@@ -2675,6 +2710,9 @@ impl StreamCtx {
                         }
                         if let Some(s) = search.as_mut() {
                             data = rewrite_chunk_server_calls(&data, &mut s.filter);
+                        }
+                        if chunk_is_final(&data) {
+                            *client_done = true;
                         }
                         out.push_str(&format!("data: {data}\n\n"));
                     }
@@ -2745,6 +2783,9 @@ impl StreamCtx {
                     out.push_str(&state.on_event(ev.event.as_deref(), &ev.data));
                 }
                 *usage = state.usage;
+                if state.is_finished() {
+                    *client_done = true;
+                }
                 Bytes::from(out)
             }
         }
@@ -2873,11 +2914,21 @@ impl StreamCtx {
                 self.usage = state.usage;
                 Bytes::from(s)
             }
-            _ => match self.tooltext.as_mut().and_then(tooltext_flush_chunk) {
+            StreamKind::OpenaiPass | StreamKind::ToOpenai(_) => {
+                let mut s = String::new();
                 // Abrupt EOF with buffered text: hand it to the client raw.
-                Some(tail) => Bytes::from(format!("data: {tail}\n\n")),
-                None => Bytes::new(),
-            },
+                if let Some(tail) = self.tooltext.as_mut().and_then(tooltext_flush_chunk) {
+                    s.push_str(&format!("data: {tail}\n\n"));
+                }
+                // A truncated upstream never sent a terminal reason; without
+                // one the client sees a broken stream, not a short answer.
+                if !self.client_done {
+                    s.push_str(openai_terminator());
+                    self.client_done = true;
+                }
+                Bytes::from(s)
+            }
+            StreamKind::AnthropicPass => Bytes::new(),
         };
         record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, self.usage);
         out
@@ -3011,6 +3062,7 @@ async fn stream_outcome(
         stall,
         search,
         responses_client,
+        client_done: false,
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
@@ -4477,6 +4529,169 @@ mod tests {
                 for part in ["one", "-two", "-three", "[DONE]"] {
                     assert!(text.contains(part), "missing {part:?}: {text}");
                 }
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+    }
+
+    /// An upstream that dies mid-body leaves an OpenAI client stream with no
+    /// `finish_reason`. Clients (pi, the SDKs) read that as a protocol error —
+    /// "Stream ended without finish_reason" — so pxy closes the turn itself,
+    /// after whatever content already reached the wire.
+    #[tokio::test]
+    async fn mid_stream_death_closes_an_openai_turn() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/die",
+            post(|| async {
+                let stream = futures_util::stream::unfold(0u8, |n| async move {
+                    match n {
+                        0 => Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from(
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n",
+                            )),
+                            1,
+                        )),
+                        // Let the first chunk reach reqwest (and pxy commit the
+                        // stream) before the connection dies.
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            Some((Err(std::io::Error::other("connection reset")), 2))
+                        }
+                        _ => None,
+                    }
+                });
+                axum::http::Response::builder()
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/die"
+                models = ["m"]
+                "#
+            ),
+            "mid_stream_death",
+        );
+
+        let payload = json!({"model": "p/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("half"), "content before the death must survive: {text}");
+                assert!(text.contains("\"finish_reason\":\"stop\""), "pxy must close the turn: {text}");
+                assert_eq!(text.matches("[DONE]").count(), 1, "exactly one terminator: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+    }
+
+    /// The same hole with a `[DONE]` and no `finish_reason` before it: some
+    /// aggregators close that way. The synthetic reason must land *before*
+    /// `[DONE]`, not after — a client that stops at `[DONE]` never sees a
+    /// later chunk. This request declares tools, so it takes the rewriting
+    /// path a Chat Completions client with tool history actually uses.
+    #[tokio::test]
+    async fn done_without_finish_reason_gets_one_before_done() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/bare",
+            post(|| async {
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/bare"
+                models = ["m"]
+                "#
+            ),
+            "done_without_finish",
+        );
+
+        let payload = json!({"model": "p/m", "stream": true,
+            "tools": [{"type": "function", "function": {"name": "bash",
+                "parameters": {"type": "object", "properties": {}}}}],
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                let finish = text.find("\"finish_reason\":\"stop\"").expect("a terminal reason");
+                let done = text.find("[DONE]").expect("a terminator");
+                assert!(finish < done, "the reason must precede [DONE]: {text}");
+                assert_eq!(text.matches("[DONE]").count(), 1, "exactly one terminator: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+    }
+
+    /// The Anthropic-upstream half of the same guarantee: an Anthropic SSE
+    /// stream that stops before `message_stop` reaches an OpenAI client with
+    /// no `finish_reason`, so pxy must synthesize one on this path too.
+    #[tokio::test]
+    async fn truncated_anthropic_upstream_closes_an_openai_turn() {
+        use crate::translate::sse::format_event;
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/a",
+            post(|| async {
+                let mut s = String::new();
+                s.push_str(&format_event("message_start", &json!({
+                    "type": "message_start",
+                    "message": {"id": "msg_1", "type": "message", "role": "assistant",
+                                "model": "m", "content": [],
+                                "usage": {"input_tokens": 3, "output_tokens": 0}},
+                })));
+                s.push_str(&format_event("content_block_start", &json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })));
+                s.push_str(&format_event("content_block_delta", &json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": "half"},
+                })));
+                // …and the upstream ends here, with no message_stop.
+                s
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/a"
+                format = "anthropic"
+                models = ["m"]
+                "#
+            ),
+            "truncated_anthropic",
+        );
+
+        let payload = json!({"model": "p/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("half"), "content must survive: {text}");
+                assert!(text.contains("\"finish_reason\":\"stop\""), "pxy must close the turn: {text}");
+                assert_eq!(text.matches("[DONE]").count(), 1, "exactly one terminator: {text}");
             }
             Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
         }

@@ -334,6 +334,12 @@ impl StreamState {
         }
     }
 
+    /// Has the translated stream already emitted its terminal chunk? The
+    /// router asks so it can close a stream the upstream abandoned mid-body.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
     /// Translate one parsed Anthropic SSE event into OpenAI chunk text.
     pub fn on_event(&mut self, event_type: Option<&str>, data: &str) -> String {
         let payload: Value = match serde_json::from_str(data) {
