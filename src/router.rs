@@ -226,13 +226,17 @@ pub fn resolve_candidates(
     // Session affinity: the candidate this conversation last won on walks
     // first, so a post-failover conversation keeps its prompt-cache locality
     // instead of bouncing back to the chain head. A stale or unlisted
-    // binding is ignored — the walk's winner rebinds it (self-healing).
+    // binding is ignored — the walk's winner rebinds it (self-healing). So
+    // is one outside this group's chain: the key is the conversation's
+    // opener, which two sessions on different groups can share, and a `gpt`
+    // walk must never start on the model a `muse` session won on.
     let mut affinity = None;
     if pinned.is_none() {
         if let Some(key) = session {
             if let Some(full_id) = state.session_get(key) {
                 let bound = catalog.resolve(cfg, &full_id);
-                if !bound.is_empty() && bound.iter().all(|c| catalog.is_listed(&c.full_id())) {
+                let in_chain = |c: &Candidate| chain.iter().any(|m| m.full_id() == c.full_id());
+                if !bound.is_empty() && bound.iter().all(in_chain) {
                     affinity = Some(bound);
                 }
             }
@@ -4452,8 +4456,13 @@ mod tests {
             [providers.b]
             base_url = "http://127.0.0.1:1/b"
             models = ["m2"]
+            [providers.c]
+            base_url = "http://127.0.0.1:1/c"
+            models = ["m3"]
             [groups.free]
             models = ["a/m1", "b/m2"]
+            [groups.other]
+            models = ["c/m3"]
             "#,
             "session_affinity",
         );
@@ -4483,6 +4492,16 @@ mod tests {
                 .collect();
         assert_eq!(ids, ["a/m1", "b/m2"], "pin first, affinity never leads");
         app.state.kv_set(&route_pin_key("free"), "").unwrap();
+
+        // A binding to a model outside this group is ignored: the opener hash
+        // is shared across groups, and another group's winner must not lead.
+        app.state.session_set("uid:u3", "c/m3");
+        let ids: Vec<String> =
+            resolve_candidates(&app.catalog, &app.cfg, &app.state, "free", Some("uid:u3"))
+                .iter()
+                .map(|c| c.full_id())
+                .collect();
+        assert_eq!(ids, ["a/m1", "b/m2"], "a foreign group's binding never leads");
 
         // An unlisted binding degrades (is_listed gate, like the pin).
         app.state.session_set("uid:u2", "gone/nope");
