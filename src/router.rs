@@ -2846,21 +2846,29 @@ impl StreamCtx {
             messages.extend(served.tool_results);
         }
 
+        // Same rule as the first call: the total timeout must not span the
+        // body, or the answer after a tool call dies at timeout_secs with a
+        // clean-looking stop. Bound the wait for headers here; the body is
+        // bounded per read by the stall deadline in the unfold.
         let mut req = self
             .app
             .http
             .post(&search.url)
-            .timeout(search.timeout)
             .header("content-type", "application/json");
         for (k, v) in &search.headers {
             req = req.header(k, v);
         }
-        let resp = match req.json(&search.body).send().await {
-            Ok(r) if r.status().is_success() => r,
+        let resp = match tokio::time::timeout(search.timeout, req.json(&search.body).send()).await {
+            Ok(Ok(r)) if r.status().is_success() => r,
             // No second call means no answer, so the turn ends here rather
             // than hanging: the client still gets the results it can read.
-            other => {
+            Ok(other) => {
                 warn!(status = ?other.map(|r| r.status().as_u16()), "server tool continuation failed");
+                self.search = None;
+                return None;
+            }
+            Err(_) => {
+                warn!(secs = search.timeout.as_secs(), "server tool continuation: no response");
                 self.search = None;
                 return None;
             }
@@ -4563,6 +4571,102 @@ mod tests {
             }
             Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
         }
+    }
+
+    /// The continuation after a served tool call is a stream too, and the
+    /// same total-timeout rule applies: an answer whose chunks keep arriving
+    /// past timeout_secs must reach the client whole, not be cut at the
+    /// total with a clean-looking stop.
+    #[tokio::test]
+    async fn continuation_stream_survives_past_timeout_secs() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        fn chunk(c: &str) -> String {
+            format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{c}\"}}}}]}}\n\n")
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        let sse = concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_datetime\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        );
+                        return axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .unwrap()
+                            .into_response();
+                    }
+                    // The answer: three chunks spread past timeout_secs = 1.
+                    let stream = futures_util::stream::unfold(0u8, |k| async move {
+                        let (c, next, delay_ms) = match k {
+                            0 => (Bytes::from(chunk("one")), 1u8, 0),
+                            1 => (Bytes::from(chunk("-two")), 2, 550),
+                            2 => (Bytes::from(chunk("-three")), 3, 550),
+                            3 => (
+                                Bytes::from("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
+                                4,
+                                0,
+                            ),
+                            _ => return None,
+                        };
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        Some((Ok::<Bytes, std::io::Error>(c), next))
+                    });
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                timeout_secs = 1
+                models = ["m"]
+                [groups.free]
+                models = ["p/m"]
+                "#
+            ),
+            "continuation_long_stream",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what time is it?"}],
+            "tools": [{"type": "pxy:datetime"}],
+        });
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                for part in ["one", "-two", "-three", "\"finish_reason\":\"stop\"", "[DONE]"] {
+                    assert!(text.contains(part), "missing {part:?}: {text}");
+                }
+                assert!(!text.contains("pxy_datetime"), "reserved call leaked: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// An upstream that dies mid-body leaves an OpenAI client stream with no
