@@ -1265,17 +1265,7 @@ async fn try_candidate_inner(
                 body.as_object_mut().map(|o| o.remove("tools"));
             }
         }
-        // A `tool_choice` naming a function pxy just dropped would 400 an
-        // upstream that validates it, and a `tool_choice` with no tools at all
-        // is already invalid.
-        let chosen = body["tool_choice"]["function"]["name"].as_str().map(str::to_string);
-        if body["tools"].is_null()
-            || chosen.is_some_and(|n| {
-                server_tools::Tool::from_function_name(&n).is_some() && !keep.iter().any(|k| k == &n)
-            })
-        {
-            body.as_object_mut().map(|o| o.remove("tool_choice"));
-        }
+        settle_tool_choice(&mut body);
         for tool in injected.iter().filter(|t| !servable.contains(t)) {
             debug!(
                 candidate = %cand.full_id(),
@@ -1411,6 +1401,7 @@ async fn try_candidate_inner(
             .map(str::to_string)
             .unwrap_or_else(|| app.cfg.default_route()),
         served: std::collections::BTreeMap::new(),
+        results_served: 0,
     });
 
     app.state.rpm_increment(&cand.state_provider());
@@ -2341,6 +2332,9 @@ struct ServerToolLoop {
     /// Calls actually run this turn, by canonical tool name — the
     /// `server_tool_use` the final usage reports.
     served: std::collections::BTreeMap<String, u64>,
+    /// Search hits returned to the model this turn, for web_search's
+    /// `max_total_results`.
+    results_served: u64,
 }
 
 impl ServerToolLoop {
@@ -2349,6 +2343,7 @@ impl ServerToolLoop {
     /// an arbitrary one silently lost the model's other queries. Capped by
     /// the remaining search budget; empty when another tool call shared the
     /// turn (the continuation can't fake that one) or the budget is spent.
+    #[cfg(test)]
     fn pending_calls(&self) -> Vec<ServerCall> {
         self.split_calls().0
     }
@@ -2421,6 +2416,7 @@ impl ServerToolLoop {
                 if let Some(tool) = server_tools::Tool::from_function_name(name) {
                     *self.served.entry(tool.name().to_string()).or_default() += 1;
                 }
+                self.results_served += render.marker["hits"].as_u64().unwrap_or(0);
             }
         }
     }
@@ -2428,6 +2424,7 @@ impl ServerToolLoop {
     /// The captured calls as (id, arguments), for telling whether one is
     /// queued; the continuation uses [`pending_calls`](Self::pending_calls)
     /// so it also knows which tool each call belongs to.
+    #[cfg(test)]
     fn pending(&self) -> Vec<(String, String)> {
         self.pending_calls().into_iter().map(|c| (c.id, c.args)).collect()
     }
@@ -2484,6 +2481,9 @@ async fn serve_calls(
             server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null },
         )
     };
+    // Hits this batch has already returned, so parallel searches share one
+    // `max_total_results` budget.
+    let mut batch_hits: u64 = 0;
     for call in &calls {
         let Some(tool) = server_tools::Tool::from_function_name(&call.name) else {
             continue;
@@ -2501,8 +2501,12 @@ async fn serve_calls(
         ctx.agent = (!loop_.agent.is_empty()).then(|| loop_.agent.clone());
         ctx.session = loop_.session.clone();
         ctx.outer_model = loop_.outer_model.clone();
+        ctx.results_used = loop_.results_served + batch_hits;
         match tool.execute(&ctx, &args).await {
-            Ok(ran) => record(call, ran.model_output, ran.client),
+            Ok(ran) => {
+                batch_hits += ran.client.marker["hits"].as_u64().unwrap_or(0);
+                record(call, ran.model_output, ran.client)
+            }
             Err(e) => {
                 let (output, render) = error(e);
                 record(call, output, render);
@@ -2715,6 +2719,39 @@ fn swap_declared_served_tools(body: &mut Value) {
         })
         .collect();
     body["tools"] = Value::Array(converted);
+}
+
+/// Make `tool_choice` name a function the body still offers. A choice naming
+/// a served tool by its own name (`web_search`, as Claude Code forces it) is
+/// rewritten to the reserved function when that is offered; a choice naming
+/// a function that is not in the body — a reserved one pxy just dropped, or
+/// a bare name nothing maps to — is removed, since an upstream that validates
+/// it would 400. A choice with no tools at all is already invalid.
+fn settle_tool_choice(body: &mut Value) {
+    let Some(chosen) = body["tool_choice"]["function"]["name"].as_str().map(str::to_string) else {
+        if body["tools"].is_null() {
+            body.as_object_mut().map(|o| o.remove("tool_choice"));
+        }
+        return;
+    };
+    let offered = |body: &Value, name: &str| {
+        body["tools"]
+            .as_array()
+            .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == name))
+    };
+    if offered(body, &chosen) {
+        return;
+    }
+    let reserved = server_tools::Tool::implemented()
+        .iter()
+        .find(|t| t.name() == chosen)
+        .map(|t| server_tools::function_name(*t));
+    match reserved {
+        Some(name) if offered(body, &name) => body["tool_choice"]["function"]["name"] = json!(name),
+        _ => {
+            body.as_object_mut().map(|o| o.remove("tool_choice"));
+        }
+    }
 }
 
 /// Declare `[server_tools.defaults]` on this turn as if the client had sent
@@ -3762,6 +3799,7 @@ mod tests {
             session: None,
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
+            results_served: 0,
         };
         // The captured search WOULD run...
         loop_.filter.saw_other = false;
@@ -3791,6 +3829,7 @@ mod tests {
             session: None,
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
+            results_served: 0,
         };
         let render = || server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null };
         loop_.commit(&[(ws.clone(), render()), (ws.clone(), render())]);
@@ -3836,6 +3875,7 @@ mod tests {
             session: None,
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
+            results_served: 0,
         };
         let pending = loop_.pending();
         assert_eq!(
@@ -3907,6 +3947,7 @@ mod tests {
             session: None,
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
+            results_served: 0,
         };
         let served = serve_calls(&app, calls, Vec::new(), &bare).await.expect("two answerable calls");
         // The unknown name is left out; the other two are answered with an
@@ -3989,6 +4030,7 @@ mod tests {
             session: None,
             outer_model: String::new(),
             served: std::collections::BTreeMap::new(),
+            results_served: 0,
         };
         assert!(!loop_.pending().is_empty());
         loop_.uses_left = 0;
@@ -6956,6 +6998,41 @@ mod tests {
         drop_hosted_server_tools(&mut only_hosted);
         assert!(only_hosted.get("tools").is_none(), "{only_hosted}");
         assert!(only_hosted.get("tool_choice").is_none(), "{only_hosted}");
+    }
+
+    /// `tool_choice` must name a function the body offers: a served tool's
+    /// own name is rewritten to the reserved function when it is offered, a
+    /// name nothing offers is removed, and no tools at all means no choice.
+    #[test]
+    fn tool_choice_is_settled_against_the_offered_functions() {
+        let ws = server_tools::function_name(server_tools::Tool::WebSearch);
+        let mut body = json!({
+            "tools": [{"type": "function", "function": {"name": ws}}],
+            "tool_choice": {"type": "function", "function": {"name": "web_search"}},
+        });
+        settle_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"]["function"]["name"], ws, "{body}");
+
+        let mut dropped = json!({
+            "tools": [{"type": "function", "function": {"name": "mine"}}],
+            "tool_choice": {"type": "function", "function": {"name": "web_search"}},
+        });
+        settle_tool_choice(&mut dropped);
+        assert!(dropped.get("tool_choice").is_none(), "{dropped}");
+
+        let mut kept = json!({
+            "tools": [{"type": "function", "function": {"name": "mine"}}],
+            "tool_choice": {"type": "function", "function": {"name": "mine"}},
+        });
+        settle_tool_choice(&mut kept);
+        assert_eq!(kept["tool_choice"]["function"]["name"], "mine");
+
+        let mut none = json!({"tool_choice": "required"});
+        settle_tool_choice(&mut none);
+        assert!(none.get("tool_choice").is_none(), "{none}");
+        let mut auto = json!({"tools": [{"type": "function", "function": {"name": "mine"}}], "tool_choice": "auto"});
+        settle_tool_choice(&mut auto);
+        assert_eq!(auto["tool_choice"], "auto");
     }
 
     /// A model asserted `tool_call = false` is offered no reserved function

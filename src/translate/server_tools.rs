@@ -175,6 +175,9 @@ pub struct ToolCtx<'a> {
     /// The model id the client requested. A meta-tool whose declaration pins
     /// no model consults this one, as OpenRouter's does.
     pub outer_model: String,
+    /// Search results already returned to the model this turn, for
+    /// web_search's `max_total_results`.
+    pub results_used: u64,
 }
 
 impl<'a> ToolCtx<'a> {
@@ -187,6 +190,7 @@ impl<'a> ToolCtx<'a> {
             agent: None,
             session: None,
             outer_model: String::new(),
+            results_used: 0,
         }
     }
 
@@ -597,24 +601,119 @@ pub fn tool_def(tool: Tool, _params: &Value) -> Value {
     }
 }
 
-/// Run one web_search call through the provider walk. A missing or empty query
-/// argument makes the call unserved; a provider failure is reported to the
-/// model, the way the real API does.
+/// A declaration's `engine`: `auto` (or absent) walks the configured pool;
+/// a configured provider's name pins the walk to it; anything else is an
+/// error the model is told about, never a request failure.
+fn engine_choice<'a>(
+    params: &'a Value,
+    configured: impl Iterator<Item = &'a str>,
+) -> Result<Option<&'a str>, String> {
+    let Some(engine) = params["engine"].as_str().filter(|e| !e.is_empty() && *e != "auto") else {
+        return Ok(None);
+    };
+    let names: Vec<&str> = configured.collect();
+    if names.contains(&engine) {
+        Ok(Some(engine))
+    } else {
+        Err(format!("unknown engine '{engine}'; configured: {}", names.join(", ")))
+    }
+}
+
+/// The strings of a declaration's list parameter (`allowed_domains`,
+/// `excluded_domains`, `blocked_domains`, …).
+fn param_list(params: &Value, key: &str) -> Vec<String> {
+    params[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .map(|d| d.trim().trim_start_matches("*.").to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// The host of a URL, lowercased, without port or credentials.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    host.split(':').next().unwrap_or("").to_ascii_lowercase()
+}
+
+/// Whether a URL's host passes the declaration's domain lists: a listed
+/// domain matches itself and every subdomain (`example.com` covers
+/// `docs.example.com`). An empty `allowed` allows everything; `blocked`
+/// always wins.
+pub fn domain_allowed(url: &str, allowed: &[String], blocked: &[String]) -> bool {
+    let host = url_host(url);
+    let matches = |d: &String| host == *d || host.ends_with(&format!(".{d}"));
+    if blocked.iter().any(matches) {
+        return false;
+    }
+    allowed.is_empty() || allowed.iter().any(matches)
+}
+
+/// A string cut to at most `max` characters, on a character boundary.
+fn cut_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => &text[..cut],
+        None => text,
+    }
+}
+
+/// Run one web_search call through the provider walk. A missing or empty
+/// query argument makes the call unserved; a provider failure is reported to
+/// the model, the way the real API does. The declaration's `parameters`
+/// shape the search: `max_results` per call, `max_total_results` per turn,
+/// `allowed_domains` / `excluded_domains` on the hits, `max_characters` on
+/// each snippet, `engine` on the provider walked.
 async fn run_web_search(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let query =
         args["query"].as_str().filter(|q| !q.is_empty()).ok_or("missing query")?.to_string();
-    let found = crate::media::search::run_search(ctx.app, &query, 5, None).await;
-    Ok(match &found {
-        Ok((provider, results)) => {
+    let params = &ctx.params;
+    let unrun = |message: String| Ran {
+        model_output: format!("Search failed: {message}"),
+        client: ClientRender { blocks: Vec::new(), marker: Value::Null },
+    };
+    let only = match engine_choice(params, ctx.app.cfg.search.providers.iter().map(|p| p.name.as_str()))
+    {
+        Ok(only) => only,
+        Err(e) => return Ok(unrun(e)),
+    };
+    let max_results = params["max_results"].as_u64().unwrap_or(5).clamp(1, 25);
+    let n = match params["max_total_results"].as_u64() {
+        Some(total) if ctx.results_used >= total => {
+            return Ok(unrun(format!(
+                "max_total_results ({total}) already returned this turn; answer from what you have"
+            )));
+        }
+        Some(total) => max_results.min(total - ctx.results_used),
+        None => max_results,
+    };
+    let allowed = param_list(params, "allowed_domains");
+    let excluded = param_list(params, "excluded_domains");
+    let max_chars = params["max_characters"].as_u64().map(|c| c.clamp(1, 100_000) as usize);
+
+    let found = crate::media::search::run_search(ctx.app, &query, n, only).await;
+    Ok(match found {
+        Ok((provider, mut results)) => {
+            results.retain(|r| domain_allowed(r["url"].as_str().unwrap_or(""), &allowed, &excluded));
+            if let Some(max) = max_chars {
+                for r in &mut results {
+                    if let Some(snippet) = r["snippet"].as_str().map(|t| cut_chars(t, max).to_string()) {
+                        r["snippet"] = json!(snippet);
+                    }
+                }
+            }
             info!(%query, %provider, hits = results.len(), "web_search served");
             Ran {
-                model_output: web_search::results_for_model(results),
+                model_output: web_search::results_for_model(&results),
                 client: ClientRender {
                     blocks: vec![
                         web_search::server_tool_use_block(ctx.call_id, &query),
-                        web_search::result_block(ctx.call_id, results),
+                        web_search::result_block(ctx.call_id, &results),
                     ],
-                    marker: json!({"id": ctx.call_id, "query": &query}),
+                    marker: json!({"id": ctx.call_id, "query": &query, "hits": results.len()}),
                 },
             }
         }
@@ -627,81 +726,101 @@ async fn run_web_search(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> 
                         web_search::server_tool_use_block(ctx.call_id, &query),
                         web_search::error_block(ctx.call_id),
                     ],
-                    marker: json!({"id": ctx.call_id, "query": &query}),
+                    marker: json!({"id": ctx.call_id, "query": &query, "hits": 0}),
                 },
             }
         }
     })
 }
 
-/// How much of a fetched page the model is shown. One fetch must not be able
-/// to swallow the context window; the tail is dropped, not summarised.
+/// How much of a fetched page the model is shown when the declaration sets
+/// no `max_content_tokens`. One fetch must not be able to swallow the context
+/// window; the tail is dropped, not summarised.
 const FETCH_CONTENT_CHARS: usize = 100_000;
 
-/// The model-facing text for a fetched page: its URL, then the extracted
-/// content, capped.
-fn fetched_for_model(url: &str, content: &str) -> String {
-    let body = match content.char_indices().nth(FETCH_CONTENT_CHARS) {
+/// The model-facing result for a fetched page, in OpenRouter's documented
+/// shape: the URL, the extracted content (capped, and marked when cut), the
+/// status and when it was read.
+fn fetched_for_model(url: &str, content: &str, max_chars: usize, retrieved_at: &str) -> String {
+    let body = match content.char_indices().nth(max_chars) {
         Some((cut, _)) => format!("{}\n\n[truncated]", &content[..cut]),
         None => content.to_string(),
     };
-    format!("Content of {url}:\n\n{body}")
+    json!({"url": url, "content": body, "status": "completed", "retrieved_at": retrieved_at})
+        .to_string()
+}
+
+/// The model-facing result for a fetch that did not happen or failed.
+fn fetch_failed(url: &str, error: &str) -> String {
+    json!({"url": url, "status": "failed", "error": error}).to_string()
 }
 
 /// Run one web_fetch call through the fetch provider walk (the same walk
 /// `/v1/fetch` runs). A missing URL makes the call unserved; a provider
-/// failure is reported to the model. web_fetch has no documented Anthropic
-/// result block, so it renders nothing for a Messages client.
+/// failure is reported to the model. The declaration's `allowed_domains` /
+/// `blocked_domains` are checked before anything is fetched,
+/// `max_content_tokens` (four characters each) caps what the model is shown,
+/// and `engine` pins the walk to one configured provider. web_fetch has no
+/// documented Anthropic result block, so it renders nothing for a Messages
+/// client.
 async fn run_web_fetch(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let url = args["url"].as_str().filter(|u| !u.is_empty()).ok_or("missing url")?.to_string();
+    let params = &ctx.params;
+    let render = || ClientRender { blocks: Vec::new(), marker: json!({"id": ctx.call_id, "url": &url}) };
+    let failed = |error: String| Ran { model_output: fetch_failed(&url, &error), client: render() };
     // The same check /v1/fetch makes: a reader endpoint is not a general
     // fetcher, and a self-hosted base_url must not widen what a model can ask
     // it to read.
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Ok(Ran {
-            model_output: "Fetch failed: url must be http(s)".into(),
-            client: ClientRender {
-                blocks: Vec::new(),
-                marker: json!({"id": ctx.call_id, "url": &url}),
-            },
-        });
+        return Ok(failed("url must be http(s)".into()));
     }
-    let found = crate::media::search::run_fetch(ctx.app, &url, None).await;
+    let allowed = param_list(params, "allowed_domains");
+    let blocked = param_list(params, "blocked_domains");
+    if !domain_allowed(&url, &allowed, &blocked) {
+        return Ok(failed("domain not allowed by the tool's domain lists".into()));
+    }
+    let only = match engine_choice(params, ctx.app.cfg.fetch.providers.iter().map(|p| p.name.as_str()))
+    {
+        Ok(only) => only,
+        Err(e) => return Ok(failed(e)),
+    };
+    let max_chars = params["max_content_tokens"]
+        .as_u64()
+        .map(|t| t.saturating_mul(4).max(1) as usize)
+        .unwrap_or(FETCH_CONTENT_CHARS);
+    let found = crate::media::search::run_fetch(ctx.app, &url, only).await;
     Ok(match &found {
         Ok((provider, content)) => {
             info!(%url, %provider, bytes = content.len(), "web_fetch served");
+            let retrieved_at = ctx.now.to_string();
             Ran {
-                model_output: fetched_for_model(&url, content),
-                client: ClientRender {
-                    blocks: Vec::new(),
-                    marker: json!({"id": ctx.call_id, "url": &url}),
-                },
+                model_output: fetched_for_model(&url, content, max_chars, &retrieved_at),
+                client: render(),
             }
         }
         Err(e) => {
             warn!(%url, error = %e, "web_fetch failed");
-            Ran {
-                model_output: format!("Fetch failed: {e}"),
-                client: ClientRender {
-                    blocks: Vec::new(),
-                    marker: json!({"id": ctx.call_id, "url": &url}),
-                },
-            }
+            failed(e.clone())
         }
     })
 }
 
-/// The current time as ISO-8601 with its offset, then the zone it is in. No
-/// network, and a zone jiff does not know is reported to the model rather than
-/// failing the call. An empty or absent `timezone` means UTC.
+/// The current time, in OpenRouter's documented shape: `datetime` as
+/// ISO-8601 with milliseconds and offset, and the zone it is in. No network.
+/// The call's own `timezone` wins over the declaration's, which wins over
+/// UTC; a zone jiff does not know is reported to the model rather than
+/// failing the call.
 fn run_datetime(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
-    let requested = args["timezone"].as_str().filter(|z| !z.is_empty());
+    let requested = args["timezone"]
+        .as_str()
+        .or_else(|| ctx.params["timezone"].as_str())
+        .filter(|z| !z.is_empty());
     let (zoned, label) = match requested {
         Some(name) => match ctx.now.in_tz(name) {
             Ok(z) => (z, name.to_string()),
             Err(_) => {
                 return Ok(Ran {
-                    model_output: format!("Unknown timezone: {name}"),
+                    model_output: json!({"error": format!("Unknown timezone: {name}")}).to_string(),
                     client: ClientRender {
                         blocks: Vec::new(),
                         marker: json!({"id": ctx.call_id, "timezone": name}),
@@ -711,8 +830,14 @@ fn run_datetime(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         },
         None => (ctx.now.to_zoned(jiff::tz::TimeZone::UTC), "UTC".to_string()),
     };
+    let datetime = format!(
+        "{}.{:03}{}",
+        zoned.strftime("%Y-%m-%dT%H:%M:%S"),
+        zoned.millisecond(),
+        zoned.strftime("%:z")
+    );
     Ok(Ran {
-        model_output: format!("{} ({label})", zoned.strftime("%Y-%m-%dT%H:%M:%S%:z")),
+        model_output: json!({"datetime": datetime, "timezone": label}).to_string(),
         client: ClientRender {
             blocks: Vec::new(),
             marker: json!({"id": ctx.call_id, "timezone": label}),
@@ -723,16 +848,24 @@ fn run_datetime(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
 /// Run one search_models call against pxy's own catalog. Every argument is
 /// optional and a missing one filters nothing. The model is told each
 /// matching `provider/model`, the facts it routes on, and the group aliases
-/// that reach it.
+/// that reach it, in OpenRouter's documented shape: `models`, how many
+/// matched (`total_results`) and how many were returned (`showing`), capped
+/// by the declaration's `max_results` (default 10, at most 50).
 fn run_search_models(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
-    let matches = matching_models(&ctx.app.catalog, args);
-    let total = ctx.app.catalog.models().len();
-    let output = models_for_model(&matches, total);
+    let mut matches = matching_models(&ctx.app.catalog, args);
+    let total_results = matches.len();
+    let max_results = ctx.params["max_results"].as_u64().unwrap_or(10).clamp(1, 50) as usize;
+    matches.truncate(max_results);
+    let output = json!({
+        "models": matches,
+        "total_results": total_results,
+        "showing": matches.len(),
+    });
     Ok(Ran {
-        model_output: output,
+        model_output: output.to_string(),
         client: ClientRender {
             blocks: Vec::new(),
-            marker: json!({"id": ctx.call_id, "matches": matches, "total": total}),
+            marker: json!({"id": ctx.call_id, "matches": matches, "total_results": total_results}),
         },
     })
 }
@@ -781,43 +914,6 @@ fn matching_models(catalog: &Catalog, args: &Value) -> Vec<Value> {
 /// anything but an asserted yes, because an unasserted capability is not a no.
 fn matches_flag(asserted: Option<bool>, want: bool) -> bool {
     if want { asserted == Some(true) } else { asserted != Some(true) }
-}
-
-/// The model-facing report for a search_models call: one line per match, then
-/// how many of the catalog it is. No matches is an answer, not an error.
-fn models_for_model(matches: &[Value], total: usize) -> String {
-    if matches.is_empty() {
-        return format!("0 of {total} models matched.");
-    }
-    let mut out = format!("{} of {total} models:\n", matches.len());
-    for m in matches {
-        let mut facts =
-            vec![format!("context {}", m["context_length"].as_u64().unwrap_or(0))];
-        if m["tool_call"] == true {
-            facts.push("tools".into());
-        }
-        if m["reasoning"] == true {
-            facts.push("reasoning".into());
-        }
-        if m["free"] == true {
-            facts.push("free".into());
-        }
-        let groups: Vec<&str> = m["groups"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|g| g.as_str()).collect())
-            .unwrap_or_default();
-        let suffix = if groups.is_empty() {
-            String::new()
-        } else {
-            format!(" [groups: {}]", groups.join(", "))
-        };
-        out.push_str(&format!(
-            "- {} ({}){suffix}\n",
-            m["id"].as_str().unwrap_or(""),
-            facts.join(", ")
-        ));
-    }
-    out.trim_end().to_string()
 }
 
 /// The declaration's own `parameters` object for a tool, when the request
@@ -982,18 +1078,33 @@ async fn run_subagent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
 /// Run one image_generation call through the image media walk — the same walk
 /// `/v1/images/generations` runs, so the media quota and failover are shared.
 /// A missing prompt makes the call unserved; a provider failure is reported
-/// to the model. The model is handed the image URL, not the bytes.
+/// to the model. The declaration's `model` is the default when the call names
+/// none, and every other parameter (`quality`, `size`, `aspect_ratio`,
+/// `background`, `output_format`, …) rides the generation body as given. The
+/// model is handed the image URL in OpenRouter's documented shape, not the
+/// bytes.
 async fn run_image_generation(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let prompt = args["prompt"].as_str().filter(|p| !p.is_empty()).ok_or("missing prompt")?;
-    let model = args["model"].as_str().filter(|m| !m.is_empty());
-    match crate::media::images::run_generate(ctx.app, model, &json!({"prompt": prompt}), true).await {
+    let model = args["model"]
+        .as_str()
+        .or_else(|| ctx.params["model"].as_str())
+        .filter(|m| !m.is_empty());
+    let mut payload = json!({"prompt": prompt});
+    if let (Some(dst), Some(src)) = (payload.as_object_mut(), ctx.params.as_object()) {
+        for (k, v) in src {
+            if !matches!(k.as_str(), "model" | "max_uses" | "max_tool_calls" | "prompt") {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    match crate::media::images::run_generate(ctx.app, model, &payload, true).await {
         // The walk is told the tool needs a URL, so a base64-only candidate
         // fails over and a success here carries one.
         Ok((body, provider)) => {
             let url = body["data"][0]["url"].as_str().unwrap_or("");
             info!(%provider, "image_generation served");
             Ok(Ran {
-                model_output: format!("Generated image: {url}"),
+                model_output: json!({"status": "ok", "imageUrl": url}).to_string(),
                 client: ClientRender {
                     blocks: Vec::new(),
                     marker: json!({"id": ctx.call_id, "provider": provider, "url": url}),
@@ -1007,7 +1118,11 @@ async fn run_image_generation(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, St
             let detail = String::from_utf8_lossy(&bytes);
             warn!(%status, error = %detail, "image_generation failed");
             Ok(Ran {
-                model_output: format!("Image generation failed ({status}): {detail}"),
+                model_output: json!({
+                    "status": "error",
+                    "error": format!("Image generation failed ({status}): {detail}"),
+                })
+                .to_string(),
                 client: ClientRender {
                     blocks: Vec::new(),
                     marker: json!({"id": ctx.call_id, "model": model}),
@@ -1085,13 +1200,27 @@ mod tests {
         let ctx = ToolCtx { now, ..ToolCtx::new(&app, "call_1") };
 
         let utc = Tool::Datetime.execute(&ctx, &json!({})).await.unwrap();
-        assert_eq!(utc.model_output, "2025-07-15T18:30:00+00:00 (UTC)");
+        assert_eq!(
+            utc.model_output,
+            json!({"datetime": "2025-07-15T18:30:00.000+00:00", "timezone": "UTC"}).to_string()
+        );
 
         let ny = Tool::Datetime
             .execute(&ctx, &json!({"timezone": "America/New_York"}))
             .await
             .unwrap();
-        assert_eq!(ny.model_output, "2025-07-15T14:30:00-04:00 (America/New_York)");
+        assert_eq!(
+            ny.model_output,
+            json!({"datetime": "2025-07-15T14:30:00.000-04:00", "timezone": "America/New_York"})
+                .to_string()
+        );
+
+        // The declaration's `timezone` is the default; the call's own wins.
+        let declared = ToolCtx { params: json!({"timezone": "Asia/Dhaka"}), ..ToolCtx { now, ..ToolCtx::new(&app, "call_1") } };
+        let dhaka = Tool::Datetime.execute(&declared, &json!({})).await.unwrap();
+        assert!(dhaka.model_output.contains("2025-07-16T00:30:00.000+06:00"), "{}", dhaka.model_output);
+        let call_wins = Tool::Datetime.execute(&declared, &json!({"timezone": "UTC"})).await.unwrap();
+        assert!(call_wins.model_output.contains("+00:00"), "{}", call_wins.model_output);
     }
 
     /// A zone jiff cannot resolve is the model's mistake to see, not a reason
@@ -1258,9 +1387,41 @@ mod tests {
             .execute(&ctx, &json!({"url": "https://example.com/article"}))
             .await
             .expect("a configured provider serves the call");
-        assert!(ran.model_output.contains("hello from the page"), "{}", ran.model_output);
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["content"], "hello from the page", "{out}");
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["url"], "https://example.com/article", "{out}");
+        assert!(out["retrieved_at"].as_str().is_some_and(|t| t.contains('T')), "{out}");
         assert_eq!(ran.client.marker["url"], "https://example.com/article");
         assert!(ran.client.blocks.is_empty(), "web_fetch has no Anthropic block");
+
+        // The declaration's parameters: a content cap in tokens (four
+        // characters each), domain lists checked before any fetch, and an
+        // engine that must name a configured provider.
+        let fetch = |params: Value| {
+            let app = app.clone();
+            async move {
+            let ctx = ToolCtx { params, ..ToolCtx::new(&app, "call_2") };
+            let ran = Tool::WebFetch
+                .execute(&ctx, &json!({"url": "https://docs.example.com/page"}))
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&ran.model_output).unwrap()
+            }
+        };
+        let capped = fetch(json!({"max_content_tokens": 1})).await;
+        assert_eq!(capped["content"], "hell\n\n[truncated]", "{capped}");
+        let blocked = fetch(json!({"blocked_domains": ["example.com"]})).await;
+        assert_eq!(blocked["status"], "failed", "{blocked}");
+        assert!(blocked["error"].as_str().unwrap().contains("domain"), "{blocked}");
+        let not_allowed = fetch(json!({"allowed_domains": ["other.org"]})).await;
+        assert_eq!(not_allowed["status"], "failed", "{not_allowed}");
+        let allowed = fetch(json!({"allowed_domains": ["example.com"]})).await;
+        assert_eq!(allowed["status"], "completed", "a subdomain of an allowed domain: {allowed}");
+        let engine = fetch(json!({"engine": "nope"})).await;
+        assert!(engine["error"].as_str().unwrap().contains("unknown engine 'nope'; configured: mock"), "{engine}");
+        let named = fetch(json!({"engine": "mock"})).await;
+        assert_eq!(named["status"], "completed", "{named}");
     }
 
     /// A URL that is not http(s) is refused before any provider sees it: the
@@ -1290,10 +1451,27 @@ mod tests {
     #[test]
     fn fetched_content_is_capped() {
         let long = "x".repeat(FETCH_CONTENT_CHARS + 10);
-        let out = fetched_for_model("https://e/x", &long);
-        assert!(out.ends_with("[truncated]"), "the model must be told");
-        assert!(out.contains(&"x".repeat(FETCH_CONTENT_CHARS)));
-        assert!(!out.contains(&"x".repeat(FETCH_CONTENT_CHARS + 1)));
+        let out: Value =
+            serde_json::from_str(&fetched_for_model("https://e/x", &long, FETCH_CONTENT_CHARS, "t")).unwrap();
+        let content = out["content"].as_str().unwrap();
+        assert!(content.ends_with("[truncated]"), "the model must be told");
+        assert!(content.contains(&"x".repeat(FETCH_CONTENT_CHARS)));
+        assert!(!content.contains(&"x".repeat(FETCH_CONTENT_CHARS + 1)));
+    }
+
+    /// A listed domain covers itself and its subdomains; `blocked` wins over
+    /// `allowed`; an empty `allowed` allows everything.
+    #[test]
+    fn domain_lists_match_hosts_and_subdomains() {
+        let allowed = vec!["example.com".to_string()];
+        let blocked = vec!["private.example.com".to_string()];
+        assert!(domain_allowed("https://example.com/x", &allowed, &blocked));
+        assert!(domain_allowed("https://docs.example.com:8443/x?y#z", &allowed, &blocked));
+        assert!(!domain_allowed("https://notexample.com/x", &allowed, &blocked));
+        assert!(!domain_allowed("https://private.example.com/x", &allowed, &blocked));
+        assert!(!domain_allowed("https://deep.private.example.com/x", &allowed, &blocked));
+        assert!(domain_allowed("https://anything.org/", &[], &blocked));
+        assert!(domain_allowed("https://user:pw@Example.COM/", &allowed, &[]));
     }
 
     /// search_models answers from pxy's own catalog: every filter is optional,
@@ -1319,39 +1497,52 @@ mod tests {
             "#,
             "search_models",
         );
-        let ctx = ToolCtx::new(&app, "c");
 
-        let ran = Tool::SearchModels
-            .execute(&ctx, &json!({"query": "big", "min_context_length": 100000}))
-            .await
-            .unwrap();
-        assert!(ran.model_output.contains("alpha/big"), "{}", ran.model_output);
-        assert!(ran.model_output.contains("1 of 3"), "{}", ran.model_output);
-        assert!(!ran.model_output.contains("alpha/small"), "{}", ran.model_output);
-        assert!(!ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
-        assert!(ran.model_output.contains("aaa"), "the group alias: {}", ran.model_output);
+        let search = |args: Value, params: Value| {
+            let app = app.clone();
+            async move {
+            let ctx = ToolCtx { params, ..ToolCtx::new(&app, "c") };
+            let ran = Tool::SearchModels.execute(&ctx, &args).await.unwrap();
+            let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+            let ids: Vec<String> = out["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect();
+            (out, ids)
+            }
+        };
+        let (out, ids) =
+            search(json!({"query": "big", "min_context_length": 100000}), json!({})).await;
+        assert_eq!(ids, vec!["alpha/big"], "{out}");
+        assert_eq!(out["total_results"], 1, "{out}");
+        assert_eq!(out["showing"], 1, "{out}");
+        assert_eq!(out["models"][0]["groups"], json!(["aaa"]), "the group alias: {out}");
 
         // A capability filter reads the catalog's asserted metadata.
-        let ran = Tool::SearchModels.execute(&ctx, &json!({"tool_call": true})).await.unwrap();
-        assert!(ran.model_output.contains("alpha/big"), "{}", ran.model_output);
-        assert!(!ran.model_output.contains("alpha/small"), "{}", ran.model_output);
-        assert!(!ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
+        let (out, ids) = search(json!({"tool_call": true}), json!({})).await;
+        assert_eq!(ids, vec!["alpha/big"], "{out}");
 
         // `free: false` excludes only asserted-free models; an unasserted
         // capability is not a no, so the two unknowns match.
-        let ran = Tool::SearchModels.execute(&ctx, &json!({"free": false})).await.unwrap();
-        assert!(ran.model_output.contains("2 of 3"), "{}", ran.model_output);
-        assert!(ran.model_output.contains("alpha/big"), "{}", ran.model_output);
-        assert!(ran.model_output.contains("alpha/small"), "{}", ran.model_output);
-        assert!(!ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
+        let (out, ids) = search(json!({"free": false}), json!({})).await;
+        assert_eq!(ids, vec!["alpha/big", "alpha/small"], "{out}");
+        assert_eq!(out["total_results"], 2, "{out}");
 
-        let ran = Tool::SearchModels.execute(&ctx, &json!({"free": true})).await.unwrap();
-        assert!(ran.model_output.contains("1 of 3"), "{}", ran.model_output);
-        assert!(ran.model_output.contains("beta/tiny"), "{}", ran.model_output);
+        let (_, ids) = search(json!({"free": true}), json!({})).await;
+        assert_eq!(ids, vec!["beta/tiny"]);
 
         // No match is a report, not an unserved call.
-        let ran = Tool::SearchModels.execute(&ctx, &json!({"query": "nope"})).await.unwrap();
-        assert!(ran.model_output.contains("0 of 3"), "{}", ran.model_output);
+        let (out, ids) = search(json!({"query": "nope"}), json!({})).await;
+        assert!(ids.is_empty(), "{out}");
+        assert_eq!(out["total_results"], 0, "{out}");
+
+        // The declaration's `max_results` caps what is shown, not what matched.
+        let (out, ids) = search(json!({}), json!({"max_results": 1})).await;
+        assert_eq!(ids.len(), 1, "{out}");
+        assert_eq!(out["total_results"], 3, "{out}");
+        assert_eq!(out["showing"], 1, "{out}");
     }
 
     /// image_generation runs the image media walk and hands the model the URL
@@ -1360,10 +1551,16 @@ mod tests {
     #[tokio::test]
     async fn image_generation_returns_the_image_url_from_a_mock_provider() {
         use axum::routing::post;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
         let router = axum::Router::new().route(
             "/img",
-            post(|| async {
-                axum::Json(json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({"created": 1, "data": [{"url": "https://x/y.png"}]}))
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1383,13 +1580,94 @@ mod tests {
             ),
             "image_generation",
         );
-        let ctx = ToolCtx::new(&app, "call_1");
+        let ctx = ToolCtx {
+            params: json!({"model": "mock/m", "quality": "high", "size": "1024x1024", "max_uses": 3}),
+            ..ToolCtx::new(&app, "call_1")
+        };
         let ran = Tool::ImageGeneration
             .execute(&ctx, &json!({"prompt": "a cat"}))
             .await
             .expect("a configured image chain serves the call");
-        assert!(ran.model_output.contains("https://x/y.png"), "{}", ran.model_output);
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(out["imageUrl"], "https://x/y.png", "{out}");
         assert!(ran.client.blocks.is_empty(), "no Anthropic block for image_generation");
+        // Every parameter but the tool's own rides the generation body.
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["prompt"], "a cat", "{body}");
+        assert_eq!(body["quality"], "high", "{body}");
+        assert_eq!(body["size"], "1024x1024", "{body}");
+        assert!(body.get("max_uses").is_none(), "{body}");
+        assert_eq!(body["model"], "m", "the declaration's model, as the chain spells it: {body}");
+    }
+
+    /// web_search's parameters: `max_results` is what the provider is asked
+    /// for, `excluded_domains` / `allowed_domains` filter the hits,
+    /// `max_characters` cuts each snippet, `max_total_results` ends searching
+    /// for the turn, and `engine` must name a configured provider.
+    #[tokio::test]
+    async fn web_search_honours_its_parameters() {
+        use axum::routing::post;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/s",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({"data": [
+                        {"title": "A", "url": "https://a.example.com/1", "description": "alpha beta gamma"},
+                        {"title": "B", "url": "https://b.other.org/2", "description": "bravo"},
+                    ]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [[search.providers]]
+                name = "mock"
+                kind = "jina"
+                api_key = "k"
+                base_url = "http://{addr}/s"
+                "#
+            ),
+            "web_search_params",
+        );
+        let ctx = ToolCtx {
+            params: json!({"max_results": 2, "excluded_domains": ["other.org"], "max_characters": 5}),
+            ..ToolCtx::new(&app, "call_1")
+        };
+        let ran = Tool::WebSearch.execute(&ctx, &json!({"query": "q"})).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[0]["num"], 2, "max_results is what the provider is asked for");
+        assert!(ran.model_output.contains("https://a.example.com/1"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("other.org"), "excluded: {}", ran.model_output);
+        assert!(ran.model_output.contains("alpha"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("alpha beta"), "cut at 5 characters: {}", ran.model_output);
+        assert_eq!(ran.client.marker["hits"], 1);
+
+        let spent = ToolCtx {
+            params: json!({"max_total_results": 3}),
+            results_used: 3,
+            ..ToolCtx::new(&app, "call_2")
+        };
+        let ran = Tool::WebSearch.execute(&spent, &json!({"query": "q"})).await.unwrap();
+        assert!(ran.model_output.contains("max_total_results (3)"), "{}", ran.model_output);
+        assert!(ran.client.marker.is_null(), "nothing ran");
+        assert_eq!(seen.lock().unwrap().len(), 1, "no provider call past the total");
+
+        let engine = ToolCtx { params: json!({"engine": "nope"}), ..ToolCtx::new(&app, "call_3") };
+        let ran = Tool::WebSearch.execute(&engine, &json!({"query": "q"})).await.unwrap();
+        assert!(ran.model_output.contains("unknown engine 'nope'; configured: mock"), "{}", ran.model_output);
+        let named = ToolCtx { params: json!({"engine": "mock", "max_total_results": 3, "max_results": 5}), results_used: 2, ..ToolCtx::new(&app, "call_4") };
+        let ran = Tool::WebSearch.execute(&named, &json!({"query": "q"})).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[1]["num"], 1, "only the remaining total is asked for");
+        assert_eq!(ran.client.marker["hits"], 2);
     }
 
     /// A base64-only chain has no URL to hand the model. The walk fails over,
