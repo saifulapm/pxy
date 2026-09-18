@@ -6406,6 +6406,87 @@ mod tests {
         assert_eq!(app.state.usage_total("p").unwrap().requests, 2);
     }
 
+    /// A fusion panel whose members do not resolve must not fail the outer
+    /// turn: the all-failed panel comes back as a tool error the model reads,
+    /// and the turn finishes.
+    #[tokio::test]
+    async fn unavailable_fusion_panel_degrades_to_a_tool_error() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    let tool_error =
+                        body["messages"].to_string().contains("Every panel member failed");
+                    sink.lock().unwrap().push(body);
+                    let sse = if tool_error {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_fusion\",\"arguments\":\"{\\\"prompt\\\":\\\"why?\\\"}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                [server_tools]
+                fusion_panel = ["missing/one", "missing/two"]
+                "#
+            ),
+            "fusion_unavailable",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "why is the sky blue?"}],
+            "tools": [{"type": "pxy:fusion"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("final answer"), "the turn must continue: {text}");
+        assert!(!text.contains("pxy_"), "no reserved name may reach the client: {text}");
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "ask, then answer");
+        assert!(
+            bodies[1]["messages"].to_string().contains("Every panel member failed"),
+            "the model must read the failure: {}",
+            bodies[1]["messages"]
+        );
+        // Neither the panel nor the analyst reached a provider, so only the
+        // outer upstream's two calls are charged.
+        assert_eq!(app.state.usage_total("p").unwrap().requests, 2);
+    }
+
     /// A meta-tool may not name a meta-tool as its model — a self-reference or
     /// a two-tool loop. The name does not resolve in the catalog, so the
     /// consultation degrades to a tool error and no provider is called for it.

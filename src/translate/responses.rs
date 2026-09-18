@@ -1108,9 +1108,10 @@ mod tests {
 
     /// A served tool's marker chunk: web_search has a documented Responses
     /// item and is replayed as one; every other tool — web_fetch, datetime,
-    /// search_models, image_generation — has none and is swallowed. Either way
-    /// the empty-choices marker must not be mistaken for the trailing usage
-    /// chunk and complete the response before the model answers.
+    /// search_models, image_generation, fusion — has none and is swallowed.
+    /// Either way the empty-choices marker must not be mistaken for the
+    /// trailing usage chunk and complete the response before the model
+    /// answers.
     #[test]
     fn served_tool_markers_render_or_swallow_without_completing() {
         for (name, rendered) in [
@@ -1119,6 +1120,7 @@ mod tests {
             ("pxy_datetime", false),
             ("pxy_search_models", false),
             ("pxy_image_generation", false),
+            ("pxy_fusion", false),
         ] {
             let mut st = StreamState::new(1);
             st.on_data(r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#);
