@@ -1190,6 +1190,7 @@ mod tests {
             ("pxy_image_generation", false),
             ("pxy_fusion", false),
             ("pxy_tool_search", false),
+            ("pxy_describe_image", false),
         ] {
             let mut st = StreamState::new(1);
             st.on_data(r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#);

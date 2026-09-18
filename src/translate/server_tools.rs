@@ -27,6 +27,7 @@ pub enum Tool {
     Subagent,
     Fusion,
     ToolSearch,
+    DescribeImage,
 }
 
 impl Tool {
@@ -44,6 +45,7 @@ impl Tool {
             Tool::Subagent,
             Tool::Fusion,
             Tool::ToolSearch,
+            Tool::DescribeImage,
         ]
     }
 
@@ -60,6 +62,7 @@ impl Tool {
             Tool::Subagent => "subagent",
             Tool::Fusion => "fusion",
             Tool::ToolSearch => "tool_search",
+            Tool::DescribeImage => "describe_image",
         }
     }
 
@@ -67,7 +70,7 @@ impl Tool {
     /// router. A meta-tool is stripped from a sub-request, so recursion stops
     /// at one level.
     pub fn is_meta(self) -> bool {
-        matches!(self, Tool::Advisor | Tool::Subagent | Tool::Fusion)
+        matches!(self, Tool::Advisor | Tool::Subagent | Tool::Fusion | Tool::DescribeImage)
     }
 
     /// Run one call for this tool. `Err` means the call could not be served at
@@ -85,6 +88,7 @@ impl Tool {
             Tool::Subagent => run_subagent(ctx, args).await,
             Tool::Fusion => run_fusion(ctx, args).await,
             Tool::ToolSearch => run_tool_search(ctx, args),
+            Tool::DescribeImage => run_describe_image(ctx, args).await,
         }
     }
 
@@ -114,6 +118,9 @@ impl Tool {
             // The search runs over the request's own deferred tools, so it
             // needs nothing of the app at all.
             Tool::ToolSearch => true,
+            // Its vision model is named on the declaration, and a declaration
+            // that names none is an error the calling model reads.
+            Tool::DescribeImage => true,
         }
     }
 
@@ -515,6 +522,8 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "openrouter:subagent" | "pxy:subagent" => Some(Tool::Subagent),
         "openrouter:fusion" | "pxy:fusion" => Some(Tool::Fusion),
         "openrouter:tool_search" | "pxy:tool_search" | "tool_search" => Some(Tool::ToolSearch),
+        // pxy's own; OpenRouter has no equivalent, so there is one spelling.
+        "pxy:describe_image" => Some(Tool::DescribeImage),
         // Anthropic names the matcher in the type. Only the regex one is pxy's;
         // `tool_search_tool_bm25*` falls through to `None` and is unservable,
         // because pxy would otherwise answer a BM25 search with regex results.
@@ -735,6 +744,37 @@ pub fn tool_def(tool: Tool, params: &Value) -> Value {
                         },
                     },
                     "required": ["pattern"],
+                },
+            },
+        }),
+        Tool::DescribeImage => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::DescribeImage),
+                "description": "Look at an image this conversation carries. An image you \
+                    cannot see yourself appears in the transcript as [image N]; pass that \
+                    number to have a vision model describe it or transcribe its text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image": {
+                            "type": "string",
+                            "description": "The number of an [image N] placeholder, or an \
+                                https:// or data: image URL."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "What you want to know about the image. Omit for a \
+                                full description."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["describe", "ocr"],
+                            "description": "describe (default) for a description, ocr to \
+                                transcribe a document into Markdown."
+                        },
+                    },
+                    "required": ["image"],
                 },
             },
         }),
@@ -1264,6 +1304,84 @@ async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         Err(e) => {
             warn!(%model, error = %e, "advisor failed");
             Ok(failed(e))
+        }
+    }
+}
+
+/// What a `describe` call asks the vision model when the caller says nothing.
+const DESCRIBE_PROMPT: &str = "Describe this image in detail, transcribing all visible text.";
+
+/// The same for `ocr`, whose job is the document rather than the picture.
+const OCR_PROMPT: &str = "Transcribe this document into clean Markdown in natural reading order.";
+
+/// Run one describe_image call: a model that cannot see an image asks one that
+/// can. `image` is the number of an `[image N]` placeholder — the URLs swapped
+/// out of this turn's transcript, in that order — or an image URL of its own.
+/// The leg is a single user message, the prompt then the image: DeepSeek 400s
+/// on an image part in a system or assistant message. `Err` is a call pxy will
+/// not send at all; a leg that ran and failed reports to the calling model.
+async fn run_describe_image(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let image = args["image"].as_str().filter(|i| !i.is_empty()).ok_or("missing image")?;
+    let mode = match args["mode"].as_str().filter(|m| !m.is_empty()).unwrap_or("describe") {
+        m @ ("describe" | "ocr") => m,
+        other => return Err(format!("unknown mode '{other}': use describe or ocr")),
+    };
+    let url = match image.parse::<usize>() {
+        // An index the transcript does not have would otherwise be sent as a
+        // URL the vision model cannot fetch.
+        Ok(n) => ctx
+            .images
+            .get(n.checked_sub(1).ok_or("image 0: placeholders count from 1")?)
+            .ok_or_else(|| format!("no [image {n}] in this conversation"))?
+            .as_str(),
+        Err(_) if image.starts_with("https://") || image.starts_with("http://") => image,
+        Err(_) if image.starts_with("data:") => image,
+        Err(_) => return Err(format!("image must be a placeholder number or a URL, got '{image}'")),
+    };
+    // The declaration's model only: falling back to the model that called the
+    // tool would send the image to the one that cannot see it.
+    let model = match mode {
+        "ocr" => ctx.params["ocr_model"].as_str().or_else(|| ctx.params["model"].as_str()),
+        _ => ctx.params["model"].as_str(),
+    }
+    .filter(|m| !m.is_empty())
+    .ok_or("no describe_image model configured")?;
+    let prompt = args["prompt"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .unwrap_or(if mode == "ocr" { OCR_PROMPT } else { DESCRIBE_PROMPT });
+    let messages = vec![json!({"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]})];
+    let knobs = leg_params(&ctx.params, &[]);
+    // No documented Anthropic block for this tool, so every dialect reads the
+    // marker and Messages is served silently.
+    let render = || ClientRender {
+        blocks: Vec::new(),
+        marker: json!({"id": ctx.call_id, "model": model, "mode": mode}),
+    };
+    match run_internal_chat(ctx.app, model, messages, knobs, &ctx.sub_context()).await {
+        Ok(description) => {
+            info!(%model, mode, "describe_image served");
+            Ok(Ran {
+                model_output: json!({
+                    "status": "ok", "model": model, "mode": mode, "description": description,
+                })
+                .to_string(),
+                client: render(),
+            })
+        }
+        Err(e) => {
+            warn!(%model, mode, error = %e, "describe_image failed");
+            Ok(Ran {
+                model_output: json!({
+                    "status": "error",
+                    "error": format!("describe_image call failed: {e}"),
+                })
+                .to_string(),
+                client: render(),
+            })
         }
     }
 }
@@ -2666,6 +2784,143 @@ mod tests {
             .unwrap();
         let out: Value = serde_json::from_str(&ran.model_output).unwrap();
         assert_eq!(out["model"], "p/m", "{out}");
+    }
+
+    /// describe_image is the eye of a model that has none: the `[image N]` the
+    /// transcript carries resolves to the URL swapped out of it, and the leg is
+    /// one user message, the prompt then the image, because DeepSeek 400s on an
+    /// image anywhere else. `ocr` mode swaps both the model and the prompt.
+    #[tokio::test]
+    async fn describe_image_resolves_an_index_and_sends_one_user_message() {
+        use axum::routing::post;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "a red barn"},
+                        "finish_reason": "stop"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = mock_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "http://{addr}/c"
+                models = ["sees", "reads"]
+                "#
+            ),
+            "describe_image",
+        );
+        let ctx = ToolCtx {
+            params: json!({"model": "p/sees", "ocr_model": "p/reads"}),
+            images: vec!["https://e.test/a.png".into(), "data:image/png;base64,aGk=".into()],
+            ..ToolCtx::new(&app, "call_1")
+        };
+
+        let ran = Tool::DescribeImage.execute(&ctx, &json!({"image": "2"})).await.unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(out["mode"], "describe", "{out}");
+        assert_eq!(out["model"], "p/sees", "{out}");
+        assert_eq!(out["description"], "a red barn", "{out}");
+        // No Anthropic block for this tool: the round is served silently.
+        assert!(ran.client.blocks.is_empty());
+        assert_eq!(ran.client.marker["mode"], "describe");
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["model"], "sees", "{body}");
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "user", "content": [
+                {"type": "text", "text": "Describe this image in detail, transcribing all visible text."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ]}]),
+            "{body}"
+        );
+
+        // `ocr` reads the document instead: its own model, its own prompt, and
+        // a URL passed straight through rather than an index.
+        let ran = Tool::DescribeImage
+            .execute(&ctx, &json!({"image": "https://e.test/scan.png", "mode": "ocr"}))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["model"], "p/reads", "{out}");
+        assert_eq!(out["mode"], "ocr", "{out}");
+        let body = seen.lock().unwrap()[1].clone();
+        assert_eq!(body["model"], "reads", "{body}");
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "Transcribe this document into clean Markdown in natural reading order.",
+            "{body}"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "https://e.test/scan.png",
+            "{body}"
+        );
+
+        // The caller's own question replaces the default prompt.
+        let _ = Tool::DescribeImage
+            .execute(&ctx, &json!({"image": "1", "prompt": "what colour is the door?"}))
+            .await
+            .unwrap();
+        let body = seen.lock().unwrap()[2].clone();
+        assert_eq!(body["messages"][0]["content"][0]["text"], "what colour is the door?");
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "https://e.test/a.png",
+            "{body}"
+        );
+    }
+
+    /// Calls describe_image cannot serve at all: the loop answers each with the
+    /// error result the model reads, and nothing reaches a vision model.
+    #[tokio::test]
+    async fn describe_image_refuses_an_unusable_call() {
+        let app = mock_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/c"
+            models = ["sees"]
+            "#,
+            "describe_image_unusable",
+        );
+        let ctx = ToolCtx {
+            params: json!({"model": "p/sees"}),
+            images: vec!["https://e.test/a.png".into()],
+            ..ToolCtx::new(&app, "call_1")
+        };
+        for args in [
+            json!({}),                                  // no image
+            json!({"image": "2"}),                      // no such placeholder
+            json!({"image": "ftp://e.test/a.png"}),     // not a URL pxy will send
+            json!({"image": "1", "mode": "haiku"}),     // no such mode
+        ] {
+            assert!(
+                Tool::DescribeImage.execute(&ctx, &args).await.is_err(),
+                "{args} must not be served"
+            );
+        }
+        // A declaration that pins no model cannot be served either: the tool
+        // never falls back to the model that called it, which is the one that
+        // could not see the image in the first place.
+        let modelless = ToolCtx {
+            outer_model: "p/sees".into(),
+            images: vec!["https://e.test/a.png".into()],
+            ..ToolCtx::new(&app, "call_2")
+        };
+        assert!(Tool::DescribeImage.execute(&modelless, &json!({"image": "1"})).await.is_err());
     }
 
     /// `forward_transcript` hands the advisor the turn's conversation as

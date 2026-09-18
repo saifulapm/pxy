@@ -7556,6 +7556,113 @@ mod tests {
         );
     }
 
+    /// The whole point of the capability, end to end: a `vision = false` model
+    /// is sent `[image 1]`, calls describe_image with that number, and the leg
+    /// carries the real image to a model that can see it. The description comes
+    /// back as the tool result and the blind model answers from it.
+    #[tokio::test]
+    async fn describe_image_gives_a_blind_model_its_picture_back() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let chats: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let eyes: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (chat_sink, eyes_sink) = (chats.clone(), eyes.clone());
+        let router = axum::Router::new()
+            .route(
+                "/m",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let sink = chat_sink.clone();
+                    async move {
+                        let answered = body["messages"].to_string().contains("a red barn");
+                        sink.lock().unwrap().push(body);
+                        let sse = if answered {
+                            ANSWER_SSE.to_string()
+                        } else {
+                            calls_sse(&[(
+                                "call_1",
+                                "pxy_describe_image",
+                                "{\"image\":\"1\"}",
+                            )])
+                        };
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .unwrap()
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/eyes",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let sink = eyes_sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "a red barn"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 9, "completion_tokens": 3}}))
+                    }
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = [{{ id = "m", vision = false }}]
+                [providers.eyes]
+                base_url = "{base}/eyes"
+                models = ["v"]
+                "#
+            ),
+            "describe_image_e2e",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is in this?"},
+                {"type": "image_url", "image_url": {"url": "https://e.test/barn.png"}},
+            ]}],
+            "tools": [{"type": "pxy:describe_image", "parameters": {"model": "eyes/v"}}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("done"), "{text}");
+        assert!(!text.contains("pxy_"), "the reserved name must not leak: {text}");
+
+        let chats = chats.lock().unwrap();
+        assert_eq!(chats.len(), 2, "the call must have been replayed");
+        assert_eq!(
+            chats[0]["messages"][0]["content"][1],
+            json!({"type": "text", "text": "[image 1]"}),
+            "{}",
+            chats[0]
+        );
+        let result = chats[1]["messages"].as_array().unwrap().last().unwrap().clone();
+        let served: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(served["status"], "ok", "{served}");
+        assert_eq!(served["description"], "a red barn", "{served}");
+
+        // The leg, and only the leg, carried the real image.
+        let eyes = eyes.lock().unwrap();
+        assert_eq!(eyes.len(), 1);
+        assert_eq!(eyes[0]["model"], "v", "{}", eyes[0]);
+        assert_eq!(
+            eyes[0]["messages"][0]["content"][1]["image_url"]["url"],
+            "https://e.test/barn.png",
+            "{}",
+            eyes[0]
+        );
+    }
+
     /// search_models and image_generation render through the same Chat
     /// Completions path as datetime: the reserved call is stripped, no `pxy_*`
     /// name reaches the client, and the client sees one answer. The image call
