@@ -860,6 +860,32 @@ mod tests {
         .unwrap();
     }
 
+    /// `vision` is an assertion about image input, made only from a real
+    /// call: `false` is "this upstream 400s on an image part", and nothing
+    /// else means nobody knows. Routing never reads it.
+    #[test]
+    fn vision_is_an_optional_assertion_on_a_model_entry() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://p.example/chat"
+            models = ["plain", { id = "blind", vision = false }]
+            "#,
+        )
+        .unwrap();
+        let spec = |id: &str| {
+            cfg.providers["p"]
+                .models
+                .iter()
+                .map(|m| m.spec())
+                .find(|s| s.id == id)
+                .unwrap()
+        };
+        assert_eq!(spec("plain").vision, None, "a bare id asserts nothing");
+        assert_eq!(spec("blind").vision, Some(false));
+    }
+
     /// `<think>` parsing is ON unless a provider opts out. Most free reasoning
     /// models inline CoT as literal tags, and leaving it off leaked them into
     /// the client as assistant text (only 3 of the live providers set it).
@@ -1180,6 +1206,13 @@ pub struct ModelSpec {
     /// Asserted tool-calling support, skipping discovery. Set this only from a
     /// real verified call.
     pub tool_call: Option<bool>,
+    /// Asserted image-input support, set only from a real verified call.
+    /// `Some(false)` means the upstream 400s on an image part, so every one is
+    /// swapped for an `[image N]` placeholder (`wiki:vision`) and only
+    /// describe_image can look at it. `None` = nobody knows, and images pass
+    /// through. CAPABILITY METADATA: routing never reads it, so a
+    /// `vision = false` model still serves a turn that carries an image.
+    pub vision: Option<bool>,
     /// Whether the provider prices this model at zero, as discovery saw it.
     /// DISPLAY METADATA — routing never reads it, so a wrong value costs a
     /// misleading picker row and nothing else. `None` = nobody knows.
@@ -1230,6 +1263,7 @@ impl ModelEntry {
                 max_output_tokens: default_max_output(),
                 format: None,
                 tool_call: None,
+                vision: None,
                 free: None,
                 reasoning: None,
                 effort: Vec::new(),

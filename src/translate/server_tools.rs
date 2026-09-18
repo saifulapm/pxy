@@ -194,6 +194,10 @@ pub struct ToolCtx<'a> {
     /// The client function definitions held out of the upstream body this
     /// turn, for tool_search to match against.
     pub deferred: Vec<Value>,
+    /// The image URLs swapped out of the transcript for a `vision = false`
+    /// candidate, in the order the placeholders number them, so describe_image
+    /// resolves `[image 2]` to the second entry.
+    pub images: Vec<String>,
 }
 
 impl<'a> ToolCtx<'a> {
@@ -209,6 +213,7 @@ impl<'a> ToolCtx<'a> {
             results_used: 0,
             transcript: Vec::new(),
             deferred: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -1134,6 +1139,34 @@ pub fn declared_parameters(payload: &Value, tool: Tool) -> Value {
     params
 }
 
+/// Replace every `image_url` part of a chat body with the text part
+/// `[image N]`, N counting from 1 across the whole transcript in order, and
+/// return the URLs in that same order. The swap is what a `vision = false`
+/// candidate gets instead of a 400: the model is told an image was there and
+/// can ask describe_image about it by its number (`wiki:vision`).
+pub fn swap_image_parts(body: &mut Value) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    let Some(messages) = body["messages"].as_array_mut() else { return urls };
+    for message in messages {
+        let Some(parts) = message["content"].as_array_mut() else { continue };
+        for part in parts {
+            if part["type"] != "image_url" {
+                continue;
+            }
+            // `{"url": ".."}` is the documented shape; a bare string is what
+            // some clients send, and responses_upstream already reads both.
+            let url = part["image_url"]["url"]
+                .as_str()
+                .or_else(|| part["image_url"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            urls.push(url);
+            *part = json!({"type": "text", "text": format!("[image {}]", urls.len())});
+        }
+    }
+    urls
+}
+
 /// The turn's conversation as prose an advisor can read without the tools
 /// that produced it: system turns stay, text turns stay, an assistant's tool
 /// calls become bracketed lines in its text, and a tool result becomes a
@@ -1700,6 +1733,47 @@ mod tests {
         assert!(!Tool::WebFetch.served_on(ClientFormat::Anthropic));
         assert!(!Tool::Datetime.served_on(ClientFormat::Anthropic));
         assert!(!Tool::Subagent.served_on(ClientFormat::Anthropic));
+    }
+
+    /// A model asserted `vision = false` 400s on an image part, so each one
+    /// becomes the text `[image N]` — numbered across the whole transcript in
+    /// order, so the number the model reads is the index describe_image takes.
+    #[test]
+    fn swap_image_parts_numbers_every_image_across_the_transcript() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "compare these"},
+                {"type": "image_url", "image_url": {"url": "https://e.test/a.png"}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ]},
+            {"role": "assistant", "content": "the first is darker"},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://e.test/c.png"}},
+            ]},
+        ]});
+        let urls = swap_image_parts(&mut body);
+        assert_eq!(
+            urls,
+            vec!["https://e.test/a.png", "data:image/png;base64,aGk=", "https://e.test/c.png"]
+        );
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "compare these"},
+                {"type": "text", "text": "[image 1]"},
+                {"type": "text", "text": "[image 2]"},
+            ])
+        );
+        assert_eq!(body["messages"][1]["content"], "the first is darker");
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([{"type": "text", "text": "[image 3]"}])
+        );
+
+        // Nothing to swap: a body of plain text is returned untouched.
+        let mut text = json!({"messages": [{"role": "user", "content": "hello"}]});
+        assert!(swap_image_parts(&mut text).is_empty());
+        assert_eq!(text["messages"][0]["content"], "hello");
     }
 
     /// The web_fetch executor runs the same provider walk `/v1/fetch` runs,

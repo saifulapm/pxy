@@ -1214,6 +1214,17 @@ async fn try_candidate_inner(
         swap_declared_served_tools(&mut body);
     }
 
+    // A candidate that cannot take an image part is sent `[image N]` in its
+    // place: being told an image is there beats a 400, and describe_image
+    // resolves the number back to a URL. Before the loop copies the body
+    // below, so a continuation replays the placeholders, and only at depth 0 —
+    // the describe_image leg itself must still carry its image.
+    let images = if cand.model.vision == Some(false) && ctx.tool_depth == 0 {
+        server_tools::swap_image_parts(&mut body)
+    } else {
+        Vec::new()
+    };
+
     // Hosted server tools pxy runs itself. An OpenAI upstream has no hosted
     // tools of its own, so whoever built the body — anthropic_to_openai for
     // Claude Code's server tool, responses for `codex --search` — injected a
@@ -1417,6 +1428,7 @@ async fn try_candidate_inner(
         served: std::collections::BTreeMap::new(),
         results_served: 0,
         deferred,
+        images,
     });
 
     app.state.rpm_increment(&cand.state_provider());
@@ -2360,6 +2372,9 @@ struct ServerToolLoop {
     /// The client function definitions held out of the upstream body, for
     /// tool_search to match against and reveal into the replay.
     deferred: Vec<Value>,
+    /// The image URLs this turn's placeholders stand for, for describe_image
+    /// to resolve an index against.
+    images: Vec<String>,
 }
 
 impl ServerToolLoop {
@@ -2559,6 +2574,7 @@ async fn serve_calls(
         ctx.outer_model = loop_.outer_model.clone();
         ctx.results_used = loop_.results_served + batch_hits;
         ctx.deferred = loop_.deferred.clone();
+        ctx.images = loop_.images.clone();
         ctx.transcript = loop_.body["messages"].as_array().cloned().unwrap_or_default();
         match tool.execute(&ctx, &args).await {
             Ok(ran) => {
@@ -3942,6 +3958,7 @@ mod tests {
             served: std::collections::BTreeMap::new(),
             results_served: 0,
             deferred: Vec::new(),
+            images: Vec::new(),
         };
         // The captured search WOULD run...
         loop_.filter.saw_other = false;
@@ -3973,6 +3990,7 @@ mod tests {
             served: std::collections::BTreeMap::new(),
             results_served: 0,
             deferred: Vec::new(),
+            images: Vec::new(),
         };
         let render = || server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null };
         loop_.commit(&[(ws.clone(), render()), (ws.clone(), render())]);
@@ -4020,6 +4038,7 @@ mod tests {
             served: std::collections::BTreeMap::new(),
             results_served: 0,
             deferred: Vec::new(),
+            images: Vec::new(),
         };
         let pending = loop_.pending();
         assert_eq!(
@@ -4093,6 +4112,7 @@ mod tests {
             served: std::collections::BTreeMap::new(),
             results_served: 0,
             deferred: Vec::new(),
+            images: Vec::new(),
         };
         let served = serve_calls(&app, calls, Vec::new(), &bare).await.expect("two answerable calls");
         // The unknown name is left out; the other two are answered with an
@@ -4177,6 +4197,7 @@ mod tests {
             served: std::collections::BTreeMap::new(),
             results_served: 0,
             deferred: Vec::new(),
+            images: Vec::new(),
         };
         assert!(!loop_.pending().is_empty());
         loop_.uses_left = 0;
@@ -7471,6 +7492,69 @@ mod tests {
         let bodies = seen.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0].get("tools").is_none(), "{}", bodies[0]);
+    }
+
+    /// A candidate asserted `vision = false` is sent `[image N]` in place of
+    /// every image part — the upstream would 400 on the part, and a model told
+    /// an image is there can ask describe_image for it by index. The
+    /// continuation replays the placeholders, because the loop takes its copy
+    /// of the body after the swap. A model that asserts nothing is unaffected.
+    #[tokio::test]
+    async fn vision_false_sends_placeholders_instead_of_image_parts() {
+        let turn = |base: String, name: &'static str, vision: &'static str| async move {
+            let app = test_app(
+                &format!(
+                    r#"
+                    [server]
+                    [providers.p]
+                    base_url = "{base}/m"
+                    models = [{{ id = "m"{vision} }}]
+                    "#
+                ),
+                name,
+            );
+            let payload = json!({
+                "model": "p/m",
+                "stream": true,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "what time was this taken?"},
+                    {"type": "image_url", "image_url": {"url": "https://e.test/a.png"}},
+                ]}],
+                "tools": [{"type": "pxy:datetime"}],
+            });
+            let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default())
+                .await;
+            let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        };
+
+        let first = calls_sse(&[("call_1", "pxy_datetime", "{}")]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        turn(base.clone(), "vision_false", ", vision = false").await;
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "the served call must have been replayed");
+        for body in &bodies {
+            assert_eq!(
+                body["messages"][0]["content"],
+                json!([
+                    {"type": "text", "text": "what time was this taken?"},
+                    {"type": "text", "text": "[image 1]"},
+                ]),
+                "{body}"
+            );
+        }
+
+        // The mirror case: nothing asserted, so the image goes up as it came.
+        seen.lock().unwrap().clear();
+        turn(base, "vision_unknown", "").await;
+        let bodies = seen.lock().unwrap();
+        assert_eq!(
+            bodies[0]["messages"][0]["content"][1],
+            json!({"type": "image_url", "image_url": {"url": "https://e.test/a.png"}}),
+            "{}",
+            bodies[0]
+        );
     }
 
     /// search_models and image_generation render through the same Chat
