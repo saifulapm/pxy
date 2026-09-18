@@ -168,11 +168,37 @@ pub struct ToolCtx<'a> {
     /// The wall clock the tool sees. `new` reads the real clock; a test builds
     /// the struct directly to fix it.
     pub now: jiff::Timestamp,
+    /// The client behind this turn: a meta-tool's leg bills to its agent and
+    /// keeps its opencode session affinity, exactly as the turn itself does.
+    pub agent: Option<String>,
+    pub session: Option<String>,
+    /// The model id the client requested. A meta-tool whose declaration pins
+    /// no model consults this one, as OpenRouter's does.
+    pub outer_model: String,
 }
 
 impl<'a> ToolCtx<'a> {
     pub fn new(app: &'a SharedApp, call_id: &'a str) -> Self {
-        Self { app, call_id, params: Value::Null, now: jiff::Timestamp::now() }
+        Self {
+            app,
+            call_id,
+            params: Value::Null,
+            now: jiff::Timestamp::now(),
+            agent: None,
+            session: None,
+            outer_model: String::new(),
+        }
+    }
+
+    /// The context a sub-request through pxy's router runs under: the
+    /// client's own agent and session, one level deeper.
+    pub fn sub_context(&self) -> ClientContext {
+        ClientContext {
+            agent: self.agent.clone(),
+            session: self.session.clone(),
+            tool_depth: 1,
+            ..ClientContext::default()
+        }
     }
 }
 
@@ -181,11 +207,14 @@ impl<'a> ToolCtx<'a> {
 /// passes limits and cooldowns, translates, records usage and fails over
 /// exactly like a client turn, because it is one. `params` is merged into the
 /// payload beside `model`, `messages` and `stream`, which pxy owns here.
+/// `caller` is the client's context (agent, session); the leg always runs one
+/// level deeper, so a meta-tool can never re-enter one.
 pub async fn run_internal_chat(
     app: &SharedApp,
     model: &str,
     messages: Vec<Value>,
     params: Value,
+    caller: &ClientContext,
 ) -> Result<String, String> {
     let mut payload = json!({
         "model": model,
@@ -200,7 +229,7 @@ pub async fn run_internal_chat(
         }
     }
     // handle_chat is already boxed to break the meta-tool recursion cycle.
-    let ctx = ClientContext { tool_depth: 1, ..ClientContext::default() };
+    let ctx = ClientContext { tool_depth: 1, ..caller.clone() };
     let outcome = handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await;
     match outcome {
         Outcome::Json { status, body, .. } if status < 400 => body["choices"][0]["message"]
@@ -227,12 +256,13 @@ pub async fn run_panel(
     models: &[String],
     prompt: &str,
     params: &Value,
+    caller: &ClientContext,
 ) -> Vec<(String, Result<String, String>)> {
     let legs = models.iter().map(|model| {
         let messages = vec![json!({"role": "user", "content": prompt})];
         let params = params.clone();
         async move {
-            let answer = run_internal_chat(app, model, messages, params).await;
+            let answer = run_internal_chat(app, model, messages, params, caller).await;
             (model.clone(), answer)
         }
     });
@@ -256,6 +286,7 @@ pub async fn run_analyst(
     prompt: &str,
     answers: &[(String, Result<String, String>)],
     params: &Value,
+    caller: &ClientContext,
 ) -> Result<Value, String> {
     let mut panel = String::new();
     for (name, answer) in answers {
@@ -271,7 +302,7 @@ pub async fn run_analyst(
             "content": format!("Question:\n{prompt}\n\nPanel answers:\n{panel}"),
         }),
     ];
-    let text = run_internal_chat(app, model, messages, params.clone()).await?;
+    let text = run_internal_chat(app, model, messages, params.clone(), caller).await?;
     serde_json::from_str(&text).map_err(|e| format!("analyst returned non-JSON: {e}"))
 }
 
@@ -308,7 +339,8 @@ async fn run_fusion(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         .to_string();
     let params = leg_params(&ctx.params);
 
-    let answers = run_panel(ctx.app, &panel, prompt, &params).await;
+    let caller = ctx.sub_context();
+    let answers = run_panel(ctx.app, &panel, prompt, &params, &caller).await;
     if answers.iter().all(|(_, answer)| answer.is_err()) {
         let first = answers
             .iter()
@@ -328,7 +360,7 @@ async fn run_fusion(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     }
 
     let mut result = json!({"status": "ok", "panel": panel_answers(&answers)});
-    match run_analyst(ctx.app, &analyst, prompt, &answers, &params).await {
+    match run_analyst(ctx.app, &analyst, prompt, &answers, &params, &caller).await {
         Ok(analysis) => result["analysis"] = analysis,
         Err(e) => warn!(%analyst, error = %e, "fusion analyst failed; returning the panel"),
     }
@@ -829,7 +861,7 @@ async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
             marker: json!({"id": ctx.call_id, "model": model, "prompt": prompt}),
         },
     };
-    match run_internal_chat(ctx.app, model, messages, json!({})).await {
+    match run_internal_chat(ctx.app, model, messages, json!({}), &ctx.sub_context()).await {
         Ok(advice) => {
             info!(%model, "advisor served");
             Ok(Ran {
@@ -913,7 +945,7 @@ async fn run_subagent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     // serves them there, exactly as it does for a client turn. `tool_depth` 1
     // strips any meta-tool, so a worker can never re-enter one.
     let params = leg_params(&ctx.params);
-    match run_internal_chat(ctx.app, model, messages, params).await {
+    match run_internal_chat(ctx.app, model, messages, params, &ctx.sub_context()).await {
         Ok(outcome) => {
             info!(%model, %task_name, "subagent served");
             Ok(Ran {
@@ -1050,7 +1082,7 @@ mod tests {
     async fn datetime_defaults_to_utc_and_accepts_an_iana_zone() {
         let app = mock_app("[server]", "datetime_clock");
         let now: jiff::Timestamp = "2025-07-15T18:30:00Z".parse().unwrap();
-        let ctx = ToolCtx { app: &app, call_id: "call_1", params: Value::Null, now };
+        let ctx = ToolCtx { now, ..ToolCtx::new(&app, "call_1") };
 
         let utc = Tool::Datetime.execute(&ctx, &json!({})).await.unwrap();
         assert_eq!(utc.model_output, "2025-07-15T18:30:00+00:00 (UTC)");
@@ -1068,7 +1100,7 @@ mod tests {
     async fn datetime_reports_an_unknown_zone() {
         let app = mock_app("[server]", "datetime_bad_zone");
         let now: jiff::Timestamp = "2025-07-15T18:30:00Z".parse().unwrap();
-        let ctx = ToolCtx { app: &app, call_id: "call_1", params: Value::Null, now };
+        let ctx = ToolCtx { now, ..ToolCtx::new(&app, "call_1") };
         let ran = Tool::Datetime
             .execute(&ctx, &json!({"timezone": "Mars/Olympus"}))
             .await
@@ -1455,6 +1487,7 @@ mod tests {
             "p/m",
             vec![json!({"role": "user", "content": "advise me"})],
             json!({}),
+            &ClientContext { agent: Some("pi".into()), ..ClientContext::default() },
         )
         .await
         .unwrap();
@@ -1512,13 +1545,11 @@ mod tests {
             "subagent_tools",
         );
         let ctx = ToolCtx {
-            app: &app,
-            call_id: "call_1",
             params: json!({
                 "model": "worker/w",
                 "tools": [{"type": "openrouter:web_search"}],
             }),
-            now: jiff::Timestamp::now(),
+            ..ToolCtx::new(&app, "call_1")
         };
         let ran = Tool::Subagent
             .execute(
@@ -1587,7 +1618,7 @@ mod tests {
             vec!["p/a".to_string(), "p/b".to_string(), "p/c".to_string()];
         let results = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_panel(&app, &models, "compare answers", &json!({})),
+            run_panel(&app, &models, "compare answers", &json!({}), &ClientContext::default()),
         )
         .await
         .expect("the panel must not serialise: the barrier never released");
@@ -1641,8 +1672,12 @@ mod tests {
             "analyst",
         );
         let models = vec!["p/a".to_string(), "p/b".to_string(), "p/c".to_string()];
-        let answers = run_panel(&app, &models, "which is best?", &json!({})).await;
-        let analysis = run_analyst(&app, "p/an", "which is best?", &answers, &json!({})).await.unwrap();
+        let answers =
+            run_panel(&app, &models, "which is best?", &json!({}), &ClientContext::default()).await;
+        let analysis =
+            run_analyst(&app, "p/an", "which is best?", &answers, &json!({}), &ClientContext::default())
+                .await
+                .unwrap();
         assert_eq!(analysis["summary"], "they agree");
 
         let bodies = seen.lock().unwrap();
@@ -1688,7 +1723,9 @@ mod tests {
             "analyst_non_json",
         );
         let answers = vec![("p/a".to_string(), Ok("hi".to_string()))];
-        let err = run_analyst(&app, "p/an", "q", &answers, &json!({})).await.unwrap_err();
+        let err = run_analyst(&app, "p/an", "q", &answers, &json!({}), &ClientContext::default())
+            .await
+            .unwrap_err();
         assert!(err.contains("non-JSON"), "{err}");
     }
 

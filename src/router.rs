@@ -1403,6 +1403,14 @@ async fn try_candidate_inner(
         body: body.clone(),
         timeout: Duration::from_secs(provider_cfg.timeout_secs),
         responses_upstream,
+        agent: ctx.agent.clone().unwrap_or_default(),
+        session: ctx.session.clone(),
+        outer_model: payload["model"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| app.cfg.default_route()),
+        served: std::collections::BTreeMap::new(),
     });
 
     app.state.rpm_increment(&cand.state_provider());
@@ -2323,6 +2331,16 @@ struct ServerToolLoop {
     /// translated out and the continuation's events back in, as on the first
     /// call.
     responses_upstream: bool,
+    /// The client behind the turn, handed to every executor: a meta-tool's
+    /// leg bills to this agent and keeps this session's affinity.
+    agent: String,
+    session: Option<String>,
+    /// The model id the client requested, for a meta-tool whose declaration
+    /// pins none.
+    outer_model: String,
+    /// Calls actually run this turn, by canonical tool name — the
+    /// `server_tool_use` the final usage reports.
+    served: std::collections::BTreeMap<String, u64>,
 }
 
 impl ServerToolLoop {
@@ -2332,41 +2350,77 @@ impl ServerToolLoop {
     /// the remaining search budget; empty when another tool call shared the
     /// turn (the continuation can't fake that one) or the budget is spent.
     fn pending_calls(&self) -> Vec<ServerCall> {
-        if self.filter.saw_other || self.uses_left == 0 {
-            return Vec::new();
+        self.split_calls().0
+    }
+
+    /// The captured calls, lowest index first, split into those the budget
+    /// lets run and those it does not. Selection only; [`commit`](Self::commit)
+    /// charges what was served. A call whose tool has no budget left is over
+    /// budget (it gets an error result, never another tool's turn budget); a
+    /// call to a function that was never offered is in neither list, since
+    /// replaying it would name a tool the body does not declare.
+    fn split_calls(&self) -> (Vec<ServerCall>, Vec<ServerCall>) {
+        if self.filter.saw_other {
+            return (Vec::new(), Vec::new());
         }
         let mut keys: Vec<u64> = self.filter.ours.keys().copied().collect();
         keys.sort_unstable();
-        // Selection only; [`commit`](Self::commit) charges what was served. A
-        // call whose tool has no budget left (or none at all) is skipped, so
-        // an exhausted tool never eats another tool's turn budget.
         let mut left = self.uses_left;
         let mut per_tool = self.per_tool.clone();
-        let mut out: Vec<ServerCall> = Vec::new();
+        let mut fits: Vec<ServerCall> = Vec::new();
+        let mut over: Vec<ServerCall> = Vec::new();
         for k in keys {
-            if left == 0 {
-                break;
-            }
             let Some((id, args)) = self.filter.ours.get(&k) else { continue };
             let name = self.filter.names.get(&k).cloned().unwrap_or_default();
             let Some(tool_left) = per_tool.get_mut(&name) else { continue };
-            if *tool_left == 0 {
+            let call = ServerCall { name, id: id.clone(), args: args.clone() };
+            if left == 0 || *tool_left == 0 {
+                over.push(call);
                 continue;
             }
             *tool_left -= 1;
             left -= 1;
-            out.push(ServerCall { name, id: id.clone(), args: args.clone() });
+            fits.push(call);
         }
-        out
+        (fits, over)
+    }
+
+    /// Whether the upstream call that just ended must be followed by a
+    /// continuation: the model made at least one reserved call and no client
+    /// tool shared the turn. Over-budget calls count — they are answered with
+    /// an error result so the model can still finish its answer.
+    fn has_replay(&self) -> bool {
+        !self.filter.saw_other && !self.filter.ours.is_empty()
+    }
+
+    /// The `server_tool_use` object the final usage reports:
+    /// `{"<tool>_requests": n}` per tool that ran, or Null when none did.
+    fn server_tool_use(&self) -> Value {
+        if self.served.is_empty() {
+            return Value::Null;
+        }
+        let counts: serde_json::Map<String, Value> = self
+            .served
+            .iter()
+            .map(|(name, n)| (format!("{name}_requests"), json!(n)))
+            .collect();
+        Value::Object(counts)
     }
 
     /// Charge the calls that were actually served against the turn budget and
     /// each tool's own cap.
     fn commit(&mut self, renders: &[(String, server_tools::ClientRender)]) {
-        for (name, _) in renders {
+        for (name, render) in renders {
             self.uses_left = self.uses_left.saturating_sub(1);
             if let Some(left) = self.per_tool.get_mut(name) {
                 *left = left.saturating_sub(1);
+            }
+            // A Null marker is an error result pxy wrote itself; only a call
+            // that reached its executor is a request.
+            if !render.marker.is_null() {
+                if let Some(tool) = server_tools::Tool::from_function_name(name) {
+                    *self.served.entry(tool.name().to_string()).or_default() += 1;
+                }
             }
         }
     }
@@ -2397,42 +2451,111 @@ struct Served {
     renders: Vec<(String, server_tools::ClientRender)>,
 }
 
-/// Run every captured call through its tool, lowest first. A call whose
-/// reserved name maps to no tool, whose arguments will not parse, or whose
-/// executor refuses it is skipped: the assistant message carries only the
-/// calls pxy actually served, so the replay stays valid. Returns None when
-/// nothing was served.
+/// Run every captured call through its tool, lowest first, and answer the
+/// rest. A call whose arguments will not parse or whose executor refuses it
+/// gets an error result, as does every call the budget left over: the model
+/// asked, so the model is answered, and the turn never ends on the empty
+/// assistant message a silently dropped call produced. Only a reserved name
+/// that maps to no tool is skipped — replaying it would name a function the
+/// body never declared. Returns None when nothing at all could be replayed.
 async fn serve_calls(
     app: &SharedApp,
     calls: Vec<ServerCall>,
-    params: &std::collections::HashMap<String, Value>,
+    over_budget: Vec<ServerCall>,
+    loop_: &ServerToolLoop,
 ) -> Option<Served> {
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
     let mut renders: Vec<(String, server_tools::ClientRender)> = Vec::new();
-    for call in calls {
-        let Some(tool) = server_tools::Tool::from_function_name(&call.name) else {
-            continue;
-        };
-        let Ok(args) = serde_json::from_str::<Value>(&call.args) else {
-            continue;
-        };
-        let mut ctx = server_tools::ToolCtx::new(app, &call.id);
-        ctx.params = params.get(&call.name).cloned().unwrap_or(Value::Null);
-        let Ok(ran) = tool.execute(&ctx, &args).await else {
-            continue;
-        };
+    let mut record = |call: &ServerCall, output: String, render: server_tools::ClientRender| {
         tool_calls.push(json!({
             "id": &call.id,
             "type": "function",
             "function": {"name": &call.name, "arguments": &call.args},
         }));
         tool_results.push(json!({
-            "role": "tool", "tool_call_id": &call.id, "content": ran.model_output,
+            "role": "tool", "tool_call_id": &call.id, "content": output,
         }));
-        renders.push((call.name.clone(), ran.client));
+        renders.push((call.name.clone(), render));
+    };
+    let error = |message: String| {
+        (
+            json!({"status": "error", "error": message}).to_string(),
+            server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null },
+        )
+    };
+    for call in &calls {
+        let Some(tool) = server_tools::Tool::from_function_name(&call.name) else {
+            continue;
+        };
+        let args = match serde_json::from_str::<Value>(&call.args) {
+            Ok(args) => args,
+            Err(e) => {
+                let (output, render) = error(format!("arguments are not valid JSON: {e}"));
+                record(call, output, render);
+                continue;
+            }
+        };
+        let mut ctx = server_tools::ToolCtx::new(app, &call.id);
+        ctx.params = loop_.params.get(&call.name).cloned().unwrap_or(Value::Null);
+        ctx.agent = (!loop_.agent.is_empty()).then(|| loop_.agent.clone());
+        ctx.session = loop_.session.clone();
+        ctx.outer_model = loop_.outer_model.clone();
+        match tool.execute(&ctx, &args).await {
+            Ok(ran) => record(call, ran.model_output, ran.client),
+            Err(e) => {
+                let (output, render) = error(e);
+                record(call, output, render);
+            }
+        }
+    }
+    for call in &over_budget {
+        if server_tools::Tool::from_function_name(&call.name).is_none() {
+            continue;
+        }
+        let (output, render) = error(
+            "tool call budget exhausted for this turn; answer with what you have".to_string(),
+        );
+        record(call, output, render);
     }
     (!tool_calls.is_empty()).then_some(Served { tool_calls, tool_results, renders })
+}
+
+/// Take every reserved function out of a replay body once the budget is
+/// spent, so the model is asked to answer rather than to call again.
+fn strip_reserved_functions(body: &mut Value) {
+    let Some(tools) = body["tools"].as_array_mut() else { return };
+    tools.retain(|t| {
+        !t["function"]["name"].as_str().is_some_and(|n| server_tools::Tool::from_function_name(n).is_some())
+    });
+    let emptied = tools.is_empty();
+    let chosen_reserved = body["tool_choice"]["function"]["name"]
+        .as_str()
+        .is_some_and(|n| server_tools::Tool::from_function_name(n).is_some());
+    let body = body.as_object_mut().expect("tools was indexed on an object");
+    if emptied {
+        body.remove("tools");
+    }
+    if emptied || chosen_reserved {
+        body.remove("tool_choice");
+    }
+}
+
+/// Insert the turn's `server_tool_use` into an OpenAI usage chunk. Only a
+/// chunk carrying a usage object changes; every other one passes as-is.
+fn add_server_tool_use(data: &str, loop_: &ServerToolLoop) -> String {
+    let counts = loop_.server_tool_use();
+    if counts.is_null() || !data.contains("\"usage\"") {
+        return data.to_string();
+    }
+    let Ok(mut v) = serde_json::from_str::<Value>(data) else {
+        return data.to_string();
+    };
+    if !v["usage"].is_object() {
+        return data.to_string();
+    }
+    v["usage"]["server_tool_use"] = counts;
+    v.to_string()
 }
 
 /// The prefix pxy reserves for the OpenAI functions it injects for served
@@ -2735,6 +2858,19 @@ fn chunk_is_final(data: &str) -> bool {
 /// Close an OpenAI-dialect client stream the upstream left open. `[DONE]`
 /// alone is not a terminator: clients (pi, the official SDKs) require a
 /// non-null `finish_reason` and report a protocol error without one.
+/// The one line of an upstream error body worth showing a client: its
+/// `error.message` when it is JSON, else the body itself, bounded.
+fn error_summary(body: &str) -> String {
+    let text = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| body.trim().to_string());
+    match text.char_indices().nth(300) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
+}
+
 fn openai_terminator() -> &'static str {
     "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
 }
@@ -2851,7 +2987,7 @@ impl StreamCtx {
                         }
                         // Held back while a search is queued: this ends the
                         // upstream call, not the client's turn.
-                        if search.as_ref().is_none_or(|s| s.pending().is_empty()) {
+                        if search.as_ref().is_none_or(|s| !s.has_replay()) {
                             if *client_done {
                                 out.push_str("data: [DONE]\n\n");
                             } else {
@@ -2869,6 +3005,7 @@ impl StreamCtx {
                         }
                         if let Some(s) = search.as_mut() {
                             data = rewrite_chunk_server_calls(&data, &mut s.filter);
+                            data = add_server_tool_use(&data, s);
                         }
                         if chunk_is_final(&data) {
                             *client_done = true;
@@ -2914,7 +3051,7 @@ impl StreamCtx {
                         // A search is queued: this [DONE] ends the upstream
                         // call, not the client's turn. Closing the message
                         // here would strand the answer the model still owes.
-                        if search.as_ref().is_none_or(|s| s.pending().is_empty()) {
+                        if search.as_ref().is_none_or(|s| !s.has_replay()) {
                             out.push_str(&state.on_data(&ev.data));
                         }
                     } else {
@@ -2961,18 +3098,16 @@ impl StreamCtx {
     /// model AND to the client rather than aborting: an error block is what
     /// the real API sends too.
     async fn continue_after_server_calls(&mut self) -> Option<Bytes> {
-        let calls = self.search.as_ref()?.pending_calls();
-        if calls.is_empty() {
+        let (calls, over_budget) = self.search.as_ref()?.split_calls();
+        if calls.is_empty() && over_budget.is_empty() {
             return None;
         }
-        let params = self.search.as_ref()?.params.clone();
 
         // Run every call through its tool, accumulating the client-side
-        // render and the model-side tool output. A malformed call, or one the
-        // registry does not implement, is skipped: the synthesized assistant
-        // message below carries only the calls that were actually served, so
-        // the protocol stays valid.
-        let served = serve_calls(&self.app, calls, &params).await?;
+        // render and the model-side tool output. A call that could not run
+        // is answered with an error result rather than dropped; only a name
+        // the registry does not implement is left out of the replay.
+        let served = serve_calls(&self.app, calls, over_budget, self.search.as_ref()?).await?;
 
         let search = self.search.as_mut()?;
         search.commit(&served.renders);
@@ -2989,6 +3124,11 @@ impl StreamCtx {
             }));
             messages.extend(served.tool_results);
         }
+        // Budget spent: the model is asked to answer, not to call again.
+        if search.uses_left == 0 {
+            strip_reserved_functions(&mut search.body);
+        }
+        let counts = search.server_tool_use();
 
         // Same rule as the first call: the total timeout must not span the
         // body, or the answer after a tool call dies at timeout_secs with a
@@ -3011,17 +3151,23 @@ impl StreamCtx {
         };
         let resp = match tokio::time::timeout(search.timeout, req.json(send_body).send()).await {
             Ok(Ok(r)) if r.status().is_success() => r,
-            // No second call means no answer, so the turn ends here rather
-            // than hanging: the client still gets the results it can read.
-            Ok(other) => {
-                warn!(status = ?other.map(|r| r.status().as_u16()), "server tool continuation failed");
-                self.search = None;
-                return None;
+            // No second call means no answer. The turn ends here rather than
+            // hanging, and the client is told why in the one place it can
+            // still read: the stream cannot change its status any more, and
+            // an empty answer with a clean `stop` hides the failure entirely.
+            Ok(Ok(r)) => {
+                let status = r.status().as_u16();
+                let body = r.text().await.unwrap_or_default();
+                warn!(status, "server tool continuation failed");
+                return Some(self.continuation_failed(&format!("{status}: {}", error_summary(&body))));
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "server tool continuation failed");
+                return Some(self.continuation_failed(&e.to_string()));
             }
             Err(_) => {
                 warn!(secs = search.timeout.as_secs(), "server tool continuation: no response");
-                self.search = None;
-                return None;
+                return Some(self.continuation_failed("no response from the upstream"));
             }
         };
         self.upstream = if search.responses_upstream {
@@ -3041,6 +3187,7 @@ impl StreamCtx {
                 // The call that asked for the search finished with `tool_calls`;
                 // the turn hasn't, and the continuation sets its own reason.
                 state.clear_finish_reason();
+                state.server_tool_use = counts;
                 // One server_tool_use + result pair per call the model made.
                 for (_, render) in &served.renders {
                     for block in &render.blocks {
@@ -3060,7 +3207,8 @@ impl StreamCtx {
                 let spent = std::mem::take(&mut self.usage);
                 record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, spent);
                 if self.responses_client {
-                    for (name, render) in &served.renders {
+                    // An error result pxy wrote itself has no marker.
+                    for (name, render) in served.renders.iter().filter(|(_, r)| !r.marker.is_null()) {
                         let mut chunk = json!({
                             "object": "chat.completion.chunk",
                             "choices": [],
@@ -3072,6 +3220,20 @@ impl StreamCtx {
             }
         }
         Some(Bytes::from(out))
+    }
+
+    /// Close the served-tool loop after a continuation that produced no
+    /// answer, telling the client so in its own dialect as one text delta.
+    fn continuation_failed(&mut self, detail: &str) -> Bytes {
+        self.search = None;
+        let chunk = json!({"choices": [{"index": 0, "delta": {
+            "content": format!("[pxy] server tool continuation failed ({detail})"),
+        }}]})
+        .to_string();
+        match &mut self.kind {
+            StreamKind::ToAnthropic(state) => Bytes::from(state.on_data(&chunk)),
+            _ => Bytes::from(format!("data: {chunk}\n\n")),
+        }
     }
 
     fn finish(&mut self) -> Bytes {
@@ -3596,6 +3758,10 @@ mod tests {
             body: Value::Null,
             timeout: Duration::from_secs(1),
             responses_upstream: false,
+            agent: String::new(),
+            session: None,
+            outer_model: String::new(),
+            served: std::collections::BTreeMap::new(),
         };
         // The captured search WOULD run...
         loop_.filter.saw_other = false;
@@ -3621,6 +3787,10 @@ mod tests {
             body: Value::Null,
             timeout: Duration::from_secs(1),
             responses_upstream: false,
+            agent: String::new(),
+            session: None,
+            outer_model: String::new(),
+            served: std::collections::BTreeMap::new(),
         };
         let render = || server_tools::ClientRender { blocks: Vec::new(), marker: Value::Null };
         loop_.commit(&[(ws.clone(), render()), (ws.clone(), render())]);
@@ -3662,6 +3832,10 @@ mod tests {
             body: Value::Null,
             timeout: Duration::from_secs(1),
             responses_upstream: false,
+            agent: String::new(),
+            session: None,
+            outer_model: String::new(),
+            served: std::collections::BTreeMap::new(),
         };
         let pending = loop_.pending();
         assert_eq!(
@@ -3719,9 +3893,39 @@ mod tests {
                 args: "{}".to_string(),
             },
         ];
+        let bare = ServerToolLoop {
+            filter: ServerCallFilter::default(),
+            uses_left: 0,
+            per_tool: std::collections::HashMap::new(),
+            params: std::collections::HashMap::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            body: Value::Null,
+            timeout: Duration::from_secs(1),
+            responses_upstream: false,
+            agent: String::new(),
+            session: None,
+            outer_model: String::new(),
+            served: std::collections::BTreeMap::new(),
+        };
+        let served = serve_calls(&app, calls, Vec::new(), &bare).await.expect("two answerable calls");
+        // The unknown name is left out; the other two are answered with an
+        // error result so the model can still finish its answer.
+        assert_eq!(served.tool_calls.len(), 2, "{:?}", served.tool_calls);
+        for result in &served.tool_results {
+            let content: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+            assert_eq!(content["status"], "error", "{result}");
+        }
+        assert!(served.renders.iter().all(|(_, r)| r.marker.is_null()));
+
+        let unknown_only = vec![ServerCall {
+            name: "pxy_not_a_tool".to_string(),
+            id: "call_9".to_string(),
+            args: "{}".to_string(),
+        }];
         assert!(
-            serve_calls(&app, calls, &std::collections::HashMap::new()).await.is_none(),
-            "nothing served, so the turn must close normally"
+            serve_calls(&app, unknown_only, Vec::new(), &bare).await.is_none(),
+            "an unknown name alone leaves nothing to replay"
         );
     }
 
@@ -3781,10 +3985,20 @@ mod tests {
             body: Value::Null,
             timeout: Duration::from_secs(1),
             responses_upstream: false,
+            agent: String::new(),
+            session: None,
+            outer_model: String::new(),
+            served: std::collections::BTreeMap::new(),
         };
         assert!(!loop_.pending().is_empty());
         loop_.uses_left = 0;
         assert!(loop_.pending().is_empty());
+        // Over budget is still a replay: the call is answered with an error
+        // result, not dropped.
+        assert!(loop_.has_replay());
+        let (fits, over) = loop_.split_calls();
+        assert!(fits.is_empty());
+        assert_eq!(over.len(), 1);
     }
 
     /// `[server_tools] enabled` gates servability: a spelling the registry
@@ -4200,6 +4414,170 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         format!("http://{addr}")
+    }
+
+    /// An OpenAI-format upstream that answers its n-th call with the n-th
+    /// scripted (status, SSE body) and records every body it was sent. A call
+    /// past the script repeats the last step.
+    async fn scripted_upstream(
+        steps: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                let calls = calls.clone();
+                let steps = steps.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (status, sse) = steps[n.min(steps.len() - 1)];
+                    axum::http::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        (mock_server(router).await, seen)
+    }
+
+    /// The SSE of a model calling reserved functions, one call per (id,
+    /// name, arguments), closed with `tool_calls`.
+    fn calls_sse(calls: &[(&str, &str, &str)]) -> String {
+        let mut out = String::new();
+        for (i, (id, name, args)) in calls.iter().enumerate() {
+            let chunk = json!({"id": "c1", "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": i, "id": id, "type": "function",
+                 "function": {"name": name, "arguments": args}}]}}]});
+            out.push_str(&format!("data: {chunk}\n\n"));
+        }
+        out.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    const ANSWER_SSE: &str = concat!(
+        "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    async fn datetime_turn(base: &str, name: &str, max_tool_calls: u64) -> String {
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            name,
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what time is it?"}],
+            "tools": [{"type": "pxy:datetime"}],
+            "max_tool_calls": max_tool_calls,
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// A reserved call pxy could not run — arguments that are not JSON here —
+    /// is answered with an error result and replayed beside the calls that
+    /// ran, so the model still writes its answer and the client sees it.
+    #[tokio::test]
+    async fn served_turn_answers_a_malformed_call_with_an_error_result() {
+        let first = calls_sse(&[
+            ("call_1", "pxy_datetime", "{not json"),
+            ("call_2", "pxy_datetime", "{}"),
+        ]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let text = datetime_turn(&base, "served_turn_malformed", 5).await;
+        assert!(text.contains("done"), "{text}");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "the turn must be replayed");
+        let msgs = bodies[1]["messages"].as_array().unwrap();
+        let assistant = &msgs[msgs.len() - 3];
+        assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 2, "{assistant}");
+        let bad: Value = serde_json::from_str(msgs[msgs.len() - 2]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(bad["status"], "error", "{bad}");
+        assert!(bad["error"].as_str().unwrap().contains("not valid JSON"), "{bad}");
+        assert!(msgs[msgs.len() - 1]["content"].as_str().unwrap().contains("UTC"), "{}", msgs[msgs.len() - 1]);
+        assert!(bodies[1]["tools"].is_array(), "budget left: the tool stays offered");
+    }
+
+    /// With the budget spent, the calls it could not cover are answered with
+    /// an error result, the replay offers no reserved function, and the
+    /// model answers from what it has instead of the turn ending empty.
+    #[tokio::test]
+    async fn served_turn_over_budget_answers_and_strips_the_tools() {
+        let first = calls_sse(&[
+            ("call_1", "pxy_datetime", "{}"),
+            ("call_2", "pxy_datetime", "{}"),
+        ]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let text = datetime_turn(&base, "served_turn_budget", 1).await;
+        assert!(text.contains("done"), "{text}");
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        let msgs = bodies[1]["messages"].as_array().unwrap();
+        let over: Value = serde_json::from_str(msgs[msgs.len() - 1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(over["status"], "error", "{over}");
+        assert!(over["error"].as_str().unwrap().contains("budget"), "{over}");
+        assert!(bodies[1].get("tools").is_none(), "budget spent: no reserved function may be offered: {}", bodies[1]);
+    }
+
+    /// A continuation the upstream refuses cannot change the stream's status
+    /// any more; the client is told in the one place it can still read, and
+    /// the stream still closes with a terminal reason.
+    #[tokio::test]
+    async fn served_turn_continuation_failure_is_visible() {
+        let first = calls_sse(&[("call_1", "pxy_datetime", "{}")]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, _seen) = scripted_upstream(vec![
+            (200, first),
+            (500, "{\"error\":{\"message\":\"backend exploded\"}}"),
+        ])
+        .await;
+        let text = datetime_turn(&base, "served_turn_failure", 5).await;
+        assert!(text.contains("server tool continuation failed (500: backend exploded)"), "{text}");
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    }
+
+    /// The final usage of a turn that ran a served tool reports how many
+    /// times each tool ran, under OpenRouter's `server_tool_use` spelling.
+    #[tokio::test]
+    async fn server_tool_use_is_reported_in_the_usage_chunk() {
+        let first = calls_sse(&[
+            ("call_1", "pxy_datetime", "{}"),
+            ("call_2", "pxy_datetime", "{\"timezone\":\"Europe/London\"}"),
+        ]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, _seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let text = datetime_turn(&base, "server_tool_use", 5).await;
+        assert!(
+            text.contains("\"server_tool_use\":{\"datetime_requests\":2}"),
+            "the usage chunk must carry the counts: {text}"
+        );
     }
 
     fn test_app(cfg_toml: &str, name: &str) -> SharedApp {
@@ -7212,8 +7590,8 @@ mod tests {
                 "parameters": {"model": "strong/s", "instructions": "be terse"},
             }],
         });
-        let out =
-            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let ctx = ClientContext { agent: Some("pi".into()), ..ClientContext::default() };
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await;
         let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
         let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
         let text = String::from_utf8_lossy(&bytes);
@@ -7226,6 +7604,13 @@ mod tests {
         assert_eq!(sub["messages"][0]["role"], "system", "{sub}");
         assert_eq!(sub["messages"][0]["content"], "be terse", "{sub}");
         assert_eq!(sub["messages"][1]["content"], "how?", "{sub}");
+        // The leg is the client's turn too: it bills to the client's agent,
+        // not to "other".
+        let rows = app.state.model_usage_rows().unwrap();
+        assert!(
+            rows.iter().any(|r| r.agent == "pi" && r.model == "s"),
+            "the advisor leg must bill to the client's agent: {rows:?}"
+        );
     }
 
     /// A Responses client (codex) declares the advisor with its parameters in

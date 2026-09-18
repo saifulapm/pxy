@@ -401,7 +401,7 @@ pub fn response(chat: &Value, model_id: &str) -> Value {
 fn usage_from_chat(usage: &Value) -> Value {
     let input = usage["prompt_tokens"].as_u64().unwrap_or(0);
     let output = usage["completion_tokens"].as_u64().unwrap_or(0);
-    json!({
+    let mut out = json!({
         "input_tokens": input,
         "input_tokens_details": {
             "cached_tokens": usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
@@ -412,7 +412,11 @@ fn usage_from_chat(usage: &Value) -> Value {
                 usage["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
         },
         "total_tokens": usage["total_tokens"].as_u64().unwrap_or(input + output),
-    })
+    });
+    if usage["server_tool_use"].is_object() {
+        out["server_tool_use"] = usage["server_tool_use"].clone();
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +881,20 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `server_tool_use` rides the Responses usage object when the chat
+    /// usage carried it, and is absent otherwise.
+    #[test]
+    fn usage_carries_server_tool_use() {
+        let with = usage_from_chat(&json!({
+            "prompt_tokens": 1, "completion_tokens": 2,
+            "server_tool_use": {"datetime_requests": 1},
+        }));
+        assert_eq!(with["server_tool_use"]["datetime_requests"], 1);
+        assert_eq!(with["total_tokens"], 3);
+        let without = usage_from_chat(&json!({"prompt_tokens": 1, "completion_tokens": 2}));
+        assert!(without.get("server_tool_use").is_none());
+    }
 
     /// The documented string form of `input` must become one user message;
     /// treating it as missing made the model answer a fabricated empty prompt.

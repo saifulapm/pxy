@@ -412,6 +412,9 @@ pub struct StreamState {
     tools: Vec<ToolSlot>,
     finish_reason: Option<String>,
     pub usage: TokenUsage,
+    /// The turn's `server_tool_use` counts, set by the router once a served
+    /// tool has run; reported on the closing message_delta.
+    pub server_tool_use: Value,
     input_estimate: u64,
     /// Tool names as the client declared them (lowercase -> declared), for
     /// restoring the capitalization some upstreams flatten.
@@ -691,7 +694,11 @@ impl StreamState {
             "message_delta",
             &json!({"type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                "usage": {"output_tokens": self.usage.output},
+                "usage": if self.server_tool_use.is_object() {
+                    json!({"output_tokens": self.usage.output, "server_tool_use": self.server_tool_use})
+                } else {
+                    json!({"output_tokens": self.usage.output})
+                },
             }),
         ));
         out.push_str(&format_event("message_stop", &json!({"type": "message_stop"})));
@@ -710,6 +717,23 @@ fn stop_block(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn that ran served tools reports their counts on the closing
+    /// message_delta's usage, beside output_tokens; a turn that ran none
+    /// reports usage exactly as before.
+    #[test]
+    fn finish_reports_server_tool_use_when_set() {
+        let mut st = StreamState::new("m", 0, None);
+        st.on_data(r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#);
+        st.server_tool_use = json!({"web_search_requests": 2});
+        let out = st.finish();
+        assert!(out.contains(r#""usage":{"output_tokens":0,"server_tool_use":{"web_search_requests":2}}"#), "{out}");
+
+        let mut plain = StreamState::new("m", 0, None);
+        plain.on_data(r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#);
+        let out = plain.finish();
+        assert!(out.contains(r#""usage":{"output_tokens":0}"#), "{out}");
+    }
 
     /// The web_search server tool becomes a real function pxy can intercept,
     /// and client tools are untouched. Every other server tool is dropped:
