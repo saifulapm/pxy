@@ -6317,6 +6317,158 @@ mod tests {
         assert_eq!(bodies[0]["model"], "s", "the entry's model picks the advisor");
     }
 
+    /// An advisor model that does not resolve must not fail the outer turn:
+    /// the consultation comes back as a tool error the outer model reads, and
+    /// the turn finishes. The outer upstream is charged for both its calls.
+    #[tokio::test]
+    async fn unavailable_advisor_model_degrades_to_a_tool_error() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    let tool_error = body["messages"].to_string().contains("Advisor call failed");
+                    sink.lock().unwrap().push(body);
+                    let sse = if tool_error {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_advisor\",\"arguments\":\"{\\\"prompt\\\":\\\"how?\\\"}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "advisor_unavailable",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "build a pool"}],
+            "tools": [{
+                "type": "pxy:advisor",
+                "parameters": {"model": "missing/model"},
+            }],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("final answer"), "the turn must continue: {text}");
+        assert!(!text.contains("pxy_"), "{text}");
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "ask, then answer");
+        assert!(
+            bodies[1]["messages"].to_string().contains("Advisor call failed"),
+            "the model must read the failure: {}",
+            bodies[1]["messages"]
+        );
+        // Cost: the outer upstream is charged for both its calls.
+        assert_eq!(app.state.usage_total("p").unwrap().requests, 2);
+    }
+
+    /// A meta-tool may not name a meta-tool as its model — a self-reference or
+    /// a two-tool loop. The name does not resolve in the catalog, so the
+    /// consultation degrades to a tool error and no provider is called for it.
+    #[tokio::test]
+    async fn advisor_may_not_name_a_meta_tool_as_its_model() {
+        use std::sync::Mutex;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    let tool_error = body["messages"].to_string().contains("Advisor call failed");
+                    sink.lock().unwrap().push(body);
+                    let sse = if tool_error {
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\ndata: [DONE]\n\n"
+                    } else {
+                        concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_advisor\",\"arguments\":\"{\\\"prompt\\\":\\\"how?\\\"}\"}}]}}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "advisor_self_ref",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "build a pool"}],
+            "tools": [{
+                "type": "pxy:advisor",
+                "parameters": {"model": "openrouter:subagent"},
+            }],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("final answer"), "the turn must continue: {text}");
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "only the outer upstream is called");
+        assert!(
+            bodies[1]["messages"].to_string().contains("Advisor call failed"),
+            "the meta-model must be refused as a tool error: {}",
+            bodies[1]["messages"]
+        );
+    }
+
     #[tokio::test]
     async fn server_tool_servability_follows_the_registry() {
         use axum::routing::post;
