@@ -81,6 +81,12 @@ max_tool_calls = 10
 # [server_tools.defaults.advisor]
 # model = "aaa"
 # instructions = "You are a senior engineer. Be decisive."
+# tool_search lets a client declare more function tools than a turn can
+# afford: it marks the spare ones `defer_loading` and pxy holds them out of
+# the upstream body until the model searches for what it needs. `max_results`
+# caps one search (default 5, at most 50).
+# [server_tools.defaults.tool_search]
+# max_results = 5
 
 # ---------------------------------------------------------------------------
 # Groups: named failover chains. A group name is itself a routable model id.

@@ -1065,6 +1065,17 @@ mod tests {
         assert!(cfg.server_tools.defaults["datetime"].is_table());
         assert_eq!(cfg.server_tools.defaults["web_search"]["max_results"].as_integer(), Some(3));
 
+        // The spelling config.example.toml shows for tool_search.
+        let search = load(
+            r#"
+            [server]
+            [server_tools.defaults.tool_search]
+            max_results = 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(search.server_tools.defaults["tool_search"]["max_results"].as_integer(), Some(5));
+
         let unknown = load(
             r#"
             [server]
