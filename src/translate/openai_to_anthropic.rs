@@ -296,6 +296,9 @@ fn map_stop_reason(reason: Option<&str>) -> &'static str {
     match reason {
         Some("max_tokens") => "length",
         Some("tool_use") => "tool_calls",
+        // A refused turn must not read as a normal short answer: pi and the
+        // SDKs surface `content_filter` as an error.
+        Some("refusal") => "content_filter",
         _ => "stop",
     }
 }
@@ -598,6 +601,15 @@ mod tests {
         assert!(out.contains("[DONE]"));
         assert_eq!(st.usage.input, 9);
         assert_eq!(st.usage.output, 4);
+    }
+
+    #[test]
+    fn stop_reasons_map_to_the_openai_vocabulary() {
+        assert_eq!(map_stop_reason(Some("end_turn")), "stop");
+        assert_eq!(map_stop_reason(Some("max_tokens")), "length");
+        assert_eq!(map_stop_reason(Some("tool_use")), "tool_calls");
+        assert_eq!(map_stop_reason(Some("refusal")), "content_filter");
+        assert_eq!(map_stop_reason(None), "stop");
     }
 
     /// A gateway that reports input only on the final message_delta (meta.ai)

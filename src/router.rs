@@ -1308,24 +1308,26 @@ async fn try_candidate_inner(
     // end_turn. Streams are bounded instead by the headers deadline below
     // and a per-read stall deadline in the unfold. Non-streaming keeps the
     // total timeout (it also bounds force_stream's re-assembly).
-    let mut req = app.http.post(&prepared.url).header("content-type", "application/json");
-    if !stream {
-        req = req.timeout(Duration::from_secs(provider_cfg.timeout_secs));
-    }
-    for (k, v) in &prepared.headers {
-        req = req.header(k, v);
-    }
     // opencode.ai routes on `x-opencode-session` and, from 2026-09-06, errors
     // without it. Client's own id wins; otherwise fingerprint the conversation
     // so the value is stable across the turns of one session. Scoped to
     // opencode upstreams — this identifies a conversation and is nobody
-    // else's business.
+    // else's business. It lives in the header list, not on this one request,
+    // so a served tool's continuation carries it too.
+    let mut upstream_headers = prepared.headers.clone();
     if is_opencode_provider(&cand.provider)
-        && !prepared.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-opencode-session"))
+        && !upstream_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-opencode-session"))
     {
         let session =
             ctx.session.clone().unwrap_or_else(|| conversation_fingerprint(payload));
-        req = req.header("x-opencode-session", session);
+        upstream_headers.push(("x-opencode-session".to_string(), session));
+    }
+    let mut req = app.http.post(&prepared.url).header("content-type", "application/json");
+    if !stream {
+        req = req.timeout(Duration::from_secs(provider_cfg.timeout_secs));
+    }
+    for (k, v) in &upstream_headers {
+        req = req.header(k, v);
     }
     if upstream_format == WireFormat::Anthropic {
         if let Some(beta) = &ctx.anthropic_beta {
@@ -1354,7 +1356,7 @@ async fn try_candidate_inner(
             })
             .collect(),
         url: prepared.url.clone(),
-        headers: prepared.headers.clone(),
+        headers: upstream_headers.clone(),
         body: body.clone(),
         timeout: Duration::from_secs(provider_cfg.timeout_secs),
     });
@@ -4571,6 +4573,86 @@ mod tests {
             }
             Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
         }
+    }
+
+    /// opencode.ai errors on a request without `x-opencode-session`, and the
+    /// continuation after a served tool call is a second request to the same
+    /// upstream: both calls of one turn must carry the same session id.
+    #[tokio::test]
+    async fn continuation_carries_the_opencode_session_header() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let counter = calls.clone();
+        let sink = seen.clone();
+        let router = axum::Router::new().route(
+            "/m",
+            post(move |headers: axum::http::HeaderMap| {
+                let counter = counter.clone();
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(
+                        headers
+                            .get("x-opencode-session")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sse = if n == 0 {
+                        concat!(
+                            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+                            "\"function\":{\"name\":\"pxy_datetime\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"now\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.opencode-test]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.free]
+                models = ["opencode-test/m"]
+                "#
+            ),
+            "continuation_session",
+        );
+        let payload = json!({
+            "model": "free",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what time is it?"}],
+            "tools": [{"type": "pxy:datetime"}],
+        });
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        if let Outcome::Stream { body, .. } = out {
+            let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        } else {
+            panic!("expected stream");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "two upstream calls: {seen:?}");
+        assert!(seen[0].is_some(), "first call carries the session id");
+        assert_eq!(seen[0], seen[1], "the continuation carries the same id: {seen:?}");
     }
 
     /// The continuation after a served tool call is a stream too, and the
