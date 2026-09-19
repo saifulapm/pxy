@@ -8,29 +8,63 @@
 //! truncation mid-token, say) reaches the client exactly as the upstream sent
 //! it.
 
+/// Candidate starts tried before the search gives up. Each one costs a scan of
+/// everything after it, so an unbounded search is quadratic in the length of
+/// the answer — and a preamble carrying more bracket runs than this before the
+/// real value is not a case worth serving.
+const MAX_CANDIDATES: usize = 64;
+
 /// Repair a JSON answer wrapped in prose, a fence or its own mistakes.
 ///
-/// Scans from the first `{` or `[` to the close that matches it — which drops
-/// a fence, a preamble and any commentary after the value in one move — while
-/// quoting bare keys, dropping trailing commas, and closing whatever strings
-/// and containers the text left open. `None` when the result does not parse,
-/// and `None` when it is just the input again, so a caller can treat `Some` as
-/// "this needed healing and the healed form is valid".
+/// Every `{` or `[` in the text starts a candidate, rebuilt up to the close
+/// that matches it while quoting bare keys, dropping trailing commas, and
+/// closing whatever strings and containers were left open. The candidate that
+/// parses and accounts for the most of the text wins, which drops a fence, a
+/// preamble and any commentary after the value in one move.
+///
+/// Reach, not position, is what picks the winner. A model's prose is full of
+/// runs that parse on their own — a `[1]` citation marker, a bare `[]`, a
+/// short list — and taking the first bracket would serve one of those as the
+/// answer; taking the last that parses would lose the value to a bracket in
+/// the trailing commentary.
+///
+/// `None` when nothing parses, and `None` when the winner is just the input
+/// again, so a caller can treat `Some` as "this needed healing and the healed
+/// form is valid".
 pub fn heal_json(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
-    let start = chars.iter().position(|c| *c == '{' || *c == '[')?;
-    let healed = rebuild(&chars[start..]);
-    if healed == text.trim() || serde_json::from_str::<serde_json::Value>(&healed).is_err() {
-        return None;
+    let starts = chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '{' || **c == '[')
+        .map(|(i, _)| i)
+        .take(MAX_CANDIDATES);
+
+    let mut best: Option<(usize, String)> = None;
+    for start in starts {
+        let (candidate, consumed) = rebuild(&chars[start..]);
+        if serde_json::from_str::<serde_json::Value>(&candidate).is_err() {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(reach, _)| consumed > *reach) {
+            best = Some((consumed, candidate));
+        }
+        // This one ran to the end of the text, and a later start has less text
+        // left to reach, so nothing after it can win.
+        if start + consumed == chars.len() {
+            break;
+        }
     }
-    Some(healed)
+
+    let (_, healed) = best?;
+    (healed != text.trim()).then_some(healed)
 }
 
 /// Copy `src` up to the close that matches its first container, repairing as
-/// it goes. Everything outside a string is understood; everything inside one
-/// is passed through byte for byte, so escapes and braces in string values
-/// survive untouched.
-fn rebuild(src: &[char]) -> String {
+/// it goes, and report how much of `src` that took. Everything outside a
+/// string is understood; everything inside one is passed through byte for
+/// byte, so escapes and braces in string values survive untouched.
+fn rebuild(src: &[char]) -> (String, usize) {
     let mut out = String::new();
     // One entry per open container: the closer it wants, and — for an object —
     // whether the next token is a key, which is the only place a bare word may
@@ -126,7 +160,7 @@ fn rebuild(src: &[char]) -> String {
     while let Some((closer, _)) = stack.pop() {
         out.push(closer);
     }
-    out
+    (out, i)
 }
 
 #[cfg(test)]
@@ -176,6 +210,29 @@ mod tests {
         assert_eq!(
             heal_json("{\"a\": \"hel").as_deref(),
             Some("{\"a\": \"hel\"}")
+        );
+    }
+
+    /// A citation marker, a bare `[]` or any short list in the model's own
+    /// prose parses on its own, and taking the FIRST bracket would serve it as
+    /// the answer — silently, since nothing in the response says a heal
+    /// happened. The value that accounts for the most of what the model wrote
+    /// wins instead.
+    #[test]
+    fn a_bracketed_run_in_the_prose_never_beats_the_real_value() {
+        assert_eq!(
+            heal_json("Per [1] and [2], here is the answer:\n{\"value\": 42}").as_deref(),
+            Some("{\"value\": 42}")
+        );
+        assert_eq!(
+            heal_json("Options [] were empty, so:\n[{\"id\": 7}]").as_deref(),
+            Some("[{\"id\": 7}]")
+        );
+        // The winner is the longest reach, not the last one that parses: a
+        // bracket in the trailing commentary must not displace the value.
+        assert_eq!(
+            heal_json("{\"a\": 1}\n\nHope that helps [1]").as_deref(),
+            Some("{\"a\": 1}")
         );
     }
 
