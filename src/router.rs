@@ -362,6 +362,26 @@ fn resolves_id(catalog: &Catalog, cfg: &Config, id: &str) -> bool {
     !catalog.resolve(cfg, id).is_empty()
 }
 
+/// The listed effort nearest to `requested` in canonical order, when the
+/// model lists efforts and `requested` is not among them. Ties go to the
+/// higher level: the caller asked to think, so the clamp errs toward more
+/// of it, not less. An unlisted spelling and an empty list both mean
+/// nothing to do — the former is not pxy's to reinterpret, the latter is
+/// nobody knowing.
+fn clamp_effort(requested: &str, allowed: &[String]) -> Option<String> {
+    let order = &crate::refresh::EFFORTS;
+    let want = order.iter().position(|e| *e == requested)?;
+    if allowed.is_empty() || allowed.iter().any(|a| a == requested) {
+        return None;
+    }
+    order
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| allowed.iter().any(|a| a == *e))
+        .min_by_key(|(i, _)| (i.abs_diff(want), std::cmp::Reverse(*i)))
+        .map(|(_, e)| e.to_string())
+}
+
 /// Write a model-variant override into the request body. An OpenAI client
 /// carries it as `reasoning_effort`; an Anthropic client as `thinking` (which
 /// `anthropic_to_openai` maps back to effort for an OpenAI upstream). The
@@ -1531,6 +1551,17 @@ async fn try_candidate_inner(
     {
         // Ask OpenAI upstreams to report usage in the final chunk.
         body["stream_options"] = json!({"include_usage": true});
+    }
+
+    // An effort the model does not take is a 400 for a request that was
+    // otherwise fine (agentrouter's glm-5.3 refuses "medium"), so it is moved
+    // to the nearest level the model lists. Only the OpenAI wire carries a
+    // named level; an Anthropic upstream takes a token budget instead.
+    if let Some(level) = body["reasoning_effort"].as_str()
+        && let Some(clamped) = clamp_effort(level, &cand.model.effort)
+    {
+        info!(candidate = %cand.full_id(), from = level, to = %clamped, "reasoning effort clamped");
+        body["reasoning_effort"] = json!(clamped);
     }
 
     // Keys this upstream 400s on, dropped LAST so they win over anything the
@@ -5282,6 +5313,23 @@ mod tests {
             http: reqwest::Client::new(),
             cfg,
         })
+    }
+
+    #[test]
+    fn clamp_effort_picks_the_nearest_listed_level() {
+        let allowed = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Listed: nothing to do.
+        assert_eq!(clamp_effort("high", &allowed(&["low", "high", "max"])), None);
+        // Nobody knows what the model takes: leave it alone.
+        assert_eq!(clamp_effort("medium", &allowed(&[])), None);
+        // Equidistant neighbours: the higher one keeps the intent to think.
+        assert_eq!(clamp_effort("medium", &allowed(&["low", "high", "max"])), Some("high".into()));
+        // Above the top: the top.
+        assert_eq!(clamp_effort("xhigh", &allowed(&["low", "medium"])), Some("medium".into()));
+        // Below the bottom: the bottom.
+        assert_eq!(clamp_effort("minimal", &allowed(&["medium", "high"])), Some("medium".into()));
+        // An unknown spelling is not pxy's to reinterpret.
+        assert_eq!(clamp_effort("turbo", &allowed(&["low", "high"])), None);
     }
 
     #[test]

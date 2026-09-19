@@ -1599,11 +1599,12 @@ pub struct ModelSpec {
     pub reasoning: Option<bool>,
     /// Which thinking efforts this model actually accepts, in pxy's canonical
     /// order ("none", "minimal", "low", "medium", "high", "xhigh", "max").
-    /// CAPABILITY METADATA, like `reasoning`: routing never reads it, but a
-    /// client that must declare levels up front (pi's thinkingLevelMap) uses
-    /// it to hide the ones this model would reject — agentrouter's glm-5.3
-    /// 400s on "medium" and asks for low/high/max. Empty = nobody knows, and
-    /// the client falls back to its own default set.
+    /// A client that must declare levels up front (pi's thinkingLevelMap)
+    /// uses it to hide the ones this model would reject — agentrouter's
+    /// glm-5.3 400s on "medium" and asks for low/high/max — and at the wire a
+    /// `reasoning_effort` outside the list is moved to the nearest listed
+    /// level (router::clamp_effort). Empty = nobody knows: the client falls
+    /// back to its own default set and the wire is left alone.
     #[serde(default)]
     pub effort: Vec<String>,
     /// Always request streaming upstream, even for a non-streaming client
