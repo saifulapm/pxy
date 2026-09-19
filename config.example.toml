@@ -209,6 +209,18 @@ name = "Fast"
 models = ["alpha/model-small"]
 
 # ---------------------------------------------------------------------------
+# Aliases: a second, stable name for a group, a "provider/model" id or the
+# virtual "auto/free". An alias routes exactly like the target it names and
+# shares its route pin, session affinity and policy. Point a client that
+# cannot list models at one of these, and renaming the chain underneath it
+# costs nothing. A name must not contain "/" or collide with a group or a
+# provider, and a target must not be another alias.
+# ---------------------------------------------------------------------------
+
+[aliases]
+chat = "daily"
+
+# ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
 

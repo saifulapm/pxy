@@ -62,6 +62,13 @@ pub struct Config {
     /// the config declares. A group name is itself a routable model id.
     #[serde(default)]
     pub groups: BTreeMap<String, GroupConfig>,
+    /// Stable names for what the catalog calls something else today:
+    /// `name = "target"`, where the target is a group, a `provider/model` id
+    /// or `auto/free`. An alias name is a routable model id exactly like a
+    /// group name, so a client config that cannot list models (aichat, qmd,
+    /// pi) keeps working when the group underneath it is renamed or dropped.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
     /// Provider allowlist. Empty (the default) exposes every enabled provider.
     /// Non-empty exposes ONLY these: their models are the entire catalog a
     /// picker sees, group chains keep only members that survive the filter, and
@@ -549,6 +556,40 @@ impl Config {
                 }
             }
         }
+        for (alias, target) in &self.aliases {
+            // An alias name is a model id on the wire, so it lives by the
+            // group name's rules: no '/', and no collision with a provider.
+            // It must not shadow a group either — the whole point is a second
+            // name for one chain, not two meanings for one id.
+            if alias.contains('/') {
+                anyhow::bail!("alias '{alias}': an alias name must not contain '/'");
+            }
+            if self.groups.contains_key(alias) {
+                anyhow::bail!("alias '{alias}' collides with the group of the same name");
+            }
+            if self.providers.contains_key(alias) {
+                anyhow::bail!("alias '{alias}' collides with the provider of the same name");
+            }
+            // One level deep: an alias naming an alias is a cycle waiting to
+            // happen, and resolution would have to guard against it forever.
+            if self.aliases.contains_key(target) {
+                anyhow::bail!(
+                    "alias '{alias}': target '{target}' is itself an alias (aliases are one \
+                     level deep)"
+                );
+            }
+            let known = self.groups.contains_key(target)
+                || target == "auto/free"
+                || target
+                    .split_once('/')
+                    .is_some_and(|(prov, _)| self.providers.contains_key(prov));
+            if !known {
+                anyhow::bail!(
+                    "alias '{alias}': target '{target}' is neither a group nor a model on a \
+                     configured provider"
+                );
+            }
+        }
         // A default naming a tool pxy does not implement, or one left out of
         // `enabled`, would be injected into every turn and dropped from every
         // turn: a config that silently does nothing is a config that lies.
@@ -957,6 +998,80 @@ mod tests {
         .map_err(|e| e.to_string())
         .and_then(|c| c.validate().map_err(|e| e.to_string()))
         .unwrap();
+    }
+
+    /// An alias name is a model id on the wire, so a name that already means
+    /// something else means the id means two things: refuse it at load rather
+    /// than let the lookup order decide. The message names the alias, since
+    /// the config line is all the reader has to go on.
+    #[test]
+    fn alias_colliding_with_a_group_or_provider_is_refused() {
+        let base = r#"
+            [server]
+            [providers.p]
+            base_url = "https://p.example/chat"
+            models = ["m"]
+            [groups.daily]
+            models = ["p/m"]
+        "#;
+        let cases = [
+            ("name is a group", "daily = \"p/m\"", "alias 'daily' collides with the group"),
+            ("name is a provider", "p = \"daily\"", "alias 'p' collides with the provider"),
+            ("name has a slash", "\"a/b\" = \"daily\"", "alias 'a/b': an alias name must not"),
+            (
+                "unknown target",
+                "chat = \"nope\"",
+                "alias 'chat': target 'nope' is neither a group nor a model",
+            ),
+            (
+                "target on an unknown provider",
+                "chat = \"none-such/m\"",
+                "alias 'chat': target 'none-such/m' is neither a group",
+            ),
+        ];
+        for (name, line, expect) in cases {
+            let err = toml::from_str::<Config>(&format!("{base}\n[aliases]\n{line}\n"))
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map_err(|e| e.to_string()))
+                .unwrap_err();
+            assert!(err.contains(expect), "{name}: {err}");
+        }
+        // A group target, a provider-qualified id (listed or not) and the
+        // virtual auto/free are the three shapes that pass.
+        toml::from_str::<Config>(&format!(
+            "{base}\n[aliases]\nchat = \"daily\"\none = \"p/m\"\nnew = \"p/unlisted\"\n\
+             cheap = \"auto/free\"\n"
+        ))
+        .map_err(|e| e.to_string())
+        .and_then(|c| c.validate().map_err(|e| e.to_string()))
+        .unwrap();
+    }
+
+    /// Ruling 3: aliases are one level deep. A target naming another alias is
+    /// a cycle the resolver would have to guard against on every request, so
+    /// the config is refused instead.
+    #[test]
+    fn alias_to_an_alias_is_refused() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://p.example/chat"
+            models = ["m"]
+            [groups.daily]
+            models = ["p/m"]
+            [aliases]
+            chat = "daily"
+            default = "chat"
+            "#,
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|c| c.validate().map_err(|e| e.to_string()))
+        .unwrap_err();
+        assert!(
+            err.contains("alias 'default': target 'chat' is itself an alias"),
+            "{err}"
+        );
     }
 
     /// `[plugins]` turns a request-time transform on for every request, where

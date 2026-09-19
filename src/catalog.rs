@@ -85,6 +85,17 @@ pub struct Catalog {
     /// Group name -> its walk order. Config order inside a group is priority;
     /// the map is keyed by name, so groups themselves list alphabetically.
     groups: BTreeMap<String, Group>,
+    /// Alias name -> its target (a group, a "provider/model" id or
+    /// "auto/free"), straight from the config. Alphabetical like the groups,
+    /// which every listing puts them after.
+    aliases: BTreeMap<String, String>,
+}
+
+/// The bare id a requested spelling routes on: the `claude/` mirror prefix and
+/// the `[1m]` window marker taken off, in that order.
+fn bare_id(requested: &str) -> &str {
+    let bare = requested.strip_prefix("claude/").unwrap_or(requested);
+    bare.strip_suffix(CTX_1M_MARKER).unwrap_or(bare)
 }
 
 impl Catalog {
@@ -130,7 +141,7 @@ impl Catalog {
                 (name.clone(), Group { label: g.label(name), chain, reasoning })
             })
             .collect();
-        Self { models, groups }
+        Self { models, groups, aliases: cfg.aliases.clone() }
     }
 
     /// All exposed model ids: group names first, then every "provider/model".
@@ -155,33 +166,51 @@ impl Catalog {
         self.groups().map(|(name, _)| name.as_str())
     }
 
+    /// Every declared alias, name -> target, alphabetical: the listings put
+    /// them after the groups.
+    pub fn aliases(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.aliases.iter().map(|(name, target)| (name.as_str(), target.as_str()))
+    }
+
+    /// The target a requested id aliases (the `claude/` mirror and the `[1m]`
+    /// marker stripped), or None when it is not an alias. Aliases are one
+    /// level deep — validation refuses a target naming another alias — so the
+    /// answer is a group name, a "provider/model" id or "auto/free", never a
+    /// second alias.
+    pub fn alias_target(&self, requested: &str) -> Option<&str> {
+        self.aliases.get(bare_id(requested)).map(String::as_str)
+    }
+
     /// Is this id a routable group (bare, or behind the "claude/" mirror)?
+    /// An alias of a group is one; an alias of a model id or of `auto/free`
+    /// is not, and routes like the explicit id it names.
     pub fn is_group(&self, requested: &str) -> bool {
         self.group_name(requested).is_some()
     }
 
     /// The bare group name a requested id routes on (the `claude/` mirror and
-    /// the `[1m]` marker stripped), or None when it is not a routable group.
-    /// The route pin is keyed on this, so both spellings share one pin.
+    /// the `[1m]` marker stripped, an alias replaced by its target), or None
+    /// when it is not a routable group. The route pin is keyed on this, so
+    /// every spelling of one group — mirror, marker, alias — shares one pin.
     pub fn group_name(&self, requested: &str) -> Option<&str> {
-        let bare = requested.strip_prefix("claude/").unwrap_or(requested);
-        let bare = bare.strip_suffix(CTX_1M_MARKER).unwrap_or(bare);
+        let bare = bare_id(requested);
+        let bare = self.aliases.get(bare).map(String::as_str).unwrap_or(bare);
         self.groups
             .get_key_value(bare)
             .filter(|(_, g)| !g.chain.is_empty())
             .map(|(k, _)| k.as_str())
     }
 
-    /// The GroupConfig a requested id names, accepting the `claude/` mirror and
-    /// the `[1m]` window marker — the policy lookups (headroom, paid-reserve)
-    /// must see the same group `resolve` routed on.
+    /// The GroupConfig a requested id names, accepting the `claude/` mirror,
+    /// the `[1m]` window marker and an alias — the policy lookups (headroom,
+    /// paid-reserve) must see the same group `resolve` routed on.
     pub fn group_config<'a>(
         &self,
         cfg: &'a Config,
         requested: &str,
     ) -> Option<&'a crate::config::GroupConfig> {
-        let bare = requested.strip_prefix("claude/").unwrap_or(requested);
-        let bare = bare.strip_suffix(CTX_1M_MARKER).unwrap_or(bare);
+        let bare = bare_id(requested);
+        let bare = self.aliases.get(bare).map(String::as_str).unwrap_or(bare);
         cfg.groups.get(bare)
     }
 
@@ -220,7 +249,11 @@ impl Catalog {
     /// - "provider/model" -> that pair (split on FIRST slash; model ids may
     ///   contain slashes themselves, e.g. openrouter's vendor-prefixed ids)
     /// - bare id -> first provider (BTreeMap = alphabetical) listing that model
+    ///
+    /// An alias is its target here, mirror and marker included: one lookup up
+    /// front, and every path below sees the id the alias names.
     pub fn resolve(&self, cfg: &Config, requested: &str) -> Vec<Candidate> {
+        let requested = self.alias_target(requested).unwrap_or(requested);
         if let Some(g) = self.groups.get(requested) {
             return g.chain.clone();
         }
@@ -682,6 +715,105 @@ mod tests {
         assert!(c.provider_allowed("go"));
         assert!(c.provider_allowed("go-cloud"));
         assert!(!c.provider_allowed("google"));
+    }
+
+    fn alias_cfg() -> Config {
+        toml::from_str(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "https://p.example/chat"
+            models = ["large", { id = "gratis", free = true }]
+            [providers.q]
+            base_url = "https://q.example/chat"
+            models = ["large"]
+            [providers.off]
+            base_url = "https://o.example/chat"
+            enabled = false
+            models = ["dead"]
+            [groups.daily]
+            models = ["p/large", "q/large"]
+            headroom = true
+            [groups.gone]
+            models = ["off/dead"]
+            [aliases]
+            chat = "daily"
+            cheap = "auto/free"
+            one = "p/large"
+            stale = "gone"
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// An alias is a name for its target and nothing else, in every spelling
+    /// a group id is accepted in: the client config that pins one never has
+    /// to learn the catalog moved underneath it.
+    #[test]
+    fn alias_resolves_to_its_target_chain() {
+        let c = alias_cfg();
+        c.validate().unwrap();
+        let cat = Catalog::from_config(&c);
+        for id in ["chat", "claude/chat", "chat[1m]", "claude/chat[1m]"] {
+            let r = cat.resolve(&c, id);
+            assert_eq!(r.len(), 2, "{id}");
+            assert_eq!(r[0].full_id(), "p/large", "{id}");
+            assert_eq!(r[1].full_id(), "q/large", "{id}");
+            assert_eq!(cat.alias_target(id), Some("daily"), "{id}");
+        }
+        // Alphabetical, and listed after the groups they name.
+        assert_eq!(
+            cat.aliases().collect::<Vec<_>>(),
+            [("chat", "daily"), ("cheap", "auto/free"), ("one", "p/large"), ("stale", "gone")]
+        );
+        // A target left empty by a disabled or whitelisted-away provider
+        // resolves to nothing, exactly as the group itself does.
+        assert!(cat.resolve(&c, "stale").is_empty());
+        assert!(!cat.is_group("stale"));
+        assert!(cat.alias_target("daily").is_none());
+    }
+
+    /// Ruling 1: an alias of a group IS that group for every policy lookup.
+    /// Otherwise `pxy route daily <model>` would not steer a conversation
+    /// launched on `chat`, and that conversation would bind its own affinity
+    /// key — two walks where the config declared one.
+    #[test]
+    fn alias_to_a_group_shares_its_pin_key_and_policy() {
+        let c = alias_cfg();
+        let cat = Catalog::from_config(&c);
+        for id in ["chat", "claude/chat", "chat[1m]"] {
+            assert!(cat.is_group(id), "{id}");
+            assert_eq!(cat.group_name(id), Some("daily"), "{id}");
+            assert_eq!(
+                crate::router::route_pin_key(cat.group_name(id).unwrap()),
+                crate::router::route_pin_key("daily"),
+                "{id}"
+            );
+            assert_eq!(cat.group_config(&c, id).unwrap().headroom, Some(true), "{id}");
+        }
+    }
+
+    /// Ruling 2: an alias of a model id or of `auto/free` is not a group. It
+    /// resolves to what the target resolves to, which is what leaves the
+    /// router's explicit-id path (and its account expansion) in charge.
+    #[test]
+    fn alias_to_a_model_or_auto_free_is_not_a_group() {
+        let c = alias_cfg();
+        let cat = Catalog::from_config(&c);
+        for (alias, target) in [("one", "p/large"), ("cheap", "auto/free")] {
+            for id in [alias.to_string(), format!("claude/{alias}"), format!("{alias}[1m]")] {
+                assert!(!cat.is_group(&id), "{id}");
+                assert!(cat.group_name(&id).is_none(), "{id}");
+                assert!(cat.group_config(&c, &id).is_none(), "{id}");
+                let got: Vec<String> =
+                    cat.resolve(&c, &id).iter().map(|x| x.full_id()).collect();
+                let want: Vec<String> =
+                    cat.resolve(&c, target).iter().map(|x| x.full_id()).collect();
+                assert_eq!(got, want, "{id}");
+                assert!(!got.is_empty(), "{id}");
+            }
+        }
+        assert_eq!(cat.resolve(&c, "cheap")[0].full_id(), "p/gratis");
     }
 
     #[test]

@@ -51,6 +51,17 @@ survive a restart, and `x-pxy-provider` on the response says who served it.
 group's walk, with the chain still behind it as fallback; other groups are
 untouched. `pxy route <group> --clear` undoes it, `pxy route` lists the pins.
 
+`[aliases]` gives a group, a `provider/model` id or `auto/free` a second name
+that routes the same way and shares the target's pin and policy:
+
+```toml
+[aliases]
+chat = "daily"
+```
+
+Point a client that cannot list models at `chat`, and renaming the chain
+underneath it costs nothing.
+
 `config.toml` is the whole catalog: a model is served when a provider lists it,
 and not otherwise. `models.toml` is a report that `pxy refresh --generate`
 writes and pxy never reads. Copy rows out of it by hand. Nothing is added or

@@ -734,6 +734,7 @@ mod tests {
             server: crate::config::ServerConfig { port: 1, api_key: "k".into() },
             providers: BTreeMap::from([("p".to_string(), pcfg)]),
             groups: BTreeMap::new(),
+            aliases: BTreeMap::new(),
             providers_whitelist: Vec::new(),
             launch: Default::default(),
             search: Default::default(),
