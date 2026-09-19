@@ -29,6 +29,7 @@ pub enum Tool {
     ToolSearch,
     DescribeImage,
     Memory,
+    FindDocs,
 }
 
 impl Tool {
@@ -48,6 +49,7 @@ impl Tool {
             Tool::ToolSearch,
             Tool::DescribeImage,
             Tool::Memory,
+            Tool::FindDocs,
         ]
     }
 
@@ -66,6 +68,7 @@ impl Tool {
             Tool::ToolSearch => "tool_search",
             Tool::DescribeImage => "describe_image",
             Tool::Memory => "memory",
+            Tool::FindDocs => "find_docs",
         }
     }
 
@@ -93,6 +96,7 @@ impl Tool {
             Tool::ToolSearch => run_tool_search(ctx, args),
             Tool::DescribeImage => run_describe_image(ctx, args).await,
             Tool::Memory => run_memory(ctx, args),
+            Tool::FindDocs => run_find_docs(ctx, args).await,
         }
     }
 
@@ -127,6 +131,9 @@ impl Tool {
             Tool::DescribeImage => true,
             // A directory under the data dir, made on first use.
             Tool::Memory => true,
+            // Context7 answers without an account, so the key is optional and
+            // there is nothing to configure before the tool can be served.
+            Tool::FindDocs => true,
         }
     }
 
@@ -533,6 +540,8 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         // Anthropic's native memory entry is dated; pxy serves the one command
         // set that date names.
         "pxy:memory" | "memory_20250818" => Some(Tool::Memory),
+        // pxy's own, like describe_image: OpenRouter has no docs tool.
+        "pxy:find_docs" => Some(Tool::FindDocs),
         // Anthropic names the matcher in the type. Only the regex one is pxy's;
         // `tool_search_tool_bm25*` falls through to `None` and is unservable,
         // because pxy would otherwise answer a BM25 search with regex results.
@@ -837,6 +846,41 @@ pub fn tool_def(tool: Tool, params: &Value) -> Value {
                 },
             },
         }),
+        Tool::FindDocs => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::FindDocs),
+                "description": "Read a library's current documentation. Use it before \
+                    writing against an API you are unsure of, instead of guessing from \
+                    memory: the snippets come from the library's own docs, as they are now.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "library": {
+                            "type": "string",
+                            "description": "The library's name, as it is published \
+                                (\"axum\", \"next.js\", \"stripe\")."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "The topic you need, in a few words: \
+                                \"nested routing\", \"webhook signature verification\"."
+                        },
+                        "version": {
+                            "type": "string",
+                            "description": "The version you are on (\"0.8\"), when the API \
+                                differs between them. Omit for the current one."
+                        },
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": "How much documentation to read back, in tokens. \
+                                Default 4000."
+                        },
+                    },
+                    "required": ["library", "query"],
+                },
+            },
+        }),
     }
 }
 
@@ -893,6 +937,71 @@ fn run_memory(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
                 "path": path,
             }),
         },
+    })
+}
+
+/// Read a library's documentation out of Context7 (wiki:find-docs). Both
+/// legs — the name to an id, the id to snippets — are served from `kv` for a
+/// week before Context7 is asked again. A missing library or query leaves the
+/// call unserved; everything Context7 does wrong is an error result the model
+/// reads and can correct.
+async fn run_find_docs(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let arg = |key: &str| args[key].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let library = arg("library").ok_or("find_docs call without a library")?;
+    let query = arg("query").ok_or("find_docs call without a query")?;
+    let version = arg("version");
+    // The declaration caps the call: a model that asks for the whole library
+    // gets what the request was willing to spend.
+    let cap = ctx.params["max_tokens"].as_u64().unwrap_or(4000).clamp(500, 20_000);
+    let tokens = args["max_tokens"].as_u64().unwrap_or(cap).clamp(500, cap);
+
+    let state = &ctx.app.state;
+    let render = |library: &str| ClientRender {
+        blocks: Vec::new(),
+        marker: json!({"id": ctx.call_id, "library": library, "query": query}),
+    };
+    let failed = |library: &str, e: String| {
+        warn!(%library, %query, error = %e, "find_docs failed");
+        Ran {
+            model_output: json!({"status": "error", "error": e}).to_string(),
+            client: render(library),
+        }
+    };
+
+    let key = crate::docs::search_key(library);
+    let results = match crate::docs::cache_get(state, &key, crate::docs::CACHE_TTL_SECS) {
+        Some(cached) => cached.as_array().cloned().unwrap_or_default(),
+        None => match crate::docs::search_library(ctx.app, library).await {
+            Ok(results) => {
+                crate::docs::cache_put(state, &key, &Value::Array(results.clone()));
+                results
+            }
+            Err(e) => return Ok(failed(library, e)),
+        },
+    };
+    let id = match crate::docs::pick_library(&results, library, version) {
+        Ok(id) => id,
+        Err(e) => return Ok(failed(library, e)),
+    };
+
+    let key = crate::docs::docs_key(&id, query, tokens);
+    let text = match crate::docs::cache_get(state, &key, crate::docs::CACHE_TTL_SECS) {
+        Some(cached) => cached.as_str().unwrap_or_default().to_string(),
+        None => match crate::docs::fetch_docs(ctx.app, &id, query, tokens).await {
+            Ok(text) => {
+                crate::docs::cache_put(state, &key, &Value::String(text.clone()));
+                text
+            }
+            Err(e) => return Ok(failed(&id, e)),
+        },
+    };
+
+    info!(%id, %query, tokens, "find_docs served");
+    Ok(Ran {
+        model_output: format!(
+            "Documentation for {id} (context7), topic \"{query}\":\n{text}\nSource: context7:{id}"
+        ),
+        client: render(&id),
     })
 }
 
@@ -1744,6 +1853,109 @@ mod tests {
         assert_eq!(refused.model_output, "Error: memory is read-only");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A call pxy cannot even shape is unserved, so the loop leaves it out of
+    /// the replay instead of spending a Context7 request on half a question.
+    #[tokio::test]
+    async fn find_docs_without_a_library_or_query_is_unserved() {
+        let app = mock_app("[server]", "find_docs_unserved");
+        let ctx = ToolCtx::new(&app, "call_1");
+        for args in [
+            json!({"query": "nested routing"}),
+            json!({"library": "axum"}),
+            json!({"library": " ", "query": "nested routing"}),
+        ] {
+            assert!(Tool::FindDocs.execute(&ctx, &args).await.is_err(), "{args}");
+        }
+    }
+
+    /// Both legs come out of kv while the rows are fresh: the mock app has no
+    /// Context7 to fall back on, so an answer at all proves the cache served
+    /// it. The model reads text, never the raw JSON.
+    #[tokio::test]
+    async fn find_docs_reads_both_halves_from_the_cache() {
+        let app = mock_app("[server]", "find_docs_cached");
+        let results = json!([{"id": "/tokio-rs/axum", "versions": ["axum_v0_8_4"]}]);
+        // Written under the name the model used, lowercased.
+        crate::docs::cache_put(&app.state, &crate::docs::search_key("Axum"), &results);
+        crate::docs::cache_put(
+            &app.state,
+            &crate::docs::docs_key("/tokio-rs/axum", "nested routing", 4000),
+            &json!("### Nest\nRouter::new().nest(\"/api\", api)"),
+        );
+
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::FindDocs
+            .execute(&ctx, &json!({"library": "axum", "query": "nested routing"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            ran.model_output,
+            "Documentation for /tokio-rs/axum (context7), topic \"nested routing\":\n\
+             ### Nest\nRouter::new().nest(\"/api\", api)\n\
+             Source: context7:/tokio-rs/axum"
+        );
+        assert!(ran.client.blocks.is_empty(), "find_docs is served silently");
+        assert_eq!(
+            ran.client.marker,
+            json!({"id": "call_1", "library": "/tokio-rs/axum", "query": "nested routing"})
+        );
+    }
+
+    /// A library Context7 does not have and a version it does not publish are
+    /// error results the model can correct, not failed requests.
+    #[tokio::test]
+    async fn find_docs_reports_what_context7_could_not_answer() {
+        let app = mock_app("[server]", "find_docs_errors");
+        let ctx = ToolCtx::new(&app, "call_1");
+        let error = |ran: &Ran| -> String {
+            let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+            assert_eq!(out["status"], "error", "{out}");
+            out["error"].as_str().unwrap_or_default().to_string()
+        };
+
+        crate::docs::cache_put(&app.state, &crate::docs::search_key("nosuchlib"), &json!([]));
+        let ran = Tool::FindDocs
+            .execute(&ctx, &json!({"library": "nosuchlib", "query": "x"}))
+            .await
+            .unwrap();
+        assert!(error(&ran).contains("no library matched"), "{}", ran.model_output);
+
+        crate::docs::cache_put(
+            &app.state,
+            &crate::docs::search_key("axum"),
+            &json!([{"id": "/tokio-rs/axum", "versions": ["axum_v0_8_4"]}]),
+        );
+        let ran = Tool::FindDocs
+            .execute(&ctx, &json!({"library": "axum", "query": "x", "version": "9.9"}))
+            .await
+            .unwrap();
+        assert!(error(&ran).contains("axum_v0_8_4"), "the error says what there is");
+    }
+
+    /// The declaration caps what one call may ask for; the cache key carries
+    /// the number that was actually spent.
+    #[tokio::test]
+    async fn find_docs_clamps_max_tokens_under_the_declaration() {
+        let app = mock_app("[server]", "find_docs_tokens");
+        crate::docs::cache_put(
+            &app.state,
+            &crate::docs::search_key("axum"),
+            &json!([{"id": "/tokio-rs/axum"}]),
+        );
+        crate::docs::cache_put(
+            &app.state,
+            &crate::docs::docs_key("/tokio-rs/axum", "extractors", 1000),
+            &json!("snippets"),
+        );
+
+        let ctx = ToolCtx { params: json!({"max_tokens": 1000}), ..ToolCtx::new(&app, "call_1") };
+        let ran = Tool::FindDocs
+            .execute(&ctx, &json!({"library": "axum", "query": "extractors", "max_tokens": 9000}))
+            .await
+            .unwrap();
+        assert!(ran.model_output.contains("snippets"), "9000 capped to 1000: {}", ran.model_output);
     }
 
     #[test]
