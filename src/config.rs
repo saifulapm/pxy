@@ -570,6 +570,14 @@ impl Config {
             if self.providers.contains_key(alias) {
                 anyhow::bail!("alias '{alias}' collides with the provider of the same name");
             }
+            // resolve maps aliases before the bare-id fallback, so a name
+            // equal to a declared model id (or to the `auto` prefix of the
+            // virtual ids) would silently shadow it.
+            if alias == "auto"
+                || self.providers.values().any(|p| p.models.iter().any(|m| m.spec().id == *alias))
+            {
+                anyhow::bail!("alias '{alias}' collides with the model id of the same name");
+            }
             // One level deep: an alias naming an alias is a cycle waiting to
             // happen, and resolution would have to guard against it forever.
             if self.aliases.contains_key(target) {
@@ -1018,6 +1026,8 @@ mod tests {
             ("name is a group", "daily = \"p/m\"", "alias 'daily' collides with the group"),
             ("name is a provider", "p = \"daily\"", "alias 'p' collides with the provider"),
             ("name has a slash", "\"a/b\" = \"daily\"", "alias 'a/b': an alias name must not"),
+            ("name is a bare model id", "m = \"daily\"", "alias 'm' collides with the model id"),
+            ("name is auto", "auto = \"daily\"", "alias 'auto' collides with the model id"),
             (
                 "unknown target",
                 "chat = \"nope\"",

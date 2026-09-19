@@ -22,7 +22,19 @@ fn state() -> Result<State> {
 // pxy explain <model>
 // ---------------------------------------------------------------------------
 
+use std::io::Write;
+
+macro_rules! out {
+    ($out:expr, $($arg:tt)*) => {{
+        let _ = writeln!($out, $($arg)*);
+    }};
+}
+
 pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
+    // `explain X | head` closes stdout early; a failed write ends the report
+    // quietly instead of panicking the way println! does.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
     let catalog = Catalog::from_config(cfg);
     // Persisted cooldowns rehydrate at open; rpm windows are daemon-memory
     // only and reported as unknown.
@@ -50,17 +62,17 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
     // chain, the pin, the policy — is the target's.
     if !json {
         if let Some(target) = catalog.alias_target(requested) {
-            println!("'{requested}' is an alias of '{target}'.");
+            out!(out, "'{requested}' is an alias of '{target}'.");
         }
     }
     if candidates.is_empty() {
         if json {
-            println!(
+            out!(out, 
                 "{}",
                 serde_json::json!({"requested": requested, "routePin": pin, "routePinActive": false, "candidates": []})
             );
         } else {
-            println!("'{requested}' resolves to nothing (not in any provider's model list).");
+            out!(out, "'{requested}' resolves to nothing (not in any provider's model list).");
         }
         return Ok(());
     }
@@ -70,15 +82,15 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
     let mut records: Vec<serde_json::Value> = Vec::new();
     if !json {
         match (&pin, pin_active) {
-            (Some(p), true) => println!(
+            (Some(p), true) => out!(out, 
                 "'{requested}' -> {} candidate(s) (pin '{p}' first), walked in order:\n",
                 candidates.len()
             ),
-            (Some(p), false) => println!(
+            (Some(p), false) => out!(out, 
                 "'{requested}' -> {} candidate(s); pin '{p}' is STALE (not in the catalog), walked in chain order:\n",
                 candidates.len()
             ),
-            _ => println!("'{requested}' -> {} candidate(s), walked in order:\n", candidates.len()),
+            _ => out!(out, "'{requested}' -> {} candidate(s), walked in order:\n", candidates.len()),
         }
     }
     for (i, cand) in candidates.iter().enumerate() {
@@ -165,16 +177,16 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
             .as_ref()
             .map(|a| format!("  [account {a}]"))
             .unwrap_or_default();
-        println!("{:>2}. {}{acct}  [{verdict}]{pin_mark}", i + 1, cand.full_id());
+        out!(out, "{:>2}. {}{acct}  [{verdict}]{pin_mark}", i + 1, cand.full_id());
         for s in &skips {
-            println!("      ✗ {s}");
+            out!(out, "      ✗ {s}");
         }
         for n in &notes {
-            println!("      · {n}");
+            out!(out, "      · {n}");
         }
     }
     if json {
-        println!(
+        out!(out, 
             "{}",
             serde_json::json!({"requested": requested, "routePin": pin, "routePinActive": pin_active, "candidates": records})
         );
