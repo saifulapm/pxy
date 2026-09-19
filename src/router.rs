@@ -763,6 +763,10 @@ async fn handle_chat_inner(
     let mut server_tool_skips = false;
     // Newest real upstream error of the walk (status, body, candidate).
     let mut last_raw: Option<RawError> = None;
+    // Newest refusal of the walk, and how many of `skipped` are refusals: an
+    // all-refused walk answers with the last one instead of a synthetic 429.
+    let mut last_refusal: Option<Outcome> = None;
+    let mut refusals = 0usize;
 
     // Free-first chains: fall onto a paid step only when every prior failure
     // was quota exhaustion (opt-in per group). "Paid" = the model is not
@@ -776,6 +780,7 @@ async fn handle_chat_inner(
 
     for attempt in 0..=MAX_RETRIES {
         skipped.clear();
+        refusals = 0;
         let mut saw_rpm_limit = false;
         for cand in &candidates {
             if fallback_only_quota && cand.model.free != Some(true) && !quota_only {
@@ -867,6 +872,20 @@ async fn handle_chat_inner(
                     *c = (*c).max(cand.model.context_length);
                     skipped.push(format!("{}: {reason}", cand.full_id()));
                 }
+                AttemptResult::Refused(outcome) => {
+                    // No cooldown and no `model_result`: the classifier
+                    // judged the prompt, not the model. But a refusal is a
+                    // real answer from a real attempt, so the deterministic
+                    // 400s below must not claim context size or server tools
+                    // were the sole obstacle, and a free-first chain holds
+                    // its paid reserve (a refusal is not quota exhaustion).
+                    warn!(candidate = %cand.full_id(), "failover (refusal)");
+                    other_failures = true;
+                    quota_only = false;
+                    refusals += 1;
+                    last_refusal = Some(outcome);
+                    skipped.push(format!("{}: refused", cand.full_id()));
+                }
                 AttemptResult::Fatal(outcome) => return outcome,
             }
         }
@@ -918,6 +937,15 @@ async fn handle_chat_inner(
                 skipped.join("; ")
             ),
         );
+    }
+    // Every attempted candidate refused and nothing else went wrong. The
+    // refusal is a real, billed answer to this prompt: hand the client the
+    // last one as it stood. A synthetic 429 would tell it to back off and
+    // retry a prompt no model in the chain will answer.
+    if refusals == skipped.len()
+        && let Some(outcome) = last_refusal
+    {
+        return outcome;
     }
     // The retries are spent and every candidate failed. On a single-candidate
     // request the upstream's own error IS the story — the client asked for
@@ -1350,6 +1378,13 @@ enum AttemptResult {
     /// window (our estimate under-counted): skip it and every candidate
     /// with the same or smaller window, no cooldown.
     SkipContextWindow(String),
+    /// A safety classifier refused, which upstreams report as a successful
+    /// 200. The chain behind it is worth spending, so walk on — but this is
+    /// a content outcome, not model health: no cooldown, no failure-rate
+    /// mark, because the same model answers other prompts fine. The answer
+    /// is carried so a walk that refused all the way through can hand the
+    /// client the last one instead of a synthetic 429.
+    Refused(Outcome),
     /// Fatal for the whole request: return this to the client.
     Fatal(Outcome),
 }
@@ -1939,6 +1974,10 @@ async fn try_candidate_inner(
             crate::translate::tool_text::extract_from_response(&mut upstream_body, names);
         }
         cap.add("upstream-response", &upstream_body);
+        // Read before translation: the refusal marker is the upstream's own
+        // vocabulary, and the client dialect may not have one. A single
+        // candidate has nowhere to walk to, so it is left untouched.
+        let refused = multi && upstream_refused(&upstream_body, upstream_format);
         let usage = match upstream_format {
             WireFormat::Openai | WireFormat::Responses => {
                 TokenUsage::from_openai(&upstream_body["usage"])
@@ -1961,12 +2000,27 @@ async fn try_candidate_inner(
             }
             (_, WireFormat::Responses) => unreachable!("responses wire is folded into openai"),
         };
-        AttemptResult::Done(Outcome::Json {
+        let outcome = Outcome::Json {
             status: 200,
             body: client_body,
             provider: Some(cand.full_id()),
             headers: fwd_headers,
-        })
+        };
+        if refused { AttemptResult::Refused(outcome) } else { AttemptResult::Done(outcome) }
+    }
+}
+
+/// True when this 200 is a safety-classifier refusal. Anthropic says so in
+/// `stop_reason` (the accompanying `stop_details` is informational only);
+/// OpenAI-format upstreams, including the Responses wire once it is folded
+/// into chat shape, say so in `finish_reason`. Nothing else counts: a
+/// refusal is a specific upstream verdict, not "the answer looked short".
+fn upstream_refused(body: &Value, upstream: WireFormat) -> bool {
+    match upstream {
+        WireFormat::Anthropic => body["stop_reason"] == "refusal",
+        WireFormat::Openai | WireFormat::Responses => {
+            body["choices"][0]["finish_reason"] == "content_filter"
+        }
     }
 }
 
@@ -10071,6 +10125,177 @@ mod tests {
             }
             Outcome::Stream { .. } => panic!("expected json"),
         }
+    }
+
+    /// A safety refusal is a 200, not an error, and today it ended the walk
+    /// with the chain behind it unspent. It is a content outcome, not model
+    /// health: walk on, no cooldown, no failure-rate mark.
+    #[tokio::test]
+    async fn refusal_json_walks_on() {
+        use axum::routing::post;
+        // `safe` is an Anthropic upstream refusing before any output;
+        // `open` answers normally.
+        let router = axum::Router::new()
+            .route("/safe", post(|| async {
+                axum::Json(json!({
+                    "id": "m1", "type": "message", "role": "assistant", "model": "m",
+                    "content": [],
+                    "stop_reason": "refusal",
+                    "stop_details": {"type": "refusal"},
+                    "usage": {"input_tokens": 5, "output_tokens": 0},
+                }))
+            }))
+            .route("/open", post(|| async {
+                axum::Json(json!({
+                    "id": "x",
+                    "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "answered"},
+                        "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }))
+            }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.safe]
+                base_url = "{base}/safe"
+                format = "anthropic"
+                models = ["m"]
+                [providers.open]
+                base_url = "{base}/open"
+                models = ["m"]
+                [groups.free]
+                models = ["safe/m", "open/m"]
+                "#
+            ),
+            "refusal_walk",
+        );
+
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { status, body, provider, headers } => {
+                assert_eq!(status, 200, "must fail over past the refusal: {body}");
+                assert_eq!(provider.as_deref(), Some("open/m"));
+                assert_eq!(body["choices"][0]["message"]["content"], "answered");
+                let skipped = headers.iter().find(|(k, _)| k == "x-pxy-skipped").map(|(_, v)| v);
+                assert_eq!(skipped.map(String::as_str), Some("safe/m: refused"));
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        // The same model answers other prompts fine: no cooldown…
+        assert!(app.state.cooldown("safe", "m").is_none());
+        // …and no failure-rate mark. Four real failures are four attempts;
+        // had the refusal been counted this would be the fifth and trip.
+        for _ in 0..4 {
+            app.state.model_result("safe", "m", false);
+        }
+        assert!(!app.state.model_unhealthy("safe", "m"), "a refusal must not count as a failure");
+    }
+
+    /// Every candidate refused and nothing else failed: the client gets the
+    /// last refusal as it stood, not a synthetic 429 it would back off from.
+    #[tokio::test]
+    async fn refusal_only_walk_returns_last_refusal() {
+        use axum::routing::post;
+        let refusal = |who: &'static str| {
+            move || async move {
+                axum::Json(json!({
+                    "id": "x",
+                    "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": who},
+                        "finish_reason": "content_filter"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }))
+            }
+        };
+        let router = axum::Router::new()
+            .route("/a", post(refusal("a refused")))
+            .route("/b", post(refusal("b refused")));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m"]
+                [providers.b]
+                base_url = "{base}/b"
+                models = ["m"]
+                [groups.free]
+                models = ["a/m", "b/m"]
+                "#
+            ),
+            "refusal_only",
+        );
+
+        let payload = json!({"model": "free", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { status, body, provider, .. } => {
+                assert_eq!(status, 200, "an all-refused walk is not a 429: {body}");
+                assert_eq!(provider.as_deref(), Some("b/m"), "the LAST refusal answers");
+                assert_eq!(body["choices"][0]["finish_reason"], "content_filter");
+                assert_eq!(body["choices"][0]["message"]["content"], "b refused");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert!(app.state.cooldown("a", "m").is_none());
+        assert!(app.state.cooldown("b", "m").is_none());
+    }
+
+    /// One candidate has nowhere to walk to: the refusal is the answer, and
+    /// the upstream is called exactly once.
+    #[tokio::test]
+    async fn refusal_single_candidate_passes_through() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use axum::routing::post;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let router = axum::Router::new().route("/a", post(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "id": "x",
+                    "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "cannot help"},
+                        "finish_reason": "content_filter"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }))
+            }
+        }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                models = ["m"]
+                "#
+            ),
+            "refusal_single",
+        );
+
+        let payload = json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { status, body, provider, .. } => {
+                assert_eq!(status, 200);
+                assert_eq!(provider.as_deref(), Some("a/m"));
+                assert_eq!(body["choices"][0]["finish_reason"], "content_filter");
+                assert_eq!(body["choices"][0]["message"]["content"], "cannot help");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a single candidate is never re-attempted");
     }
 
     #[tokio::test]
