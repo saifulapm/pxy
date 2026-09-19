@@ -55,9 +55,37 @@ pub fn estimate_tokens(value: &serde_json::Value) -> u64 {
     (ascii / 4 + wide) as u64
 }
 
+/// What one image costs in the estimate, whatever its byte size. Providers
+/// bill an image by its pixels, not its base64 (Anthropic: width x height /
+/// 750, at most ~1,600 for a 1568px edge; OpenAI's high detail tops out
+/// near 1,100), while base64 is 4 chars per 3 bytes: a 25 KB page scan
+/// read as text came to ~35k tokens and was skipped as too large for a
+/// 32k-window OCR model (2026-09-19). The top of the real range is used, in
+/// the over-count direction the doc above prefers.
+const IMAGE_TOKENS: usize = 1_600;
+
+/// An image or file part in any dialect pxy takes: OpenAI `image_url`,
+/// Anthropic `image` (and `document`, a PDF the file-parser has not yet
+/// replaced), Responses `input_image` / `input_file`, and the chat `file`
+/// part.
+fn is_binary_part(o: &serde_json::Map<String, serde_json::Value>) -> bool {
+    matches!(
+        o.get("type").and_then(|t| t.as_str()),
+        Some("image_url" | "image" | "input_image" | "input_file" | "file" | "document")
+    )
+}
+
+fn is_data_url(s: &str) -> bool {
+    s.starts_with("data:") && s.contains(";base64,")
+}
+
 fn count_chars(v: &serde_json::Value, ascii: &mut usize, wide: &mut usize) {
     match v {
         serde_json::Value::String(s) => {
+            if is_data_url(s) {
+                *ascii += IMAGE_TOKENS * 4;
+                return;
+            }
             for c in s.chars() {
                 if c.is_ascii() {
                     *ascii += 1;
@@ -67,6 +95,7 @@ fn count_chars(v: &serde_json::Value, ascii: &mut usize, wide: &mut usize) {
             }
         }
         serde_json::Value::Array(a) => a.iter().for_each(|x| count_chars(x, ascii, wide)),
+        serde_json::Value::Object(o) if is_binary_part(o) => *ascii += IMAGE_TOKENS * 4,
         serde_json::Value::Object(o) => o.values().for_each(|x| count_chars(x, ascii, wide)),
         _ => *ascii += 4,
     }
@@ -475,4 +504,24 @@ mod usage_tests {
         let mixed = estimate_tokens(&json!({"content": format!("{}{}", "a".repeat(400), cjk)}));
         assert!(mixed >= 500, "mixed must be >= 100 + 400, got {mixed}");
     }
+
+    #[test]
+    fn estimate_counts_an_image_flat_not_by_its_base64() {
+        let b64 = "A".repeat(40_000);
+        let openai = serde_json::json!([{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{b64}")}},
+            {"type":"text","text":"what is this"}]}]);
+        let est = estimate_tokens(&openai);
+        assert!(est < 2_000, "one image must cost ~1,600, got {est}");
+        let anthropic = serde_json::json!([{"role":"user","content":[
+            {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":b64}}]}]);
+        assert!(estimate_tokens(&anthropic) < 2_000);
+        // A bare data URL outside a typed part (a chat `file` part's
+        // file_data) is an image too.
+        let file = serde_json::json!({"file_data": format!("data:application/pdf;base64,{b64}")});
+        assert!(estimate_tokens(&file) < 2_000);
+        // Text is still text.
+        assert_eq!(estimate_tokens(&serde_json::json!("abcdefgh")), 2);
+    }
+
 }
