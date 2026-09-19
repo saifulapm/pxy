@@ -8,6 +8,7 @@ pub mod audio;
 pub mod cli;
 pub mod dashscope;
 pub mod images;
+pub mod pdf;
 pub mod rerank;
 pub mod search;
 pub mod video;

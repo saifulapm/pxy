@@ -1311,8 +1311,9 @@ async fn run_advisor(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
 /// What a `describe` call asks the vision model when the caller says nothing.
 const DESCRIBE_PROMPT: &str = "Describe this image in detail, transcribing all visible text.";
 
-/// The same for `ocr`, whose job is the document rather than the picture.
-const OCR_PROMPT: &str = "Transcribe this document into clean Markdown in natural reading order.";
+/// The same for `ocr`, whose job is the document rather than the picture. The
+/// file-parser plugin reads a scanned PDF page with the same words.
+pub(crate) const OCR_PROMPT: &str = "Transcribe this document into clean Markdown in natural reading order.";
 
 /// Run one describe_image call: a model that cannot see an image asks one that
 /// can. `image` is the number of an `[image N]` placeholder — the URLs swapped
