@@ -77,7 +77,7 @@ Chat in both dialects, streaming included, at `POST /v1/chat/completions` and
 
 Non-chat work runs through `pxy search`, `fetch`, `transcribe`, `say`, `image`
 and `video`, or the matching `/v1/...` endpoints. `POST /v1/systemone` is one
-more: Typesafe's Jev answers typed questions about a state with calibrated
+more. Typesafe's Jev answers typed questions about a state with calibrated
 probabilities, reached through whichever gateway in the `[media] systemone`
 chain is up. Media usage is counted on its own, so it never eats a chat budget.
 
@@ -85,10 +85,11 @@ Server tools work on models that never learned them. A client declares one
 by its type (`pxy:web_search`, or OpenRouter's `openrouter:web_search`), pxy
 offers the model a plain function, runs the call itself, and feeds the result
 back into the same streamed turn. Claude Code gets the `server_tool_use`
-blocks it expects. Twelve tools are served: web_search, web_fetch, datetime,
+blocks it expects. Thirteen tools are served: web_search, web_fetch, datetime,
 search_models, image_generation, advisor, subagent, fusion, tool_search,
-describe_image, memory and find_docs. Each takes the parameters OpenRouter
-documents for it, bar the last three, which are pxy's own and take pxy's. A client with more tools
+describe_image, memory, find_docs and verify. Each takes the parameters
+OpenRouter documents for it, bar the last four, which are pxy's own and take
+pxy's. A client with more tools
 than one turn can afford marks the spare ones `defer_loading` and declares
 tool_search: pxy keeps them out of the upstream body, and the model gets back
 the ones it asks for by searching. A model that cannot take an image at all is
@@ -101,8 +102,15 @@ memory tool uses; each agent gets its own store unless the config points two
 at one. find_docs is how a model stops guessing at an API it half remembers:
 it names a library and a topic, and pxy fetches that topic's snippets from
 Context7, whose free tier needs no account at all. Both halves of the lookup
-are cached for a week, so asking again inside it costs nothing. The
-`[server_tools]` table in
+are cached for a week, so asking again inside it costs nothing. verify is the
+last one. The model hands it a claim and the passage it read that claim from,
+and Typesafe's Jev answers supported, contradicted or unsupported with a
+calibrated probability. An answer Jev is not sure enough about comes back as
+uncertain instead, because it is right between 68% and 91% of the time and a
+verdict is there to be weighed, not obeyed. Turn on `rerank_web_search` and
+Jev scores search hits too, so the model reads the five that answer the query
+rather than the five the search engine ranked first. The `[server_tools]`
+table in
 `config.toml` decides which are served, how many tool-call steps one turn
 may take, and, through `[server_tools.defaults.<tool>]`, which ride every
 client turn without the harness declaring them.

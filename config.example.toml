@@ -118,6 +118,27 @@ max_tool_calls = 10
 # [server_tools.defaults.find_docs]
 # max_tokens = 4000
 
+# verify checks one claim against one passage with Typesafe's Jev, which
+# answers supported, contradicted or unsupported with a calibrated
+# probability. It needs the `[media] systemone` chain below and nothing else;
+# without one the tool is simply not offered. A confidence under
+# `abstain_below` is reported as "uncertain" rather than passed off as a
+# verdict: Jev is right between 68% and 91% of the time, so a verdict is
+# evidence for the model to weigh, never a gate.
+# [server_tools.defaults.verify]
+# abstain_below = 0.5
+
+# What else Jev is used for once that chain exists. Re-ranking scores every
+# web_search hit against the query and keeps the best, which costs one extra
+# Jev call (70-500 ms) per search, so it is off until you ask for it. With it
+# on, the search provider is asked for max(3 x max_results, 10) hits, at most
+# 25, and hits scoring under `rerank_min` are dropped before the rest are
+# sorted and cut back. A Jev that is down leaves the provider's own order
+# alone.
+[server_tools.jev]
+rerank_web_search = false
+rerank_min = 0.3
+
 # Context7 answers without an account, so find_docs needs nothing here. A key
 # (context7.com, free tier 1,000 calls a month) only raises the per-IP cap;
 # pxy sends it as a bearer token when it resolves, and answers anonymously

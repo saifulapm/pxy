@@ -1019,6 +1019,36 @@ mod tests {
         assert!(err.contains("api_ky"), "typo must not be silent: {err}");
     }
 
+    /// The example config is where a real one is copied from, so Jev's two
+    /// halves have to be in it and have to parse: the chain `verify` needs to
+    /// be servable at all, and the table that turns re-ranking on.
+    #[test]
+    fn the_example_config_carries_jevs_chain_and_its_table() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+                .unwrap();
+        let cfg: Config = toml::from_str(&src).unwrap();
+        cfg.validate().unwrap();
+
+        let chain = cfg.media.systemone.as_ref().expect("a [media] systemone chain");
+        assert_eq!(chain.as_slice().len(), 3, "all three gateways, so one being down is survivable");
+        for id in chain.as_slice() {
+            let (provider, model) = id.split_once('/').expect("provider/model");
+            let media = cfg.providers[provider]
+                .media
+                .as_ref()
+                .unwrap_or_else(|| panic!("{provider} has no media block"));
+            assert!(media.systemone_url.is_some(), "{provider} has no systemone_url");
+            assert!(
+                media.systemone_models.iter().any(|m| m == model),
+                "{id} is not in {provider}'s systemone_models"
+            );
+        }
+        assert!(!cfg.server_tools.jev.rerank_web_search, "the example must not spend a call by default");
+        assert!(src.contains("[server_tools.jev]"), "the table is named, not just defaulted");
+        assert!(src.contains("abstain_below"), "verify's one parameter is shown");
+    }
+
     /// `[server_tools.jev]` is what Jev does beyond the `verify` tool.
     /// Re-ranking costs an extra call per search, so it is opt-in.
     #[test]
