@@ -17,7 +17,7 @@ use crate::media::pdf;
 use crate::secrets::Secrets;
 use crate::state::State;
 use crate::translate::server_tools;
-use crate::translate::sse::SseParser;
+use crate::translate::sse::{SseEvent, SseParser};
 use crate::translate::tool_search;
 use crate::translate::think::ThinkFilter;
 use crate::translate::tool_text::ToolTextFilter;
@@ -2566,6 +2566,52 @@ struct StreamCtx {
     /// client and corrupt a non-streaming re-assembly. Nothing follows a
     /// closed turn.
     terminated: bool,
+    /// Same-delta counter: a model stuck emitting one chunk forever is cut
+    /// off before it spends the whole window.
+    repeat: RepeatGuard,
+}
+
+/// litellm's rule (streaming_handler.raise_on_model_repetition, default 100):
+/// this many consecutive identical content deltas of more than two characters
+/// is a loop, not an answer. Short deltas ("\n", ".") repeat legitimately.
+const REPEATED_CHUNK_LIMIT: u32 = 100;
+
+#[derive(Default)]
+struct RepeatGuard {
+    last: Option<String>,
+    count: u32,
+}
+
+impl RepeatGuard {
+    /// Feed one batch of upstream events; true when the limit is reached.
+    /// Reads the content delta in the upstream's own dialect: an OpenAI
+    /// `choices[0].delta.content` or an Anthropic `content_block_delta` text.
+    fn feed(&mut self, events: &[SseEvent], anthropic_upstream: bool) -> bool {
+        for ev in events {
+            let Ok(v) = serde_json::from_str::<Value>(&ev.data) else { continue };
+            let content = if anthropic_upstream {
+                (v["type"] == "content_block_delta").then(|| v["delta"]["text"].as_str()).flatten()
+            } else {
+                v["choices"][0]["delta"]["content"].as_str()
+            };
+            let Some(content) = content else { continue };
+            if content.chars().count() <= 2 {
+                self.last = None;
+                self.count = 0;
+                continue;
+            }
+            if self.last.as_deref() == Some(content) {
+                self.count += 1;
+            } else {
+                self.last = Some(content.to_string());
+                self.count = 1;
+            }
+            if self.count >= REPEATED_CHUNK_LIMIT {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Accumulates the model's calls to a reserved `pxy_*` server function while
@@ -3389,9 +3435,25 @@ impl StreamCtx {
         if self.terminated {
             return Bytes::new();
         }
-        let Self { parser, kind, think, tooltext, usage, search, client_done, terminated, .. } =
-            self;
-        let events = parser.feed(bytes);
+        let events = self.parser.feed(bytes);
+        let anthropic_upstream =
+            matches!(self.kind, StreamKind::AnthropicPass | StreamKind::ToOpenai(_));
+        // A looping model is ended like a stalled one: the turn the client
+        // has so far is terminated cleanly, and the model sits out a while
+        // so the next request does not pay to rediscover it.
+        if self.repeat.feed(&events, anthropic_upstream) {
+            warn!(provider = %self.provider, model = %self.model, "upstream repeating one chunk; cut");
+            self.app.state.set_cooldown(
+                &self.state_provider,
+                Some(&self.model),
+                None,
+                true,
+                "repeating output",
+            );
+            self.done = true;
+            return self.finish();
+        }
+        let Self { kind, think, tooltext, usage, search, client_done, terminated, .. } = self;
         match kind {
             StreamKind::OpenaiPass => {
                 for ev in &events {
@@ -3874,6 +3936,7 @@ async fn stream_outcome(
         responses_client,
         client_done: false,
         terminated: false,
+        repeat: RepeatGuard::default(),
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
@@ -5313,6 +5376,41 @@ mod tests {
             http: reqwest::Client::new(),
             cfg,
         })
+    }
+
+    #[test]
+    fn repeat_guard_trips_on_the_hundredth_identical_delta() {
+        let ev = |data: &str| SseEvent { event: None, data: data.to_string() };
+        let openai = |s: &str| ev(&json!({"choices":[{"delta":{"content":s}}]}).to_string());
+        let mut g = RepeatGuard::default();
+        for _ in 0..99 {
+            assert!(!g.feed(&[openai("the same")], false));
+        }
+        assert!(g.feed(&[openai("the same")], false));
+
+        // A different delta resets the count.
+        let mut g = RepeatGuard::default();
+        for _ in 0..99 {
+            g.feed(&[openai("the same")], false);
+        }
+        assert!(!g.feed(&[openai("other")], false));
+        assert!(!g.feed(&[openai("the same")], false));
+
+        // Short deltas repeat legitimately and never count.
+        let mut g = RepeatGuard::default();
+        for _ in 0..200 {
+            assert!(!g.feed(&[openai("\n")], false));
+        }
+
+        // Anthropic reads content_block_delta text.
+        let anth = |s: &str| {
+            ev(&json!({"type":"content_block_delta","delta":{"type":"text_delta","text":s}}).to_string())
+        };
+        let mut g = RepeatGuard::default();
+        for _ in 0..99 {
+            assert!(!g.feed(&[anth("again")], true));
+        }
+        assert!(g.feed(&[anth("again")], true));
     }
 
     #[test]
