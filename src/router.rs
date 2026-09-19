@@ -411,7 +411,78 @@ pub fn handle_chat(
     payload: Value,
     ctx: ClientContext,
 ) -> futures_util::future::BoxFuture<'static, Outcome> {
-    Box::pin(handle_chat_inner(app, client_format, payload, ctx))
+    Box::pin(async move {
+        // Read the gate before the payload is moved; apply the repair after
+        // the whole walk (and any served-tool loop) has settled on an answer,
+        // which is also before the Responses route rewrites it.
+        let heal = should_heal(&app.cfg, client_format, &payload);
+        let mut outcome = handle_chat_inner(app, client_format, payload, ctx).await;
+        if heal {
+            heal_json_outcome(&mut outcome);
+        }
+        outcome
+    })
+}
+
+/// Plugin ids pxy implements. OpenRouter's vocabulary is larger; an id that is
+/// not here is ignored with a log, because a client that names one still wants
+/// its answer, not a 400.
+const KNOWN_PLUGINS: [&str; 1] = [RESPONSE_HEALING];
+const RESPONSE_HEALING: &str = "response-healing";
+
+/// The plugin ids a request turned on, from OpenRouter's `plugins` key. An
+/// entry pxy cannot read an id off is skipped.
+pub fn request_plugins(payload: &Value) -> Vec<String> {
+    let Some(entries) = payload["plugins"].as_array() else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let Some(id) = entry["id"].as_str() else { continue };
+        if !KNOWN_PLUGINS.contains(&id) {
+            debug!(id, "plugin not implemented, ignored");
+        }
+        ids.push(id.to_string());
+    }
+    ids
+}
+
+/// Whether this turn's answer gets `response-healing`.
+///
+/// Narrow on purpose: healing rewrites what the model said, so it needs the
+/// client to have declared JSON mode (which is the client promising itself it
+/// will parse the content) and an answer that exists as one value. A stream is
+/// handed to the client chunk by chunk with nothing to rewrite, and an
+/// Anthropic Messages client has no `response_format` to declare in the first
+/// place.
+fn should_heal(cfg: &Config, client_format: ClientFormat, payload: &Value) -> bool {
+    let asked = request_plugins(payload).iter().any(|id| id == RESPONSE_HEALING);
+    if client_format != ClientFormat::Openai || payload["stream"] == json!(true) {
+        return false;
+    }
+    let json_mode = matches!(
+        payload["response_format"]["type"].as_str(),
+        Some("json_object" | "json_schema")
+    );
+    json_mode && (asked || cfg.plugins.response_healing)
+}
+
+/// Replace the assistant's content with its repair, when there is one. A body
+/// no closer set rescues is left exactly as the upstream sent it.
+fn heal_json_outcome(outcome: &mut Outcome) {
+    let Outcome::Json { status: 200, body, .. } = outcome else {
+        return;
+    };
+    // Read through an immutable index: `IndexMut` would materialize a
+    // `choices` array on a response that has none.
+    let Some(healed) = body["choices"][0]["message"]["content"]
+        .as_str()
+        .and_then(crate::translate::heal::heal_json)
+    else {
+        return;
+    };
+    debug!("response-healing repaired the JSON answer");
+    body["choices"][0]["message"]["content"] = json!(healed);
 }
 
 async fn handle_chat_inner(
@@ -1178,10 +1249,14 @@ async fn try_candidate_inner(
         }
     }
     body["model"] = json!(cand.model.id);
-    // pxy consumes `max_tool_calls` itself (the loop's turn budget); it is not
-    // a Chat Completions field, so it must not reach an upstream that would
-    // reject the unknown key.
-    body.as_object_mut().map(|o| o.remove("max_tool_calls"));
+    // pxy consumes `max_tool_calls` itself (the loop's turn budget) and
+    // `plugins` (wiki:plugins) the same way; neither is a Chat Completions
+    // field, so neither may reach an upstream that would reject the unknown
+    // key.
+    if let Some(o) = body.as_object_mut() {
+        o.remove("max_tool_calls");
+        o.remove("plugins");
+    }
 
     // OpenAI's newest dialect differs from the compatible-provider majority in
     // two request-body spellings, and the clients pxy fronts speak the newest
@@ -9597,7 +9672,8 @@ mod tests {
         );
 
         let payload = json!({"model": "g/m", "reasoning_effort": "high", "top_k": 40,
-            "temperature": 0.5, "messages": [{"role": "user", "content": "hi"}]});
+            "temperature": 0.5, "plugins": [{"id": "response-healing"}],
+            "messages": [{"role": "user", "content": "hi"}]});
         let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
         match out {
             Outcome::Json { status, body, .. } => assert_eq!(status, 200, "got {body}"),
@@ -9607,6 +9683,121 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none(), "provider-level drop must strip");
         assert!(body.get("top_k").is_none(), "model-level drop must strip");
         assert_eq!(body["temperature"], 0.5, "unlisted params must survive");
+        // `plugins` is pxy's own key, consumed here: an upstream that validates
+        // its request body 400s on it.
+        assert!(body.get("plugins").is_none(), "plugins must never reach the wire");
+    }
+
+    /// Fenced JSON is the commonest thing a model returns to a JSON-mode
+    /// request, and a client running `JSON.parse` on it fails. Both OpenAI
+    /// dialects must get the bare value back.
+    #[tokio::test]
+    async fn response_healing_unfences_a_json_answer_for_chat_and_responses() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/c",
+            post(|| async {
+                axum::Json(json!({
+                    "id": "x",
+                    "choices": [{"index": 0,
+                        "message": {"role": "assistant",
+                            "content": "```json\n{\"ok\": true}\n```"},
+                        "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }))
+            }),
+        );
+        let base = mock_server(router).await;
+        let plain = format!(
+            r#"
+            [server]
+            [providers.g]
+            base_url = "{base}/c"
+            models = ["m"]
+            "#
+        );
+        let app = test_app(&plain, "healing_request");
+
+        // A Chat Completions client, healing asked for by request plugin.
+        let payload = json!({"model": "g/m",
+            "response_format": {"type": "json_object"},
+            "plugins": [{"id": "response-healing"}],
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Json { body, .. } = out else { panic!("expected json") };
+        assert_eq!(body["choices"][0]["message"]["content"], "{\"ok\": true}");
+
+        // A Responses client, the same way: the route translates the request,
+        // routes it, then rewrites the outcome — the heal must already have
+        // happened by the time that rewrite reads `content`.
+        let rp = json!({"model": "g/m",
+            "text": {"format": {"type": "json_object"}},
+            "plugins": [{"id": "response-healing"}],
+            "input": [{"role": "user", "content": "hi"}]});
+        let chat_payload = crate::translate::responses::request(&rp);
+        let out =
+            handle_chat(app, ClientFormat::Openai, chat_payload, ClientContext::default()).await;
+        let Outcome::Json { body, .. } = out else { panic!("expected json") };
+        let rewritten = crate::translate::responses::response(&body, "g/m");
+        assert_eq!(rewritten["output"][0]["content"][0]["text"], "{\"ok\": true}");
+
+        // And the config flag reaches a client that asked for nothing.
+        let app = test_app(
+            &format!("{plain}\n[plugins]\nresponse_healing = true\n"),
+            "healing_config",
+        );
+        let payload = json!({"model": "g/m",
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Json { body, .. } = out else { panic!("expected json") };
+        assert_eq!(body["choices"][0]["message"]["content"], "{\"ok\": true}");
+    }
+
+    /// Healing rewrites what the model said, so the gate is narrow on purpose:
+    /// the client must have asked for JSON, and a stream has no assembled
+    /// content to rewrite.
+    #[test]
+    fn response_healing_applies_only_to_a_non_streaming_json_mode_openai_turn() {
+        let off: Config = toml::from_str("[server]\n").unwrap();
+        let on: Config = toml::from_str("[server]\n[plugins]\nresponse_healing = true\n").unwrap();
+        let json_mode = json!({"response_format": {"type": "json_object"}});
+
+        assert!(should_heal(&on, ClientFormat::Openai, &json_mode), "config flag");
+        assert!(
+            should_heal(&off, ClientFormat::Openai, &json!({
+                "response_format": {"type": "json_schema"},
+                "plugins": [{"id": "response-healing"}]})),
+            "request plugin, json_schema"
+        );
+
+        assert!(!should_heal(&off, ClientFormat::Openai, &json_mode), "nobody asked");
+        assert!(
+            !should_heal(&on, ClientFormat::Anthropic, &json_mode),
+            "an Anthropic client is never healed"
+        );
+        assert!(
+            !should_heal(&on, ClientFormat::Openai, &json!({"messages": []})),
+            "no response_format: the client never promised itself JSON"
+        );
+        assert!(
+            !should_heal(&on, ClientFormat::Openai, &json!({"stream": true,
+                "response_format": {"type": "json_object"}})),
+            "a stream is not healed"
+        );
+        assert!(
+            !should_heal(&off, ClientFormat::Openai, &json!({
+                "response_format": {"type": "json_object"},
+                "plugins": [{"id": "web-search"}]})),
+            "an unknown id is ignored, not read as consent"
+        );
+        assert_eq!(
+            request_plugins(&json!({"plugins": [{"id": "a"}, {"nope": 1}, {"id": "b"}]})),
+            ["a", "b"],
+            "an entry with no id is skipped, never a 400"
+        );
+        assert!(request_plugins(&json!({"messages": []})).is_empty());
     }
 
     /// pi's openai-completions client sends OpenAI's newest dialect for a

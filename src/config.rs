@@ -91,6 +91,24 @@ pub struct Config {
     /// implemented tool is enabled, with a ten-step budget.
     #[serde(default)]
     pub server_tools: ServerToolsConfig,
+    /// Request-time transforms (`[plugins]`). Absent means none are on for
+    /// every request; a client can still ask for one per request.
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+}
+
+/// Request-time transforms in OpenRouter's `plugins` vocabulary
+/// (wiki:plugins): no model call, no tool loop. A client turns one on for a
+/// single request with `plugins: [{"id": ".."}]`; this table turns it on for
+/// every request. Each one rewrites what a client sent or what a model said,
+/// so off is the only defensible default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// Repair a JSON-mode answer the model fenced, prefaced with prose or left
+    /// unclosed, when the repair parses.
+    #[serde(default)]
+    pub response_healing: bool,
 }
 
 /// Request artifact capture for translation debugging (wiki:overview). Off by
@@ -858,6 +876,23 @@ mod tests {
         .map_err(|e| e.to_string())
         .and_then(|c| c.validate().map_err(|e| e.to_string()))
         .unwrap();
+    }
+
+    /// `[plugins]` turns a request-time transform on for every request, where
+    /// a client's `plugins: [{"id": ".."}]` turns it on for one. Off is the
+    /// only safe default: healing rewrites what the model said.
+    #[test]
+    fn plugins_default_off_and_reject_an_unknown_key() {
+        let cfg: Config = toml::from_str("[server]\n").unwrap();
+        assert!(!cfg.plugins.response_healing, "absent table means off");
+
+        let cfg: Config = toml::from_str("[server]\n[plugins]\nresponse_healing = true\n").unwrap();
+        assert!(cfg.plugins.response_healing);
+
+        let err = toml::from_str::<Config>("[server]\n[plugins]\nresponse_heeling = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("response_heeling"), "typo must not be silent: {err}");
     }
 
     /// `vision` is an assertion about image input, made only from a real

@@ -103,6 +103,23 @@ max_tool_calls = 10
 # ocr_model = "jina/jina-ocr-v1"
 
 # ---------------------------------------------------------------------------
+# Plugins: request-time transforms, with no model call and no tool loop. A
+# client turns one on for a single request with `plugins: [{"id": "..."}]`;
+# this table turns it on for every request. pxy consumes the key, so it never
+# reaches an upstream, and an id pxy has not implemented is ignored rather
+# than refused.
+# ---------------------------------------------------------------------------
+
+[plugins]
+# Repair a JSON answer the model fenced, prefaced with prose, or left with a
+# trailing comma or an unclosed brace. It applies only to a non-streaming
+# request that asked for `response_format` json_object or json_schema, and it
+# replaces the content only when the repair parses — an answer cut off by
+# `max_tokens` usually reaches the client exactly as the model left it.
+# Nothing in the response says healing happened.
+response_healing = true
+
+# ---------------------------------------------------------------------------
 # Groups: named failover chains. A group name is itself a routable model id.
 # Walk order is the order of `models` below.
 # ---------------------------------------------------------------------------

@@ -21,7 +21,17 @@ use super::TokenUsage;
 
 pub fn request(payload: &Value) -> Value {
     let mut out = Map::new();
-    for key in ["model", "stream", "temperature", "top_p", "parallel_tool_calls", "max_tool_calls"] {
+    // `plugins` rides along like `max_tool_calls`: pxy consumes both, and a
+    // key this allowlist omits is a key the router never sees.
+    for key in [
+        "model",
+        "stream",
+        "temperature",
+        "top_p",
+        "parallel_tool_calls",
+        "max_tool_calls",
+        "plugins",
+    ] {
         if !payload[key].is_null() {
             out.insert(key.into(), payload[key].clone());
         }

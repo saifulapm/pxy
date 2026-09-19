@@ -97,5 +97,18 @@ describe_image, which asks a model that can see. The `[server_tools]` table in
 may take, and, through `[server_tools.defaults.<tool>]`, which ride every
 client turn without the harness declaring them.
 
+Separate from the tools are plugins: request-time transforms that cost no
+model call. A client asks for one with `plugins: [{"id": "..."}]`, or
+`[plugins]` in `config.toml` turns it on for every request; pxy consumes the
+key, so it never reaches an upstream, and an id pxy has not implemented is
+ignored rather than refused. The one that exists is `response-healing`. Ask a
+model for JSON and it will hand you a Markdown fence, a preamble or a trailing
+comma often enough to matter, and `JSON.parse` fails on all three. Healing
+scans from the first brace to the close that matches it, quotes bare keys,
+drops trailing commas and closes what was left open — and replaces the answer
+only when the repair parses, so an answer truncated by `max_tokens` reaches the
+client as the model left it. Streaming turns and Anthropic clients are never
+healed.
+
 The living spec is this project's mem wiki (`mem wiki` lists the pages). Design
 history is in the git log.
