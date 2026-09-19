@@ -10,10 +10,11 @@
 //! truncation mid-token, say) reaches the client exactly as the upstream sent
 //! it.
 
-/// Candidate starts tried from each of the two ranks below. Every one costs a
-/// scan of the text after it, so an unbounded search is quadratic in the
-/// length of the answer. The cap is applied per rank, after ranking, so it
-/// bites on the runs in prose and never on the value itself.
+/// Candidate starts tried from each rank below. Every one costs a scan of the
+/// text after it, so an unbounded search is quadratic in the length of the
+/// answer. A rank holding more starts than this loses its tail, the value
+/// included: an answer standing behind 64 bracket runs of the same rank is not
+/// a case worth the scan.
 const MAX_CANDIDATES: usize = 64;
 
 /// Repair a JSON answer wrapped in prose, a fence or its own mistakes.
@@ -25,13 +26,14 @@ const MAX_CANDIDATES: usize = 64;
 /// on their own, and serving one of those instead of the answer is silent,
 /// because nothing in the response says a heal happened.
 ///
-/// Where a candidate sits decides it, never how big it is. A model puts its
-/// answer at the start of a line — alone, inside a fence, or after a preamble
-/// that ended with a newline — while a `[1]` citation marker, a bare `[]` or a
-/// list in a sentence sits partway into one. So the earliest candidate that
-/// starts a line and parses is the answer, whether the prose around it is
-/// longer or shorter. Only when nothing starts a line does reach decide, and
-/// there it is measured to the same origin for every candidate.
+/// Two things decide it, in order. A model puts its answer at the start of a
+/// line — alone, inside a fence, or after a preamble that ended with a newline
+/// — so a candidate that opens a line outranks one sitting partway into a
+/// sentence, and a long list in mid-sentence prose never displaces a short
+/// value. That only sorts the candidates into two ranks, though: prose opens
+/// lines too, with a numbered reference, an echoed schema or a bare `[]`.
+/// Within a rank, the candidate accounting for the most of its own text wins,
+/// which is where the value beats the run that merely precedes it.
 ///
 /// `None` when nothing parses, and `None` when the winner is just the input
 /// again, so a caller can treat `Some` as "this needed healing and the healed
@@ -53,23 +55,27 @@ pub fn heal_json(text: &str) -> Option<String> {
     }
 
     let mut healed = None;
-    for start in opens_line.into_iter().take(MAX_CANDIDATES) {
-        let (candidate, _) = rebuild(&chars[start..]);
-        if parses(&candidate) {
-            healed = Some(candidate);
-            break;
-        }
-    }
-    if healed.is_none() {
-        // Nothing on a line of its own: the furthest into the text a candidate
-        // reaches is the best evidence left of which one is the value.
-        let mut furthest = 0;
-        for start in mid_line.into_iter().take(MAX_CANDIDATES) {
+    for rank in [opens_line, mid_line] {
+        let mut longest = 0;
+        for start in rank.into_iter().take(MAX_CANDIDATES) {
             let (candidate, consumed) = rebuild(&chars[start..]);
-            if parses(&candidate) && start + consumed > furthest {
-                furthest = start + consumed;
+            if !parses(&candidate) {
+                continue;
+            }
+            if consumed > longest {
+                longest = consumed;
                 healed = Some(candidate);
             }
+            // This one ran to the end of the text, and every later start in
+            // the rank has less text left to account for, so none can beat it.
+            if start + consumed == chars.len() {
+                break;
+            }
+        }
+        // The lower rank is a fallback, read only when the upper one is empty
+        // of anything that parses.
+        if healed.is_some() {
+            break;
         }
     }
 
@@ -273,6 +279,34 @@ mod tests {
             heal_json("See [1]: the value is {\"a\": 1}.").as_deref(),
             Some("{\"a\": 1}")
         );
+    }
+
+    /// Opening a line is what a rank is for, not what settles a rank. Prose
+    /// opens lines too — a numbered reference, an echoed schema, a bare `[]` —
+    /// so within either rank the run that accounts for the most of its own
+    /// text is the answer.
+    #[test]
+    fn a_line_opening_run_in_the_prose_never_beats_the_real_value() {
+        for (name, input, want) in [
+            ("bare list", "[]:\n{\"a\": 1}", "{\"a\": 1}"),
+            (
+                "numbered reference",
+                "[1] source: openai docs\n{\"a\": 1}",
+                "{\"a\": 1}",
+            ),
+            (
+                "echoed keys",
+                "[\"a\", \"b\"] are the keys:\n{\"a\": 1, \"b\": 2}",
+                "{\"a\": 1, \"b\": 2}",
+            ),
+            (
+                "citation last, all mid-line",
+                "The value is {\"a\": 1} per [1]",
+                "{\"a\": 1}",
+            ),
+        ] {
+            assert_eq!(heal_json(input).as_deref(), Some(want), "{name}");
+        }
     }
 
     #[test]

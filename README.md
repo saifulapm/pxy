@@ -104,15 +104,16 @@ key, so it never reaches an upstream, and an id pxy has not implemented is
 ignored rather than refused. The one that exists is `response-healing`. Ask a
 model for JSON and it will hand you a Markdown fence, a preamble or a trailing
 comma often enough to matter, and `JSON.parse` fails on all three. Healing
-takes the value the model put at the start of a line, rebuilds it up to its
-matching close, quotes bare keys, drops trailing commas and closes what was
-left open. Starting a line is what tells the answer apart from the bracketed
-runs that fill prose: a `[1]` citation marker or a list inside a sentence
-parses perfectly well on its own, and serving one of those would be silent,
-since nothing in the response says a heal happened. The answer is replaced
-only when the repair parses, so one truncated by `max_tokens` reaches the
-client as the model left it. Streaming turns and Anthropic clients are never
-healed.
+rebuilds each `{` or `[` up to its matching close, quoting bare keys, dropping
+trailing commas and closing what was left open, then picks between them. That
+choice is the hard part: prose is full of runs that parse on their own, and a
+`[1]` citation marker served in place of the answer would be silent, since
+nothing in the response says a heal happened. A model puts its answer at the
+start of a line, so a candidate that opens one outranks a candidate inside a
+sentence; within a rank the one accounting for the most of its own text wins.
+The answer is replaced only when the repair parses, so one truncated by
+`max_tokens` reaches the client as the model left it. Streaming turns and
+Anthropic clients are never healed.
 
 The living spec is this project's mem wiki (`mem wiki` lists the pages). Design
 history is in the git log.
