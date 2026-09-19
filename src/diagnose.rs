@@ -45,6 +45,14 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
     // steering the walk: when active, the pin leads — so check the head.
     let pin_active = pin.is_some()
         && candidates.first().is_some_and(|c| pinned_ids.contains(&c.full_id()));
+    // An alias opens the walk by naming what it stands for: the id the caller
+    // typed is in no provider's model list, and everything below it — the
+    // chain, the pin, the policy — is the target's.
+    if !json {
+        if let Some(target) = catalog.alias_target(requested) {
+            println!("'{requested}' is an alias of '{target}'.");
+        }
+    }
     if candidates.is_empty() {
         if json {
             println!(

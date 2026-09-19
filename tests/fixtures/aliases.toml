@@ -1,0 +1,24 @@
+# A catalog with an alias of each shape, for the CLI checks: `pxy models`,
+# `pxy models --json` and `pxy explain chat`. No key is resolved and no host
+# is reached, so the example URLs never have to answer.
+
+[server]
+
+[providers.alpha]
+base_url = "https://alpha.example/v1/chat/completions"
+models = [
+  { id = "big", context_length = 128000 },
+  { id = "tiny", context_length = 8000, free = true },
+]
+
+[providers.beta]
+base_url = "https://beta.example/v1/chat/completions"
+models = [{ id = "big", context_length = 64000 }]
+
+[groups.daily]
+models = ["alpha/big", "beta/big"]
+
+[aliases]
+chat = "daily"
+cheap = "auto/free"
+one = "alpha/big"

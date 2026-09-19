@@ -704,6 +704,27 @@ async fn models(State(app): State<SharedApp>, headers: HeaderMap) -> Json<Value>
             "max_output_tokens": max_out,
         }));
     }
+    // Then the aliases, after every group (they are second names for the
+    // same chains). Their window is the target's, so a picker sizes the walk
+    // the alias will actually take, and an alias whose target is empty stays
+    // out for the same reason `groups()` drops an empty group: advertising an
+    // id that resolves to nothing.
+    for (name, target) in app.catalog.aliases() {
+        let chain = app.catalog.resolve(&app.cfg, name);
+        if chain.is_empty() {
+            continue;
+        }
+        let (ctx, max_out) = crate::catalog::chain_limits(&chain);
+        data.push(json!({
+            "id": name,
+            "object": "model",
+            "created": created,
+            "owned_by": "pxy",
+            "display_name": target,
+            "context_length": ctx,
+            "max_output_tokens": max_out,
+        }));
+    }
     for cand in app.catalog.models() {
         data.push(json!({
             "id": cand.full_id(),
@@ -1644,6 +1665,69 @@ mod tests {
         let out = models(State(app), HeaderMap::new()).await;
         assert_eq!(out.0["object"], "list", "other clients keep the OpenAI shape");
         assert_eq!(out.0["data"][0]["object"], "model");
+    }
+
+    /// An alias is listed like a group and after every one of them, in both
+    /// list shapes and behind the `claude/` mirror: that is the whole point
+    /// of the table, an id a client that cannot list models can be pointed
+    /// at once and never revisited. Codex picks from the chains, so its
+    /// manifest leaves aliases out.
+    #[tokio::test]
+    async fn models_listing_puts_aliases_after_groups_and_out_of_the_codex_manifest() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.alpha]
+            base_url = "https://a.example/chat"
+            models = [{ id = "big", context_length = 128000 }]
+            [providers.beta]
+            base_url = "https://b.example/chat"
+            models = [{ id = "big", context_length = 64000 }]
+            [groups.daily]
+            models = ["alpha/big", "beta/big"]
+            [groups.zeta]
+            models = ["alpha/big"]
+            [aliases]
+            chat = "daily"
+            one = "beta/big"
+            "#,
+            "models_aliases",
+        );
+        let ids = |v: &Value| -> Vec<String> {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let at = |ids: &[String], id: &str| {
+            ids.iter().position(|x| x == id).unwrap_or_else(|| panic!("{id} missing from {ids:?}"))
+        };
+
+        let out = models(State(app.clone()), HeaderMap::new()).await;
+        let list = ids(&out.0);
+        assert!(at(&list, "chat") > at(&list, "zeta"), "an alias follows EVERY group: {list:?}");
+        assert!(at(&list, "chat") < at(&list, "one"), "aliases sort among themselves");
+        assert!(at(&list, "one") < at(&list, "alpha/big"), "aliases lead the ids: {list:?}");
+        at(&list, "claude/chat"); // the mirror carries the alias too
+        // The window is the target's, so a picker sizes the chain the alias
+        // will actually walk: min() over daily, not over the catalog.
+        let chat = &out.0["data"][at(&list, "chat")];
+        assert_eq!(chat["context_length"], 64_000);
+        assert_eq!(chat["display_name"], "daily", "the listing says what the name stands for");
+
+        let out = models(State(app.clone()), headers(&[("anthropic-version", "2023-06-01")])).await;
+        let list = ids(&out.0);
+        assert_eq!(out.0["data"][at(&list, "chat")]["type"], "model");
+        assert!(at(&list, "chat") > at(&list, "zeta"), "anthropic shape, same order: {list:?}");
+        at(&list, "claude/chat"); // and in this shape too
+
+        let out = models(State(app), headers(&[("originator", "codex_cli_rs")])).await;
+        let slugs: Vec<&str> =
+            out.0["models"].as_array().unwrap().iter().map(|m| m["slug"].as_str().unwrap()).collect();
+        assert!(slugs.contains(&"daily"), "the chains stay: {slugs:?}");
+        assert!(!slugs.contains(&"chat"), "codex picks from the chains: {slugs:?}");
     }
 
     /// A live fusion call served to a /v1/responses client: the router keys the

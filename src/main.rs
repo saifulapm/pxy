@@ -331,8 +331,19 @@ fn models(cfg: &config::Config, json: bool) -> Result<()> {
     let catalog = catalog::Catalog::from_config(cfg);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    // Aliases go after every group and before the "provider/model" ids: they
+    // are second names for the same chains, and one whose target resolves to
+    // nothing is left out, as an empty group is.
+    let aliases: Vec<(&str, &str, Vec<catalog::Candidate>)> = catalog
+        .aliases()
+        .map(|(name, target)| (name, target, catalog.resolve(cfg, name)))
+        .filter(|(_, _, chain)| !chain.is_empty())
+        .collect();
     if !json {
-        for m in catalog.model_ids() {
+        let group_count = catalog.group_names().count();
+        let mut ids = catalog.model_ids();
+        ids.splice(group_count..group_count, aliases.iter().map(|(name, _, _)| name.to_string()));
+        for m in ids {
             // stop quietly when the pipe closes (e.g. `pxy models | head`)
             if writeln!(out, "{m}").is_err() {
                 break;
@@ -354,6 +365,13 @@ fn models(cfg: &config::Config, json: bool) -> Result<()> {
             })
         })
         .collect();
+    for (name, target, chain) in &aliases {
+        let (ctx, max_out) = catalog::chain_limits(chain);
+        rows.push(serde_json::json!({
+            "id": name, "kind": "alias", "target": target,
+            "contextLength": ctx, "maxOutputTokens": max_out,
+        }));
+    }
     // Which groups route to a model is the fact a picker most wants: it is the
     // difference between "one of my free pools" and "real money per token".
     let membership = |full_id: &str| -> Vec<String> {
