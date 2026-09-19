@@ -33,32 +33,27 @@ pub fn docs_key(id: &str, topic: &str, tokens: u64) -> String {
 /// asking about axum means. With a `version`, the first of that library's
 /// versions containing it is appended to the id.
 pub fn pick_library(results: &[Value], name: &str, version: Option<&str>) -> Result<String, String> {
-    let named = |r: &&Value| {
-        r["id"]
-            .as_str()
-            .and_then(|id| id.rsplit('/').next())
-            .is_some_and(|seg| seg.eq_ignore_ascii_case(name))
-    };
+    // Context7's own order stands: for "sqlx" it ranks the Rust site scrape
+    // first, and preferring an id that ends in the bare name would hand the
+    // Go repo back instead. A model that means another entry pins its id.
     let usable = || results.iter().filter(|r| r["id"].is_string());
-    let hit = usable()
-        .find(named)
-        .or_else(|| usable().next())
-        .ok_or_else(|| format!("no library matched '{name}'"))?;
-    let id = hit["id"].as_str().unwrap_or_default();
-    let Some(version) = version else { return Ok(id.to_string()) };
+    let first = usable().next().ok_or_else(|| format!("no library matched '{name}'"))?;
+    let Some(version) = version else { return Ok(first["id"].as_str().unwrap_or_default().to_string()) };
 
     // Context7 spells a version `axum_v0_8_4`, so "0.8" is the underscored
-    // "0_8" carried by the first version that has it.
+    // "0_8" carried by the first version that has it, on the first result
+    // that publishes one.
     let wanted = version.replace('.', "_");
-    let versions: Vec<&str> =
-        hit["versions"].as_array().map_or(Vec::new(), |v| v.iter().filter_map(Value::as_str).collect());
-    match versions.iter().find(|v| v.contains(&wanted)) {
-        Some(v) => Ok(format!("{id}/{v}")),
-        None => Err(format!(
-            "'{id}' has no version matching '{version}'; it has: {}",
-            versions.join(", ")
-        )),
+    fn versions(r: &Value) -> Vec<&str> {
+        r["versions"].as_array().map_or(Vec::new(), |v| v.iter().filter_map(Value::as_str).collect())
     }
+    for r in usable() {
+        if let Some(v) = versions(r).iter().find(|v| v.contains(&wanted)) {
+            return Ok(format!("{}/{v}", r["id"].as_str().unwrap_or_default()));
+        }
+    }
+    let seen: Vec<&str> = usable().flat_map(versions).collect();
+    Err(format!("no '{name}' entry has a version matching '{version}'; seen: {}", seen.join(", ")))
 }
 
 /// Ask Context7 which libraries match a name.
@@ -153,18 +148,19 @@ mod tests {
         ]
     }
 
-    /// Context7 ranks the site scrape first for "axum"; the repo id is the
-    /// one a model asking about axum means.
+    /// Context7's ranking is the pick: it puts the site scrape first for
+    /// "axum", and that is the richer entry.
     #[test]
-    fn pick_library_prefers_an_exact_last_segment() {
-        assert_eq!(pick_library(&results(), "axum", None).unwrap(), "/tokio-rs/axum");
-        // Nothing matches the name: Context7's own first result stands.
-        assert_eq!(pick_library(&results(), "web framework", None).unwrap(), "/websites/rs_axum");
+    fn pick_library_takes_the_first_result() {
+        assert_eq!(pick_library(&results(), "axum", None).unwrap(), "/websites/rs_axum");
         assert!(pick_library(&[], "nope", None).is_err(), "no results is no library");
+        let unusable = vec![json!({"title": "no id"})];
+        assert!(pick_library(&unusable, "axum", None).is_err(), "an entry with no id is no library");
     }
 
     /// A version's dots are the ids' underscores, and a partial one picks the
-    /// first version that carries it.
+    /// first version that carries it, on the first result that publishes one:
+    /// the site scrape lists none, so the repo id answers.
     #[test]
     fn pick_library_appends_a_matching_version() {
         assert_eq!(
@@ -173,6 +169,7 @@ mod tests {
         );
         let err = pick_library(&results(), "axum", Some("9.9")).unwrap_err();
         assert!(err.contains("axum_v0_8_4"), "the error lists what there is: {err}");
+        assert!(err.contains("axum_v0_7_9"), "across every result: {err}");
     }
 
     fn state(name: &str) -> State {

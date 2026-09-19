@@ -869,7 +869,9 @@ pub fn tool_def(tool: Tool, params: &Value) -> Value {
                         "library": {
                             "type": "string",
                             "description": "The library's name, as it is published \
-                                (\"axum\", \"next.js\", \"stripe\")."
+                                (\"axum\", \"next.js\", \"stripe\"), or its Context7 id \
+                                (\"/launchbadge/sqlx\") when the name is shared across \
+                                languages and the wrong one came back."
                         },
                         "query": {
                             "type": "string",
@@ -1004,25 +1006,18 @@ async fn run_find_docs(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         }
     };
 
-    let key = crate::docs::search_key(library);
-    let results = match crate::docs::cache_get(state, &key, crate::docs::CACHE_TTL_SECS) {
-        Some(cached) => cached.as_array().cloned().unwrap_or_default(),
-        None => match crate::docs::search_library(ctx.app, library).await {
-            Ok(results) => {
-                // A miss is the one answer likely to change: a library
-                // Context7 has not indexed yet is listed next week, and
-                // remembering the miss would hide it until then.
-                if !results.is_empty() {
-                    crate::docs::cache_put(state, &key, &Value::Array(results.clone()));
-                }
-                results
-            }
+    // A Context7 id is the model naming the entry itself: no search, and the
+    // version already sits in the id (`/tokio-rs/axum/axum_v0_8_4`).
+    let id = if library.starts_with('/') {
+        if version.is_some() {
+            return Ok(failed(library, "a Context7 id carries its version in the id itself".into()));
+        }
+        library.to_string()
+    } else {
+        match search_and_pick(ctx, library, version).await {
+            Ok(id) => id,
             Err(e) => return Ok(failed(library, e)),
-        },
-    };
-    let id = match crate::docs::pick_library(&results, library, version) {
-        Ok(id) => id,
-        Err(e) => return Ok(failed(library, e)),
+        }
     };
 
     let key = crate::docs::docs_key(&id, query, tokens);
@@ -1052,6 +1047,26 @@ async fn run_find_docs(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
 /// question, three options; the confidence it reports is the whole reason the
 /// tool exists, so a confidence under the declaration's `abstain_below` is
 /// answered `uncertain` rather than passed off as a verdict.
+/// Context7's search for a library name, cached, then the pick.
+async fn search_and_pick(ctx: &ToolCtx<'_>, library: &str, version: Option<&str>) -> Result<String, String> {
+    let state = &ctx.app.state;
+    let key = crate::docs::search_key(library);
+    let results = match crate::docs::cache_get(state, &key, crate::docs::CACHE_TTL_SECS) {
+        Some(cached) => cached.as_array().cloned().unwrap_or_default(),
+        None => {
+            let results = crate::docs::search_library(ctx.app, library).await?;
+            // A miss is the one answer likely to change: a library Context7
+            // has not indexed yet is listed next week, and remembering the
+            // miss would hide it until then.
+            if !results.is_empty() {
+                crate::docs::cache_put(state, &key, &Value::Array(results.clone()));
+            }
+            results
+        }
+    };
+    crate::docs::pick_library(&results, library, version)
+}
+
 async fn run_verify(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     let arg = |key: &str| args[key].as_str().map(str::trim).filter(|s| !s.is_empty());
     let claim = arg("claim").ok_or("verify call without a claim")?;
@@ -2079,6 +2094,34 @@ mod tests {
             ran.client.marker,
             json!({"id": "call_1", "library": "/tokio-rs/axum", "query": "nested routing"})
         );
+    }
+
+    /// A library given as a Context7 id is the entry itself: no search runs,
+    /// and a version beside it is an error, since the id already carries one.
+    #[tokio::test]
+    async fn find_docs_takes_a_context7_id_without_searching() {
+        let app = mock_app("[server]", "find_docs_pinned");
+        crate::docs::cache_put(
+            &app.state,
+            &crate::docs::docs_key("/launchbadge/sqlx", "sqlite pool", 4000),
+            &json!("### SqlitePool"),
+        );
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::FindDocs
+            .execute(&ctx, &json!({"library": "/launchbadge/sqlx", "query": "sqlite pool"}))
+            .await
+            .unwrap();
+        assert!(ran.model_output.starts_with("Documentation for /launchbadge/sqlx"), "{}", ran.model_output);
+        assert!(
+            crate::docs::cache_get(&app.state, &crate::docs::search_key("/launchbadge/sqlx"), u64::MAX).is_none(),
+            "a pinned id is never searched for"
+        );
+
+        let ran = Tool::FindDocs
+            .execute(&ctx, &json!({"library": "/launchbadge/sqlx", "query": "x", "version": "0.8"}))
+            .await
+            .unwrap();
+        assert!(ran.model_output.contains("carries its version"), "{}", ran.model_output);
     }
 
     /// A library Context7 does not have and a version it does not publish are
