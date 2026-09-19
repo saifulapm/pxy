@@ -83,9 +83,13 @@ async fn attempt(app: &crate::router::App, r: &super::Resolved<'_>, payload: &Va
         req = req.header(k, v);
     }
     // Vercel's evaluation endpoint takes the model out of band; the body it
-    // accepts has no `model` key at all.
+    // accepts has no `model` key at all. The protocol version is not optional:
+    // without it, or with any other value tried, the gateway answers 400
+    // "Unsupported gateway protocol version" (measured 2026-09-19).
     if r.media.kind == MediaKind::Vercel {
-        req = req.header("ai-model-id", &r.model);
+        req = req
+            .header("ai-model-id", &r.model)
+            .header("ai-gateway-protocol-version", "0.0.1");
     }
     let resp = match req.json(&body).send().await {
         Ok(resp) => resp,
@@ -106,21 +110,28 @@ async fn attempt(app: &crate::router::App, r: &super::Resolved<'_>, payload: &Va
 
     let out = match r.media.kind {
         MediaKind::Vercel => vercel_response(&upstream, &questions, &r.model),
-        // Workers AI answers 200 with `success: false` for account-level
-        // failures (an empty balance, say), so the envelope — not the status —
-        // decides whether this candidate answered.
-        MediaKind::Cloudflare => match upstream.get("result").filter(|v| !v.is_null()) {
-            Some(result) => result.clone(),
-            None => {
-                let msg = upstream["errors"][0]["message"]
-                    .as_str()
-                    .unwrap_or("cloudflare returned no result");
-                return Attempt::Retryable(error_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("systemone: {msg}"),
-                ));
+        // Workers AI can answer 200 with `success: false` for an account-level
+        // failure, so the envelope, not the status, decides whether this
+        // candidate answered. An empty balance sends `result: {}` beside the
+        // error, so "answered" means `success` AND a result with something in
+        // it — a bare `{}` passed on would be an answer with no answers.
+        MediaKind::Cloudflare => {
+            let result = upstream.get("result").filter(|r| {
+                r.as_object().is_some_and(|o| !o.is_empty()) && upstream["success"] != false
+            });
+            match result {
+                Some(result) => result.clone(),
+                None => {
+                    let msg = upstream["errors"][0]["message"]
+                        .as_str()
+                        .unwrap_or("cloudflare returned no result");
+                    return Attempt::Retryable(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("systemone: {msg}"),
+                    ));
+                }
             }
-        },
+        }
         _ => upstream,
     };
     let tokens = out["usage"]["input_tokens"].as_u64().unwrap_or(0);
@@ -241,6 +252,11 @@ mod tests {
         let (sent, headers) = seen.one();
         assert!(sent.get("model").is_none(), "the id rides the header, not the body: {sent}");
         assert_eq!(headers.get("ai-model-id").unwrap(), "typesafe-ai/jev");
+        assert_eq!(
+            headers.get("ai-gateway-protocol-version").unwrap(),
+            "0.0.1",
+            "without it the gateway answers 400 Unsupported gateway protocol version"
+        );
         assert_eq!(sent["questions"]["is_urgent"]["type"], "boolean", "noul is rejected as-is");
         assert_eq!(sent["questions"]["is_urgent"]["criteria"]["true"], "needs action today");
         assert_eq!(sent["questions"]["department"]["type"], "choice", "choice is untouched");
@@ -463,7 +479,9 @@ mod tests {
                 "/cf-broke",
                 record(
                     sink.clone(),
-                    json!({"result": null, "success": false, "errors": [
+                    // The body the account really sent, `result` an empty
+                    // object rather than null (measured 2026-09-19).
+                    json!({"result": {}, "success": false, "messages": [], "errors": [
                         {"code": 2021, "message": "Insufficient balance; add money to your gateway or use BYOK"}
                     ]}),
                 ),
