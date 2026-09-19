@@ -99,7 +99,7 @@ memory tool uses; each agent gets its own store unless the config points two
 at one. find_docs is how a model stops guessing at an API it half remembers:
 it names a library and a topic, and pxy fetches that topic's snippets from
 Context7, whose free tier needs no account at all. Both halves of the lookup
-are cached for a week, so the same question twice costs one call. The
+are cached for a week, so asking again inside it costs nothing. The
 `[server_tools]` table in
 `config.toml` decides which are served, how many tool-call steps one turn
 may take, and, through `[server_tools.defaults.<tool>]`, which ride every

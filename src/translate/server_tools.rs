@@ -973,7 +973,12 @@ async fn run_find_docs(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         Some(cached) => cached.as_array().cloned().unwrap_or_default(),
         None => match crate::docs::search_library(ctx.app, library).await {
             Ok(results) => {
-                crate::docs::cache_put(state, &key, &Value::Array(results.clone()));
+                // A miss is the one answer likely to change: a library
+                // Context7 has not indexed yet is listed next week, and
+                // remembering the miss would hide it until then.
+                if !results.is_empty() {
+                    crate::docs::cache_put(state, &key, &Value::Array(results.clone()));
+                }
                 results
             }
             Err(e) => return Ok(failed(library, e)),
@@ -989,7 +994,9 @@ async fn run_find_docs(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
         Some(cached) => cached.as_str().unwrap_or_default().to_string(),
         None => match crate::docs::fetch_docs(ctx.app, &id, query, tokens).await {
             Ok(text) => {
-                crate::docs::cache_put(state, &key, &Value::String(text.clone()));
+                if !text.trim().is_empty() {
+                    crate::docs::cache_put(state, &key, &Value::String(text.clone()));
+                }
                 text
             }
             Err(e) => return Ok(failed(&id, e)),
