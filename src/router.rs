@@ -4977,6 +4977,76 @@ mod tests {
         seen.clone()
     }
 
+    /// A Messages client declares memory the way Anthropic's own API takes it,
+    /// by date and with no `parameters`: the same executor answers, the
+    /// protocol paragraph joins the system message the client sent as
+    /// `system`, and the round leaves no block behind for a client that has no
+    /// way to read one.
+    #[tokio::test]
+    async fn memory_is_served_to_an_anthropic_client_declaring_it_by_date() {
+        let store = format!("pxy-test-anthropic-{}", std::process::id());
+        let root = crate::config::data_dir().join("memory").join(&store);
+        let _ = std::fs::remove_dir_all(&root);
+        let first = calls_sse(&[(
+            "call_1",
+            "pxy_memory",
+            r#"{"command":"create","path":"/memories/n.md","file_text":"kept\n"}"#,
+        )]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "anthropic_memory",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "max_tokens": 100,
+            "system": "You are Claude Code.",
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "memory_20250818", "name": "memory"}],
+        });
+        // A native declaration carries no `parameters`, so the store is the
+        // agent behind the turn: this is the path a real Claude Code request
+        // takes.
+        let ctx = ClientContext { agent: Some(store.clone()), ..ClientContext::default() };
+        let out = handle_chat(app, ClientFormat::Anthropic, payload, ctx).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "the served call must have been replayed");
+        let names: Vec<&str> = bodies[0]["tools"]
+            .as_array()
+            .expect("the dated declaration must become a reserved function")
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["pxy_memory"], "{names:?}");
+        assert_eq!(
+            bodies[0]["messages"][0]["content"].as_str().unwrap(),
+            format!("You are Claude Code.\n\n{}", server_tools::MEMORY_PROTOCOL)
+        );
+        assert_eq!(last_message(&bodies[1]), "File created successfully at: /memories/n.md");
+        assert!(text.contains("done"), "{text}");
+        // The usage still counts the call; what memory has no way to render is
+        // a content block the client would have to interpret.
+        assert!(text.contains("\"memory_requests\":1"), "{text}");
+        assert!(!text.contains("\"type\":\"server_tool_use\""), "{text}");
+        assert!(!text.contains("pxy_memory"), "the reserved name must not leak: {text}");
+
+        assert!(root.join("n.md").is_file(), "the file the model created is on disk");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The memory tool is a directory, not a transcript: a second request
     /// reads what the first wrote. Both turns carry the protocol paragraph,
     /// once per body — the replay copies the body pxy already appended to, so
