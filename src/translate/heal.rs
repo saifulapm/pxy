@@ -255,9 +255,10 @@ mod tests {
             heal_json("Options [] were empty, so:\n[{\"id\": 7}]").as_deref(),
             Some("[{\"id\": 7}]")
         );
-        // A trailing run must not displace the value whatever its length, and
-        // a preamble's run must not win by being the longer of the two: the
-        // deciding fact is where each one sits, never how big it is.
+        // Every run below sits inside a sentence, so the rank settles these
+        // and length never enters into it: a run inside a sentence cannot
+        // displace one that opens a line, however much longer it is. Length
+        // decides only within a single rank, which is the test below.
         assert_eq!(
             heal_json("{\"a\": 1}\n\nHope that helps [1]").as_deref(),
             Some("{\"a\": 1}")
