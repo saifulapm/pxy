@@ -101,7 +101,7 @@ Separate from the tools are plugins: request-time transforms that cost no
 model call. A client asks for one with `plugins: [{"id": "..."}]`, or
 `[plugins]` in `config.toml` turns it on for every request; pxy consumes the
 key, so it never reaches an upstream, and an id pxy has not implemented is
-ignored rather than refused. The one that exists is `response-healing`. Ask a
+ignored rather than refused. Two exist. `response-healing` comes first. Ask a
 model for JSON and it will hand you a Markdown fence, a preamble or a trailing
 comma often enough to matter, and `JSON.parse` fails on all three. Healing
 rebuilds each `{` or `[` up to its matching close, quoting bare keys, dropping
@@ -114,6 +114,18 @@ sentence; within a rank the one accounting for the most of its own text wins.
 The answer is replaced only when the repair parses, so one truncated by
 `max_tokens` reaches the client as the model left it. Streaming turns and
 Anthropic clients are never healed.
+
+The second is `file-parser`, and it is the one plugin on by default. Attach a
+PDF — a chat `file` part, an Anthropic `document` block, a Responses
+`input_file` item — and pxy parses it before it picks a model, so the document
+reaches every model as text, not just the few with a file API. Pages poppler
+finds blank are scanned rather than typeset; set `ocr_model` and they are
+rasterised and read back as Markdown, otherwise such a page says so. Each
+parse is cached by the file's SHA-256, so the history a client resends every
+turn costs one parse per document, not one per message. A file that cannot be
+read becomes a single line saying why and the turn goes on. This one needs
+`poppler-utils` on the machine: pdftotext and pdftoppm are what does the
+reading.
 
 The living spec is this project's mem wiki (`mem wiki` lists the pages). Design
 history is in the git log.
