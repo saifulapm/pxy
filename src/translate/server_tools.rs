@@ -1107,6 +1107,74 @@ async fn run_verify(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
     })
 }
 
+/// Score every hit against the query in one Jev call, drop what scores under
+/// `min`, sort the rest by score and cut to `n` (wiki:jev). Search providers
+/// rank for their own purposes, and the model pays for every snippet it is
+/// shown, so a relevance score is worth one 70–500 ms call.
+///
+/// Fails open, in place: a Jev that is down, slow or answering nonsense leaves
+/// the provider's list and its order exactly as they came, because a worse
+/// order is better than no results.
+async fn rerank_hits(ctx: &ToolCtx<'_>, query: &str, hits: &mut Vec<Value>, n: usize, min: f64) {
+    if hits.is_empty() {
+        return;
+    }
+    let numbered: Vec<Value> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| json!({"result": i, "title": h["title"], "url": h["url"], "snippet": h["snippet"]}))
+        .collect();
+    let questions: serde_json::Map<String, Value> = (0..hits.len())
+        .map(|i| {
+            (
+                format!("r{i}"),
+                json!({
+                    "type": "noul",
+                    "instructions": format!("Is result {i} relevant to the query?"),
+                }),
+            )
+        })
+        .collect();
+
+    let state = json!({"query": query, "results": numbered});
+    let body = match crate::media::systemone::ask(
+        ctx.app,
+        "auto",
+        state,
+        Value::Object(questions),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(%query, error = %e, "web_search re-ranking failed; keeping the provider's order");
+            hits.truncate(n);
+            return;
+        }
+    };
+
+    let answers = &body["answers"];
+    let scores: Vec<Option<f64>> =
+        (0..hits.len()).map(|i| answers[format!("r{i}")]["noul"].as_f64()).collect();
+    // Every hit unscored is an answer pxy cannot read, not a verdict that
+    // nothing is relevant: fail open rather than hand the model an empty list.
+    if scores.iter().all(Option::is_none) {
+        warn!(%query, "web_search re-ranking scored nothing; keeping the provider's order");
+        hits.truncate(n);
+        return;
+    }
+    let mut scored: Vec<(f64, Value)> = hits
+        .drain(..)
+        .zip(scores)
+        .filter_map(|(hit, score)| score.filter(|s| *s >= min).map(|s| (s, hit)))
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.truncate(n);
+    let kept = scored.len();
+    *hits = scored.into_iter().map(|(_, hit)| hit).collect();
+    info!(%query, kept, "web_search re-ranked");
+}
+
 /// A declaration's `engine`: `auto` (or absent) walks the configured pool;
 /// a configured provider's name pins the walk to it; anything else is an
 /// error the model is told about, never a request failure.
@@ -1200,9 +1268,17 @@ async fn run_web_search(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> 
     let excluded = param_list(params, "excluded_domains");
     let max_chars = params["max_characters"].as_u64().map(|c| c.clamp(1, 100_000) as usize);
 
-    let found = crate::media::search::run_search(ctx.app, &query, n, only).await;
+    // Re-ranking needs more than `n` to choose between, so the provider is
+    // asked for a wider list and Jev cuts it back.
+    let jev = &ctx.app.cfg.server_tools.jev;
+    let asked = if jev.rerank_web_search { (n * 3).max(10).min(25) } else { n };
+
+    let found = crate::media::search::run_search(ctx.app, &query, asked, only).await;
     Ok(match found {
         Ok((provider, mut results)) => {
+            if jev.rerank_web_search {
+                rerank_hits(ctx, &query, &mut results, n as usize, jev.rerank_min).await;
+            }
             results.retain(|r| domain_allowed(r["url"].as_str().unwrap_or(""), &allowed, &excluded));
             if let Some(max) = max_chars {
                 for r in &mut results {
@@ -3486,6 +3562,179 @@ mod tests {
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
+    /// With re-ranking on the provider is over-fetched, Jev scores every hit,
+    /// the weak ones go and the rest come back best first, cut to the
+    /// declaration's `max_results`.
+    #[tokio::test]
+    async fn rerank_over_fetches_then_scores_sorts_and_cuts() {
+        let searched: Sink = Default::default();
+        let asked: Sink = Default::default();
+        // r1 and r3 are the good ones; r0 and r2 fall under rerank_min.
+        const SCORES: [f64; 10] = [0.1, 0.95, 0.2, 0.9, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4];
+        let addr = search_and_jev(searched.clone(), asked.clone(), 10, &SCORES).await;
+        let app = mock_app(&rerank_cfg(&addr, "rerank_web_search = true"), "rerank_cut");
+        let ctx = ToolCtx { params: json!({"max_results": 3}), ..ToolCtx::new(&app, "call_1") };
+
+        let ran = Tool::WebSearch.execute(&ctx, &json!({"query": "q"})).await.unwrap();
+
+        assert_eq!(
+            searched.lock().unwrap()[0]["num"], 10,
+            "max(3 x 3, 10) hits to choose between"
+        );
+        let jev = asked.lock().unwrap()[0].clone();
+        assert_eq!(jev["state"]["query"], "q");
+        assert_eq!(jev["state"]["results"][2]["result"], 2, "the hits are numbered for the questions");
+        assert_eq!(jev["state"]["results"][2]["url"], "https://h2.example/p");
+        assert_eq!(jev["questions"].as_object().unwrap().len(), 10, "one noul per hit");
+        assert_eq!(jev["questions"]["r2"]["type"], "noul");
+        assert_eq!(jev["questions"]["r2"]["instructions"], "Is result 2 relevant to the query?");
+
+        // The model reads "[1] <title>", then the url, then the snippet.
+        let titles: Vec<&str> = ran.model_output.lines().filter(|l| l.starts_with('[')).collect();
+        assert_eq!(ran.client.marker["hits"], 3, "cut to max_results: {}", ran.model_output);
+        assert!(!ran.model_output.contains("h0"), "under rerank_min: {}", ran.model_output);
+        assert!(!ran.model_output.contains("h2"), "under rerank_min: {}", ran.model_output);
+        let order: Vec<usize> = ["h1", "h3", "h4"]
+            .iter()
+            .map(|t| titles.iter().position(|l| l.contains(t)).expect(t))
+            .collect();
+        assert_eq!(order, [0, 1, 2], "best first: {}", ran.model_output);
+    }
+
+    /// The over-fetch stops at 25: no declaration can make one search cost a
+    /// hundred snippets.
+    #[tokio::test]
+    async fn rerank_caps_the_over_fetch_at_twenty_five() {
+        let searched: Sink = Default::default();
+        let asked: Sink = Default::default();
+        let addr = search_and_jev(searched.clone(), asked.clone(), 1, &[0.9]).await;
+        let app = mock_app(&rerank_cfg(&addr, "rerank_web_search = true"), "rerank_cap");
+        let ctx = ToolCtx { params: json!({"max_results": 25}), ..ToolCtx::new(&app, "call_1") };
+
+        Tool::WebSearch.execute(&ctx, &json!({"query": "q"})).await.unwrap();
+        assert_eq!(searched.lock().unwrap()[0]["num"], 25, "3 x 25 is capped");
+    }
+
+    /// Jev down is not search down: the provider's own list and order stand,
+    /// still cut to what the declaration asked for.
+    #[tokio::test]
+    async fn rerank_keeps_the_providers_order_when_jev_fails() {
+        let searched: Sink = Default::default();
+        let asked: Sink = Default::default();
+        let addr = search_and_jev(searched.clone(), asked.clone(), 10, &[]).await;
+        // A chain pointing nowhere: `ask` fails on every candidate.
+        let cfg = format!(
+            r#"
+            [server]
+            [[search.providers]]
+            name = "mock"
+            kind = "jina"
+            api_key = "k"
+            base_url = "http://{addr}/s"
+            [server_tools.jev]
+            rerank_web_search = true
+            "#
+        );
+        let app = mock_app(&cfg, "rerank_jev_down");
+        let ctx = ToolCtx { params: json!({"max_results": 2}), ..ToolCtx::new(&app, "call_1") };
+
+        let ran = Tool::WebSearch.execute(&ctx, &json!({"query": "q"})).await.unwrap();
+
+        assert_eq!(searched.lock().unwrap()[0]["num"], 10, "the over-fetch still happened");
+        assert_eq!(ran.client.marker["hits"], 2, "truncated to max_results");
+        assert!(ran.model_output.contains("h0"), "the provider's own first: {}", ran.model_output);
+        assert!(ran.model_output.contains("h1"), "{}", ran.model_output);
+        assert!(!ran.model_output.contains("h2"), "{}", ran.model_output);
+    }
+
+    /// The flag off is the search pxy ran before Jev existed: `max_results`
+    /// hits asked for, and nothing else consulted.
+    #[tokio::test]
+    async fn rerank_off_asks_the_provider_for_exactly_max_results() {
+        let searched: Sink = Default::default();
+        let asked: Sink = Default::default();
+        let addr = search_and_jev(searched.clone(), asked.clone(), 3, &[0.9, 0.9, 0.9]).await;
+        let app = mock_app(&rerank_cfg(&addr, ""), "rerank_off");
+        let ctx = ToolCtx { params: json!({"max_results": 3}), ..ToolCtx::new(&app, "call_1") };
+
+        let ran = Tool::WebSearch.execute(&ctx, &json!({"query": "q"})).await.unwrap();
+
+        assert_eq!(searched.lock().unwrap()[0]["num"], 3, "no over-fetch");
+        assert!(asked.lock().unwrap().is_empty(), "Jev is never called");
+        assert_eq!(ran.client.marker["hits"], 3);
+        assert!(ran.model_output.contains("h0"), "{}", ran.model_output);
+    }
+
+    type Sink = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+    fn rerank_cfg(addr: &str, jev_table: &str) -> String {
+        format!(
+            r#"
+            [server]
+            [[search.providers]]
+            name = "mock"
+            kind = "jina"
+            api_key = "k"
+            base_url = "http://{addr}/s"
+            [providers.openrouter]
+            [providers.openrouter.media]
+            systemone_url = "http://{addr}/decisions"
+            systemone_models = ["typesafe/jev-1.13"]
+            [media]
+            systemone = "openrouter/typesafe/jev-1.13"
+            [server_tools.jev]
+            {jev_table}
+            "#
+        )
+    }
+
+    /// One server holding both legs of a re-ranked search: a jina-shaped
+    /// provider answering `hits` numbered results, and a Jev gateway scoring
+    /// them in order.
+    async fn search_and_jev(
+        searched: Sink,
+        asked: Sink,
+        hits: usize,
+        scores: &'static [f64],
+    ) -> String {
+        use axum::routing::post;
+        let data: Vec<Value> = (0..hits)
+            .map(|i| json!({"title": format!("h{i}"), "url": format!("https://h{i}.example/p"),
+                            "description": format!("body {i}")}))
+            .collect();
+        let answers: serde_json::Map<String, Value> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("r{i}"), json!({"type": "noul", "noul": s})))
+            .collect();
+        let router = axum::Router::new()
+            .route(
+                "/s",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let (sink, data) = (searched.clone(), data.clone());
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({"data": data}))
+                    }
+                }),
+            )
+            .route(
+                "/decisions",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let (sink, answers) = (asked.clone(), answers.clone());
+                    async move {
+                        sink.lock().unwrap().push(body);
+                        axum::Json(json!({"model": "typesafe/jev-1.13", "answers": answers,
+                                          "usage": {"input_tokens": 400, "output_tokens": 0}}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        addr.to_string()
+    }
+
     /// A call pxy cannot shape is unserved: Jev is asked nothing at all.
     #[tokio::test]
     async fn verify_without_a_claim_or_evidence_is_unserved() {
