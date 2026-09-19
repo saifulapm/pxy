@@ -1653,6 +1653,9 @@ impl ModelEntry {
 pub struct Limits {
     /// Requests per minute (sliding window)
     pub rpm: Option<u32>,
+    /// Tokens per minute (same sliding window, input + output as the
+    /// upstream billed them). Several free pools cap tokens, not requests.
+    pub tpm: Option<u32>,
     pub daily_requests: Option<u64>,
     pub daily_tokens: Option<u64>,
     pub monthly_requests: Option<u64>,
@@ -1679,6 +1682,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             rpm: None,
+            tpm: None,
             daily_requests: None,
             daily_tokens: None,
             monthly_requests: None,

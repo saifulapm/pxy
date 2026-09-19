@@ -314,6 +314,7 @@ action = "skip-cooldown"
 # Limits, enforced locally against pxy's own counters. Omit for no limits.
 [providers.alpha.limits]
 rpm = 20                                  # sliding 60s window
+tpm = 100000                              # tokens in the same window, input + output
 daily_requests = 1000
 daily_tokens = 2000000
 monthly_requests = 0                      # omit or 0 for unlimited

@@ -21,6 +21,10 @@ pub struct State {
     db: Mutex<Connection>,
     cooldowns: Mutex<HashMap<String, Cooldown>>,
     rpm: Mutex<HashMap<String, RpmWindow>>,
+    /// Tokens billed per provider in the same two-bucket minute as `rpm`,
+    /// fed from real usage counts as they land, so the read lags the wire by
+    /// one response.
+    tpm: Mutex<HashMap<String, RpmWindow>>,
     /// Per-model request/failure windows (litellm's failure-rate rule): a
     /// model that fails HALF its recent requests cools down even though no
     /// single error ever crossed the per-error cooldown ladder. In-memory
@@ -164,6 +168,7 @@ impl State {
             db: Mutex::new(db),
             cooldowns: Mutex::new(cooldowns),
             rpm: Mutex::new(HashMap::new()),
+            tpm: Mutex::new(HashMap::new()),
             model_health: Mutex::new(HashMap::new()),
         })
     }
@@ -521,6 +526,27 @@ impl State {
         let w = map.entry(provider.to_string()).or_default();
         roll(w, idx);
         w.curr += 1.0;
+    }
+
+    // ---- tpm sliding window (same shape as rpm) ----
+
+    pub fn tpm_effective(&self, provider: &str) -> f64 {
+        let now_ms = epoch_ms();
+        let idx = now_ms / RPM_WINDOW_MS;
+        let elapsed = (now_ms % RPM_WINDOW_MS) as f64 / RPM_WINDOW_MS as f64;
+        let mut map = self.tpm.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let w = map.entry(provider.to_string()).or_default();
+        roll(w, idx);
+        w.prev * (1.0 - elapsed) + w.curr
+    }
+
+    pub fn tpm_add(&self, provider: &str, tokens: u64) {
+        let now_ms = epoch_ms();
+        let idx = now_ms / RPM_WINDOW_MS;
+        let mut map = self.tpm.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let w = map.entry(provider.to_string()).or_default();
+        roll(w, idx);
+        w.curr += tokens as f64;
     }
 
     // ---- per-model failure-rate window (litellm rule) ----

@@ -759,7 +759,7 @@ async fn handle_chat_inner(
                 !server_tools.is_empty(),
                 multi,
             ) {
-                saw_rpm_limit |= reason == "rpm limit";
+                saw_rpm_limit |= reason == "rpm limit" || reason == "tpm limit";
                 // Filter reasons for context start with "context", the
                 // server-tool skip with "server tools" — both deterministic.
                 // Everything else (cooldown/rpm/limits/disabled) is an
@@ -1132,6 +1132,9 @@ fn remaining_headroom(cfg: &Config, state: &State, cand: &Candidate) -> f64 {
     if let Some(rpm) = limits.rpm.filter(|r| *r > 0) {
         used.push(state.rpm_effective(&cand.state_provider()) / rpm as f64);
     }
+    if let Some(tpm) = limits.tpm.filter(|t| *t > 0) {
+        used.push(state.tpm_effective(&cand.state_provider()) / tpm as f64);
+    }
     if let Ok(w) = current_windows(limits, Timestamp::now()) {
         let day = state
             .usage(&cand.state_provider(), "day", w.day_start)
@@ -1234,6 +1237,11 @@ fn check_candidate(
         if let Some(rpm) = limits.rpm {
             if app.state.rpm_effective(&cand.state_provider()) >= rpm as f64 {
                 return Err("rpm limit".into());
+            }
+        }
+        if let Some(tpm) = limits.tpm {
+            if app.state.tpm_effective(&cand.state_provider()) >= tpm as f64 {
+                return Err("tpm limit".into());
             }
         }
         // Limit checks fail open on infrastructure errors (litellm rule):
@@ -4021,6 +4029,7 @@ fn record_usage_inner(
         .get(provider)
         .and_then(|p| p.limits.as_ref())
         .unwrap_or(&default_limits);
+    app.state.tpm_add(state_provider, usage.input + usage.output);
     if let Ok(w) = current_windows(limits, Timestamp::now()) {
         let res = if request {
             app.state.record_usage(
@@ -5273,6 +5282,35 @@ mod tests {
             http: reqwest::Client::new(),
             cfg,
         })
+    }
+
+    #[test]
+    fn tpm_limit_skips_candidate_after_a_minute_of_tokens() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/c"
+            models = ["m"]
+            [providers.p.limits]
+            tpm = 1000
+            [groups.g]
+            models = ["p/m"]
+            "#,
+            "tpm",
+        );
+        let cand = app.catalog.resolve(&app.cfg, "p/m").remove(0);
+        assert_eq!(check_candidate(&app, &cand, 10, false, false, true), Ok(()));
+        app.state.tpm_add("p", 999);
+        assert_eq!(check_candidate(&app, &cand, 10, false, false, true), Ok(()));
+        app.state.tpm_add("p", 1);
+        assert_eq!(
+            check_candidate(&app, &cand, 10, false, false, true),
+            Err("tpm limit".to_string())
+        );
+        // The window is the same blend as rpm: nearly exhausted means little
+        // headroom left.
+        assert!(remaining_headroom(&app.cfg, &app.state, &cand) < 0.01);
     }
 
     #[test]

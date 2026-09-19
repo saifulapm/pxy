@@ -112,6 +112,9 @@ pub fn explain(cfg: &Config, requested: &str, json: bool) -> Result<()> {
                 if let Some(rpm) = limits.rpm {
                     notes.push(format!("rpm cap {rpm} (live window unknown outside the daemon)"));
                 }
+                if let Some(tpm) = limits.tpm {
+                    notes.push(format!("tpm cap {tpm} (live window unknown outside the daemon)"));
+                }
                 if cand.model.tool_call == Some(false) {
                     notes.push("tool_call=false: skipped for tools requests in a group".into());
                 }
