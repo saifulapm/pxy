@@ -116,6 +116,13 @@ fn launch_claude(
     // In-session /model switching across every pxy provider: the picker
     // reads /v1/models, which mirrors all ids under a "claude/" prefix.
     cmd.env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");
+    // Claude Code switches tool search off when ANTHROPIC_BASE_URL is not a
+    // first-party Anthropic host (litellm cli/commands/agents.py, read
+    // 2026-09-19), which would silently disable the tool_search pxy serves
+    // (wiki:tool-search). An inherited value is the user's call.
+    if std::env::var_os("ENABLE_TOOL_SEARCH").is_none() {
+        cmd.env("ENABLE_TOOL_SEARCH", "true");
+    }
 
     // Claude Code assumes a 200K context for model ids it doesn't recognize —
     // wrong in both directions, and it says so at startup. Declare the real
