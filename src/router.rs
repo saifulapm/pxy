@@ -1871,6 +1871,16 @@ async fn try_candidate_inner(
             // ran inside the stream machinery; re-assemble the client
             // dialect's JSON from the translated stream.
             Ok(outcome) => AttemptResult::Done(collect_stream_json(outcome, client_format).await),
+            // Refused before a byte reached the client. A single candidate
+            // has nowhere to walk to, so its refusal is simply the answer.
+            Err(StreamFailure::Refused(outcome)) => {
+                let outcome = if stream {
+                    outcome
+                } else {
+                    collect_stream_json(outcome, client_format).await
+                };
+                if multi { AttemptResult::Refused(outcome) } else { AttemptResult::Done(outcome) }
+            }
             Err(StreamFailure::ErrorEvent(data)) => {
                 // The stream's first event was the real error: classify it
                 // exactly like an HTTP error status would have been, so a
@@ -3889,6 +3899,11 @@ enum StreamFailure {
     /// the caller can classify by the embedded status — a 400-class error
     /// must still pass through unmodified, not turn into a synthetic 429.
     ErrorEvent(String),
+    /// A safety classifier refused before any output reached the client, so
+    /// the turn can still be walked past. The outcome is the stream exactly
+    /// as it would have been committed, for a walk that refused all the way
+    /// through and has to answer with the last refusal.
+    Refused(Outcome),
 }
 
 /// An SSE data payload that means the 200 status lied. Checked on the FIRST
@@ -3902,6 +3917,54 @@ fn stream_error_event(data: &str) -> Option<StreamFailure> {
     let v: Value = serde_json::from_str(trimmed).ok()?;
     let is_err = !v["error"].is_null() || v["type"].as_str() == Some("error");
     is_err.then(|| StreamFailure::ErrorEvent(trimmed.to_string()))
+}
+
+/// True when this event ends the pre-commit hold: it carries payload the
+/// client must see, or it ends the turn. Everything a fresh stream says
+/// before that — Anthropic `message_start`, `ping`, `content_block_start`,
+/// an OpenAI role-only delta — announces the turn without answering it, and
+/// a refusal can still arrive with nothing billed and nothing sent.
+fn stream_event_commits(data: &str, upstream: WireFormat) -> bool {
+    let trimmed = data.trim();
+    // Terminal in every dialect. `stream_error_event` reads a bare one as
+    // death first, so this arm only matters to a caller asking the question
+    // on its own.
+    if trimmed == "[DONE]" {
+        return true;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(trimmed) else { return false };
+    match upstream {
+        WireFormat::Anthropic => {
+            v["type"] == "content_block_delta" || !v["delta"]["stop_reason"].is_null()
+        }
+        WireFormat::Openai | WireFormat::Responses => {
+            let choice = &v["choices"][0];
+            let carries = |v: &Value| match v {
+                Value::Null => false,
+                Value::String(s) => !s.is_empty(),
+                Value::Array(a) => !a.is_empty(),
+                _ => true,
+            };
+            !choice["finish_reason"].is_null()
+                || ["content", "reasoning_content", "reasoning", "tool_calls"]
+                    .iter()
+                    .any(|k| carries(&choice["delta"][*k]))
+        }
+    }
+}
+
+/// True when the event that ended the hold ended the turn in a safety
+/// refusal, read in the upstream's own dialect exactly as the non-streaming
+/// `upstream_refused` reads it: Anthropic puts `stop_reason` in the
+/// `message_delta`, OpenAI-format upstreams finish `content_filter`.
+fn stream_event_refused(data: &str, upstream: WireFormat) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { return false };
+    match upstream {
+        WireFormat::Anthropic => v["delta"]["stop_reason"] == "refusal",
+        WireFormat::Openai | WireFormat::Responses => {
+            v["choices"][0]["finish_reason"] == "content_filter"
+        }
+    }
 }
 
 /// Best-effort HTTP status embedded in a stream error event. Numeric
@@ -4020,12 +4083,16 @@ async fn stream_outcome(
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
-    // its first complete event. `sniff` re-parses the raw bytes because
-    // process() consumes them through translators that don't surface events.
+    // an event that carries payload or ends the turn. `sniff` re-parses the
+    // raw bytes because process() consumes them through translators that
+    // don't surface events. Holding through the announcement events is what
+    // lets a refusal that fires before any output fail over: it arrives as a
+    // successful 200 whose turn ended, with nothing sent to the client yet.
     let mut sniff = SseParser::new();
     let mut held: Vec<Bytes> = Vec::new();
+    let mut refused = false;
     let deadline = tokio::time::Instant::now() + FIRST_EVENT_DEADLINE;
-    loop {
+    'hold: loop {
         let next = match tokio::time::timeout_at(deadline, ctx.upstream.next()).await {
             Ok(n) => n,
             // Deadline: no proof of death, so commit and stream as-is.
@@ -4038,11 +4105,17 @@ async fn stream_outcome(
                 if !out.is_empty() {
                     held.push(out);
                 }
-                let Some(first) = events.first() else { continue };
-                if let Some(failure) = stream_error_event(&first.data) {
-                    return Err(failure);
+                for event in &events {
+                    // Sniffed on every held event, not just the first: an
+                    // aggregator's error can follow its own message_start.
+                    if let Some(failure) = stream_error_event(&event.data) {
+                        return Err(failure);
+                    }
+                    if stream_event_commits(&event.data, upstream_format) {
+                        refused = stream_event_refused(&event.data, upstream_format);
+                        break 'hold;
+                    }
                 }
-                break;
             }
             Some(Err(e)) => {
                 return Err(StreamFailure::Dead(format!("stream failed before first event: {e}")))
@@ -4091,11 +4164,14 @@ async fn stream_outcome(
         }
     });
 
-    Ok(Outcome::Stream {
+    let outcome = Outcome::Stream {
         provider: cand.full_id(),
         body: axum::body::Body::from_stream(head.chain(rest)),
         headers: fwd_headers,
-    })
+    };
+    // The refusal is carried as the stream it would have been, so the caller
+    // can hand it to the client unchanged when no candidate answers.
+    if refused { Err(StreamFailure::Refused(outcome)) } else { Ok(outcome) }
 }
 
 /// Drain a translated client stream into the equivalent non-streaming JSON
@@ -10296,6 +10372,205 @@ mod tests {
             Outcome::Stream { .. } => panic!("expected json"),
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a single candidate is never re-attempted");
+    }
+
+    /// Anthropic SSE that announces a turn and then refuses it, with no
+    /// content_block_delta in between: the refusal is the whole answer.
+    const ANTHROPIC_REFUSAL_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+        "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// OpenAI SSE that opens the assistant turn and then finishes it
+    /// content_filter, again with no payload delta.
+    const OPENAI_REFUSAL_SSE: &str = concat!(
+        "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// A streamed refusal that fires before any output is the same content
+    /// outcome as a non-streamed one, but the old hold committed on the
+    /// first complete event — message_start — so the client was already
+    /// receiving the stream when the refusal arrived and the rest of the
+    /// chain went unspent. The hold now runs to payload or end of turn.
+    #[tokio::test]
+    async fn refusal_stream_before_output_fails_over() {
+        use axum::routing::post;
+        let router = axum::Router::new()
+            .route("/safe", post(|| async { ANTHROPIC_REFUSAL_SSE }))
+            .route("/filter", post(|| async { OPENAI_REFUSAL_SSE }))
+            .route("/open", post(|| async { ANSWER_SSE }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.safe]
+                base_url = "{base}/safe"
+                format = "anthropic"
+                models = ["m"]
+                [providers.filter]
+                base_url = "{base}/filter"
+                models = ["m"]
+                [providers.open]
+                base_url = "{base}/open"
+                models = ["m"]
+                [groups.anth]
+                models = ["safe/m", "open/m"]
+                [groups.oai]
+                models = ["filter/m", "open/m"]
+                "#
+            ),
+            "refusal_stream",
+        );
+
+        for (group, refuser) in [("anth", "safe"), ("oai", "filter")] {
+            // Distinct openers: the session key is hashed from the first
+            // message, and a binding from the first walk would otherwise
+            // start the second one on the candidate that answered.
+            let payload = json!({"model": group, "stream": true,
+                "messages": [{"role": "user", "content": format!("hi {group}")}]});
+            let out =
+                handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+                    .await;
+            match out {
+                Outcome::Stream { provider, body, headers } => {
+                    assert_eq!(provider, "open/m", "{refuser} refused: walk on");
+                    let skipped =
+                        headers.iter().find(|(k, _)| k == "x-pxy-skipped").map(|(_, v)| v);
+                    assert_eq!(skipped.map(String::as_str), Some(&*format!("{refuser}/m: refused")));
+                    let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(text.contains("done"), "the answering candidate streams: {text}");
+                    assert!(
+                        !text.contains("refusal") && !text.contains("content_filter"),
+                        "nothing of the refused stream reached the client: {text}"
+                    );
+                }
+                Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+            }
+            // A refusal judges the prompt, not the model: no cooldown.
+            assert!(app.state.cooldown(refuser, "m").is_none());
+        }
+    }
+
+    /// Once text is committed pxy cannot take the bytes back, so a refusal
+    /// after partial output streams through as it stood — discarding the
+    /// partial answer is the client's call, not ours.
+    #[tokio::test]
+    async fn refusal_stream_after_text_passes_through() {
+        use axum::routing::post;
+        const LATE_REFUSAL_SSE: &str = concat!(
+            "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let router = axum::Router::new()
+            .route("/late", post(|| async { LATE_REFUSAL_SSE }))
+            .route("/open", post(|| async { ANSWER_SSE }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.late]
+                base_url = "{base}/late"
+                models = ["m"]
+                [providers.open]
+                base_url = "{base}/open"
+                models = ["m"]
+                [groups.free]
+                models = ["late/m", "open/m"]
+                "#
+            ),
+            "refusal_stream_late",
+        );
+
+        let payload = json!({"model": "free", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Stream { provider, body, headers } => {
+                assert_eq!(provider, "late/m", "a committed stream is never failed over");
+                assert!(headers.iter().all(|(k, _)| k != "x-pxy-skipped"));
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("partial"), "committed text reaches the client: {text}");
+                assert!(text.contains("content_filter"), "and so does the refusal: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        assert!(app.state.cooldown("late", "m").is_none());
+    }
+
+    /// The hold ends at payload or at the end of the turn, not at the first
+    /// complete event: a stream that only announced itself has said nothing,
+    /// and dying there is a failover, not a truncated turn for the client.
+    #[tokio::test]
+    async fn stream_holds_through_message_start() {
+        use axum::routing::post;
+        let anth = |data: &str| stream_event_commits(data, WireFormat::Anthropic);
+        assert!(!anth(r#"{"type":"message_start","message":{"id":"m1","content":[]}}"#));
+        assert!(!anth(r#"{"type":"ping"}"#));
+        assert!(!anth(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
+        assert!(anth(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#));
+        assert!(anth(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}"#));
+        assert!(anth(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#));
+        let oai = |data: &str| stream_event_commits(data, WireFormat::Openai);
+        assert!(!oai(r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#));
+        assert!(!oai(r#"{"choices":[{"index":0,"delta":{"tool_calls":[]}}]}"#));
+        assert!(oai(r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#));
+        assert!(oai(r#"{"choices":[{"index":0,"delta":{"reasoning_content":"hm"}}]}"#));
+        assert!(oai(r#"{"choices":[{"index":0,"delta":{"reasoning":"hm"}}]}"#));
+        assert!(oai(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0}]}}]}"#));
+        assert!(oai(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#));
+        assert!(oai("[DONE]"));
+
+        // And the walk acts on it: `mute` opens a turn and dies there.
+        let router = axum::Router::new()
+            .route("/mute", post(|| async {
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"
+            }))
+            .route("/open", post(|| async { ANSWER_SSE }));
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.mute]
+                base_url = "{base}/mute"
+                format = "anthropic"
+                models = ["m"]
+                [providers.open]
+                base_url = "{base}/open"
+                models = ["m"]
+                [groups.free]
+                models = ["mute/m", "open/m"]
+                "#
+            ),
+            "stream_hold",
+        );
+
+        let payload = json!({"model": "free", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Stream { provider, body, .. } => {
+                assert_eq!(provider, "open/m", "a stream that only announced itself is dead");
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains("done"));
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        // Death before commit is model-scoped, exactly as it was before.
+        assert!(app.state.cooldown("mute", "m").is_some());
     }
 
     #[tokio::test]
