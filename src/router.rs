@@ -545,15 +545,18 @@ async fn parse_one_file(
     if let Ok(Some(cached)) = app.state.kv_get(&key) {
         return Ok(cached);
     }
-    let markdown =
+    let parsed =
         pdf::pdf_to_markdown(app, &bytes, engine, cfg.ocr_model.as_deref(), cfg.max_pages, ctx)
             .await?;
     // No TTL: the same bytes parse to the same text forever, and a client
-    // resends its whole history every turn.
-    if let Err(e) = app.state.kv_set(&key, &markdown) {
-        warn!(error = %e, "file-parser could not cache a parse");
+    // resends its whole history every turn. A parse with a failed OCR leg
+    // is served but not kept: the next turn gets to try the model again.
+    if parsed.complete {
+        if let Err(e) = app.state.kv_set(&key, &parsed.markdown) {
+            warn!(error = %e, "file-parser could not cache a parse");
+        }
     }
-    Ok(markdown)
+    Ok(parsed.markdown)
 }
 
 /// `file_data` is a base64 data URL or a URL to fetch.

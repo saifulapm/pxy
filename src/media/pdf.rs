@@ -45,6 +45,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A parsed PDF. `complete` is false when an OCR leg failed and poppler's
+/// text (or the no-text note) stands in for that page: the Markdown is
+/// still the best answer for this turn, but not one to cache under the
+/// file's hash forever, or a transient failure would silence OCR for these
+/// bytes for good (seen live 2026-09-19).
+pub struct Parsed {
+    pub markdown: String,
+    pub complete: bool,
+}
+
 /// Parse a PDF into Markdown, one section per page. `Err` is a file pxy could
 /// not read at all, which the caller turns into the one-line part that
 /// replaces the file; a page that failed on its own is reported in place.
@@ -55,7 +65,7 @@ pub async fn pdf_to_markdown(
     ocr_model: Option<&str>,
     max_pages: u64,
     caller: &ClientContext,
-) -> Result<String, String> {
+) -> Result<Parsed, String> {
     let dir = scratch_dir()?;
     let parsed = parse(app, &dir, bytes, engine, ocr_model, max_pages, caller).await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -70,26 +80,29 @@ async fn parse(
     ocr_model: Option<&str>,
     max_pages: u64,
     caller: &ClientContext,
-) -> Result<String, String> {
+) -> Result<Parsed, String> {
     let pdf = dir.join("in.pdf");
     std::fs::write(&pdf, bytes).map_err(|e| format!("cannot stage the file: {e}"))?;
     let pages = pdftotext(&pdf).await?;
     let kept = pages.len().min(max_pages as usize);
 
     let mut out = Vec::new();
+    let mut complete = true;
     for (i, text) in pages.iter().take(kept).enumerate() {
         let n = i + 1;
-        let body = page(app, &pdf, n, text, engine, ocr_model, caller).await;
+        let (body, ok) = page(app, &pdf, n, text, engine, ocr_model, caller).await;
+        complete &= ok;
         out.push(format!("## Page {n}\n\n{body}"));
     }
     if pages.len() > kept {
         out.push(format!("[{} more pages not parsed]", pages.len() - kept));
     }
-    Ok(out.join("\n\n"))
+    Ok(Parsed { markdown: out.join("\n\n"), complete })
 }
 
 /// One page's Markdown: poppler's text, what the OCR model read, or the note
-/// that says the page held neither.
+/// that says the page held neither. The flag is false when an OCR leg was
+/// wanted and failed.
 async fn page(
     app: &SharedApp,
     pdf: &Path,
@@ -98,25 +111,30 @@ async fn page(
     engine: Engine,
     ocr_model: Option<&str>,
     caller: &ClientContext,
-) -> String {
+) -> (String, bool) {
     let thin = text.chars().filter(|c| !c.is_whitespace()).count() < THIN_PAGE;
     let wants_ocr = match engine {
         Engine::Pdftotext => false,
         Engine::Ocr => true,
         Engine::Auto => thin,
     };
+    let mut ok = true;
     if wants_ocr && let Some(model) = ocr_model {
         // A leg that failed leaves poppler's text standing: half a page beats
         // none, and the model is never told a page was skipped.
         match ocr(app, pdf, n, model, caller).await {
-            Ok(markdown) => return markdown,
-            Err(e) => warn!(page = n, error = %e, "pdf ocr leg failed"),
+            Ok(markdown) => return (markdown, true),
+            Err(e) => {
+                warn!(page = n, error = %e, "pdf ocr leg failed");
+                ok = false;
+            }
         }
     }
-    match text.trim() {
+    let body = match text.trim() {
         "" => format!("[page {n}: no text]"),
         text => text.to_string(),
-    }
+    };
+    (body, ok)
 }
 
 /// poppler's text, split into pages.
@@ -258,7 +276,8 @@ mod tests {
         let app = mock_app("[server]\n", "pages");
         let md = pdf_to_markdown(&app, FIXTURE, Engine::Pdftotext, None, 20, &ctx())
             .await
-            .unwrap();
+            .unwrap()
+            .markdown;
         assert!(md.contains("## Page 1"), "{md}");
         assert!(md.contains("Hello, pxy."), "{md}");
         assert!(md.contains("## Page 2"), "{md}");
@@ -270,7 +289,8 @@ mod tests {
         let app = mock_app("[server]\n", "cut");
         let md = pdf_to_markdown(&app, FIXTURE, Engine::Pdftotext, None, 1, &ctx())
             .await
-            .unwrap();
+            .unwrap()
+            .markdown;
         assert!(md.contains("Hello, pxy."), "{md}");
         assert!(!md.contains("## Page 2"), "{md}");
         assert!(md.ends_with("[1 more pages not parsed]"), "{md}");
@@ -287,9 +307,11 @@ mod tests {
             "ocr",
         );
 
-        let md = pdf_to_markdown(&app, FIXTURE, Engine::Auto, Some("p/reads"), 20, &ctx())
+        let parsed = pdf_to_markdown(&app, FIXTURE, Engine::Auto, Some("p/reads"), 20, &ctx())
             .await
             .unwrap();
+        assert!(parsed.complete);
+        let md = parsed.markdown;
 
         assert!(md.contains("Hello, pxy."), "page 1 keeps poppler's text: {md}");
         assert!(md.contains("scanned page two"), "{md}");
@@ -308,10 +330,28 @@ mod tests {
     #[tokio::test]
     async fn a_blank_page_without_an_ocr_model_is_reported() {
         let app = mock_app("[server]\n", "noocr");
-        let md = pdf_to_markdown(&app, FIXTURE, Engine::Auto, None, 20, &ctx())
+        let parsed = pdf_to_markdown(&app, FIXTURE, Engine::Auto, None, 20, &ctx())
             .await
             .unwrap();
-        assert!(md.contains("[page 2: no text]"), "{md}");
+        assert!(parsed.complete, "no OCR wanted means nothing failed");
+        assert!(parsed.markdown.contains("[page 2: no text]"), "{}", parsed.markdown);
+    }
+
+    /// An OCR leg that fails leaves the note standing for this turn and marks
+    /// the parse incomplete, so the caller does not cache it under the file's
+    /// hash forever.
+    #[tokio::test]
+    async fn a_failed_ocr_leg_marks_the_parse_incomplete() {
+        let app = mock_app(
+            "[server]\n[providers.p]\nbase_url = \"http://127.0.0.1:1/c\"\nmodels = [\"reads\"]\n",
+            "ocrfail",
+        );
+        let parsed = pdf_to_markdown(&app, FIXTURE, Engine::Auto, Some("p/reads"), 20, &ctx())
+            .await
+            .unwrap();
+        assert!(!parsed.complete);
+        assert!(parsed.markdown.contains("Hello, pxy."), "{}", parsed.markdown);
+        assert!(parsed.markdown.contains("[page 2: no text]"), "{}", parsed.markdown);
     }
 
     fn ctx() -> ClientContext {
