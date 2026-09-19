@@ -4,10 +4,12 @@
 //! pi = an extension in ~/.pi/agent/extensions that registers the provider.
 
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 
 use crate::catalog::Catalog;
 use crate::config::Config;
@@ -29,7 +31,7 @@ pub fn launch(
         "claude" => launch_claude(cfg, &catalog, &model, dry_run, extra_args),
         "opencode" => launch_opencode(cfg, &catalog, &model, dry_run, extra_args),
         "pi" => launch_pi(cfg, &model, dry_run, extra_args),
-        "codex" => launch_codex(cfg, &model, dry_run, extra_args),
+        "codex" => launch_codex(cfg, &catalog, &model, dry_run, extra_args),
         "fx" => launch_fx(cfg, &model, dry_run, extra_args),
         other => {
             anyhow::bail!("unknown agent '{other}' (supported: claude, opencode, pi, codex, fx)")
@@ -215,7 +217,13 @@ fn launch_opencode(
 /// codex is wired entirely through `-c` config overrides (parsed as TOML), so
 /// ~/.codex/config.toml is never touched. wire_api = "responses" points it at
 /// pxy's /v1/responses endpoint.
-fn launch_codex(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String]) -> Result<()> {
+fn launch_codex(
+    cfg: &Config,
+    catalog: &Catalog,
+    model: &str,
+    dry_run: bool,
+    extra_args: &[String],
+) -> Result<()> {
     let mut cmd = Command::new("codex");
     for (k, v) in [
         ("model_provider", "\"pxy\"".to_string()),
@@ -229,11 +237,156 @@ fn launch_codex(cfg: &Config, model: &str, dry_run: bool, extra_args: &[String])
     ] {
         cmd.arg("-c").arg(format!("{k}={v}"));
     }
+    // -m picks the model to start on; the picker behind /model is a separate
+    // list codex ships, so without this it offers OpenAI's slugs alone.
+    let mut note = "codex wired via -c model_providers.pxy overrides".to_string();
+    match codex_catalog_file(cfg, catalog, model) {
+        Ok(path) => {
+            cmd.arg("-c").arg(codex_catalog_override(&path));
+            note.push_str(&format!("; /model picker from {}", path.display()));
+        }
+        Err(e) => eprintln!("pxy: /model shows codex's own models: {e:#}"),
+    }
     cmd.arg("-m").arg(model);
     cmd.args(extra_args);
     cmd.env("PXY_API_KEY", tagged_key(cfg, "codex"));
 
-    exec_or_print(cmd, dry_run, "codex wired via -c model_providers.pxy overrides")
+    exec_or_print(cmd, dry_run, &note)
+}
+
+/// One row pxy wants in codex's picker: a group name or a `provider/model`
+/// id, the label the other launchers show for it, and the window it serves.
+pub struct CodexEntry {
+    pub id: String,
+    pub name: String,
+    pub window: u64,
+}
+
+/// Every id pxy serves, in the order launch_opencode lists them: the groups
+/// first, then every provider/model.
+fn codex_entries(catalog: &Catalog) -> Vec<CodexEntry> {
+    let mut entries = Vec::new();
+    for (name, group) in catalog.groups() {
+        let (ctx, _) = crate::catalog::chain_limits(&group.chain);
+        entries.push(CodexEntry { id: name.clone(), name: group.label.clone(), window: ctx });
+    }
+    for cand in catalog.models() {
+        entries.push(CodexEntry {
+            id: cand.full_id(),
+            name: cand.model.name.clone().unwrap_or_else(|| cand.full_id()),
+            window: cand.model.context_length,
+        });
+    }
+    entries
+}
+
+/// pxy's catalog in the shape codex reads from `model_catalog_json`. A stock
+/// entry is reused whole when the slug matches, so codex keeps everything it
+/// knows about that model; every other id is cloned off the first stock entry,
+/// which is how base_instructions and the tool flags stay codex's own. Only
+/// context_window carries pxy's number — max_context_window is left as the
+/// template has it, because codex reads the pair together.
+fn codex_catalog(stock: &Value, entries: &[CodexEntry]) -> Value {
+    let stock_models = stock["models"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let Some(template) = stock_models.first().filter(|t| t.is_object()) else {
+        return json!({ "models": [] });
+    };
+    let models: Vec<Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let mut row = match stock_models.iter().find(|m| m["slug"] == entry.id.as_str()) {
+                Some(stock) => stock.clone(),
+                None => {
+                    let mut row = template.clone();
+                    row["slug"] = json!(entry.id);
+                    row["display_name"] = json!(entry.name);
+                    row["context_window"] = json!(entry.window);
+                    // No effort picker for a pxy id: the chain decides, and the
+                    // "-high" suffix ids route on their own.
+                    row["supported_reasoning_levels"] = json!([]);
+                    // The template's retirement notice and first-run blurb
+                    // belong to its model, not to this one.
+                    row["upgrade"] = Value::Null;
+                    row["availability_nux"] = Value::Null;
+                    row
+                }
+            };
+            row["priority"] = json!(i + 1);
+            row["visibility"] = json!("list");
+            row
+        })
+        .collect();
+    json!({ "models": models })
+}
+
+fn codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::home_dir().join(".codex"))
+}
+
+fn codex_catalog_override(file: &Path) -> String {
+    format!("model_catalog_json=\"{}\"", file.display())
+}
+
+/// Write pxy's catalog where codex can read it and hand the path back — but
+/// only after codex has read the file itself and listed the launch model. A
+/// file codex rejects would leave the picker empty and the launch model with
+/// it, so a preflight that fails anywhere is worth less than doing nothing.
+fn codex_catalog_file(cfg: &Config, catalog: &Catalog, model: &str) -> Result<PathBuf> {
+    let stock = codex_debug_models(cfg, None).context("reading codex's own catalog")?;
+    let built = codex_catalog(&stock, &codex_entries(catalog));
+    let path = codex_home().join("pxy-models.json");
+    crate::config::write_atomic(&path, &serde_json::to_vec(&built)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    let read_back = codex_debug_models(cfg, Some(&path)).context("reading the catalog back")?;
+    let listed = read_back["models"]
+        .as_array()
+        .is_some_and(|models| models.iter().any(|m| m["slug"] == model));
+    anyhow::ensure!(listed, "codex read {} without '{model}' in it", path.display());
+    Ok(path)
+}
+
+/// codex 0.147.0 prints its catalog with `codex debug models` and replaces it
+/// with `-c model_catalog_json=<path>` (probed 2026-09-19). Neither invocation
+/// touches the network, so the only way this hangs is codex itself.
+const CODEX_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn codex_debug_models(cfg: &Config, catalog_file: Option<&Path>) -> Result<Value> {
+    let out = std::env::temp_dir().join(format!("pxy-codex-models.{}.json", std::process::id()));
+    let models = run_codex_debug_models(cfg, catalog_file, &out);
+    let _ = std::fs::remove_file(&out);
+    models
+}
+
+fn run_codex_debug_models(cfg: &Config, catalog_file: Option<&Path>, out: &Path) -> Result<Value> {
+    let mut cmd = Command::new("codex");
+    if let Some(file) = catalog_file {
+        cmd.arg("-c").arg(codex_catalog_override(file));
+    }
+    cmd.arg("debug").arg("models");
+    cmd.env("PXY_API_KEY", tagged_key(cfg, "codex"));
+    // The catalog runs to a few hundred KB — past a pipe's buffer, and nothing
+    // drains that pipe until the child exits, so stdout goes to a file.
+    cmd.stdout(std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?);
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().context("running codex debug models")?;
+
+    let deadline = Instant::now() + CODEX_PROBE_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("codex debug models ran past {}s", CODEX_PROBE_TIMEOUT.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    anyhow::ensure!(status.success(), "codex debug models exited with {status}");
+    Ok(serde_json::from_slice(&std::fs::read(out)?)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,4 +462,101 @@ fn install_pi_extension(cfg: &Config, path: &std::path::Path, dry_run: bool) -> 
     crate::config::write_atomic(path, source.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `codex debug models` as codex 0.147.0 prints it, three entries kept and
+    /// the long instruction strings trimmed.
+    fn stock() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/fixtures/codex-debug-models.json")).unwrap()
+    }
+
+    #[test]
+    fn codex_catalog_reuses_stock_and_clones_unknown() {
+        let entries = vec![
+            CodexEntry { id: "aaa".into(), name: "aaa chain".into(), window: 200_000 },
+            CodexEntry { id: "gpt-5.5".into(), name: "pxy name".into(), window: 12 },
+            CodexEntry { id: "gpt-5.4".into(), name: "pxy name".into(), window: 12 },
+        ];
+        let built = codex_catalog(&stock(), &entries);
+        let models = built["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+
+        // Unknown slug: cloned off the first stock entry, so codex's own
+        // instructions and tool flags come along untouched.
+        let cloned = &models[0];
+        assert_eq!(cloned["slug"], "aaa");
+        assert_eq!(cloned["display_name"], "aaa chain");
+        assert_eq!(cloned["context_window"], 200_000);
+        assert_eq!(cloned["base_instructions"], stock()["models"][0]["base_instructions"]);
+        assert_eq!(cloned["apply_patch_tool_type"], stock()["models"][0]["apply_patch_tool_type"]);
+        // max_context_window stays the template's (ruling 7), the picker's
+        // effort list goes, and neither an upgrade notice nor a first-run
+        // message belongs on a pxy id.
+        assert_eq!(cloned["max_context_window"], stock()["models"][0]["max_context_window"]);
+        assert_eq!(cloned["supported_reasoning_levels"], serde_json::json!([]));
+        assert_eq!(cloned["upgrade"], serde_json::Value::Null);
+        assert_eq!(cloned["availability_nux"], serde_json::Value::Null);
+
+        // Matching slug: the stock entry itself, its own name and window kept.
+        let reused = &models[1];
+        assert_eq!(reused["slug"], "gpt-5.5");
+        assert_eq!(reused["display_name"], "GPT-5.5");
+        assert_eq!(reused["context_window"], 272_000);
+        assert_eq!(reused["supported_reasoning_levels"].as_array().unwrap().len(), 4);
+
+        // Every row is listed, in pxy's order — a stock entry codex hides
+        // (gpt-5.4) included, or a pxy id would be missing from the picker.
+        assert_eq!(cloned["priority"], 1);
+        assert_eq!(reused["priority"], 2);
+        assert_eq!(cloned["visibility"], "list");
+        assert_eq!(reused["visibility"], "list");
+        assert_eq!(models[2]["slug"], "gpt-5.4");
+        assert_eq!(models[2]["visibility"], "list");
+    }
+
+    #[test]
+    fn codex_catalog_orders_by_pxy_listing() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.openai]
+            base_url = "https://o.example/chat"
+            models = ["gpt-5.4", { id = "o-mini", context_length = 64000 }]
+            [providers.zai]
+            base_url = "https://z.example/chat"
+            models = ["glm-4.7-flash"]
+            [groups.muse]
+            models = ["zai/glm-4.7-flash"]
+            [groups.aaa]
+            models = ["openai/gpt-5.4"]
+            "#,
+        )
+        .unwrap();
+        let catalog = Catalog::from_config(&cfg);
+        let entries = codex_entries(&catalog);
+        let built = codex_catalog(&stock(), &entries);
+        let slugs: Vec<&str> =
+            built["models"].as_array().unwrap().iter().map(|m| m["slug"].as_str().unwrap()).collect();
+        // Groups first (alphabetical, as the catalog holds them), then every
+        // provider/model id — the order launch_opencode lists.
+        assert_eq!(slugs, ["aaa", "muse", "openai/gpt-5.4", "openai/o-mini", "zai/glm-4.7-flash"]);
+        let priorities: Vec<u64> = built["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["priority"].as_u64().unwrap())
+            .collect();
+        assert_eq!(priorities, [1, 2, 3, 4, 5]);
+        // Each id carries its own window: a model its context_length, a group
+        // the narrowest window its chain can serve.
+        let by_slug = |s: &str| {
+            built["models"].as_array().unwrap().iter().find(|m| m["slug"] == s).unwrap().clone()
+        };
+        assert_eq!(by_slug("openai/o-mini")["context_window"], 64_000);
+        assert_eq!(by_slug("muse")["context_window"], by_slug("zai/glm-4.7-flash")["context_window"]);
+    }
 }
