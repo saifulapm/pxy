@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::catalog::{Candidate, Catalog};
 use crate::config::{Config, ErrorAction, ServerToolsConfig, WireFormat};
+use crate::media::pdf;
 use crate::secrets::Secrets;
 use crate::state::State;
 use crate::translate::server_tools;
@@ -427,8 +428,13 @@ pub fn handle_chat(
 /// Plugin ids pxy implements. OpenRouter's vocabulary is larger; an id that is
 /// not here is ignored with a log, because a client that names one still wants
 /// its answer, not a 400.
-const KNOWN_PLUGINS: [&str; 1] = [RESPONSE_HEALING];
+const KNOWN_PLUGINS: [&str; 2] = [RESPONSE_HEALING, FILE_PARSER];
 const RESPONSE_HEALING: &str = "response-healing";
+const FILE_PARSER: &str = "file-parser";
+
+/// Far past any real document, and small enough that a data URL cannot eat
+/// the process.
+const MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
 
 /// The plugin ids a request turned on, from OpenRouter's `plugins` key. An
 /// entry pxy cannot read an id off is skipped.
@@ -445,6 +451,123 @@ pub fn request_plugins(payload: &Value) -> Vec<String> {
         ids.push(id.to_string());
     }
     ids
+}
+
+/// Replace every file part with the text pxy parsed out of it (wiki:plugins).
+///
+/// Runs before the candidate walk, so every candidate sees the same body and
+/// the parse happens once whichever model wins, and only at depth 0: a
+/// meta-tool's leg carries text its caller already parsed. A file pxy cannot
+/// read becomes one line saying why, never nothing: a model told a document
+/// failed can ask for it another way, where a model told nothing answers as
+/// if the document did not exist.
+pub async fn parse_file_parts(payload: &mut Value, app: &SharedApp, ctx: &ClientContext) {
+    let cfg = &app.cfg.plugins.file_parser;
+    if !cfg.enabled || ctx.tool_depth != 0 {
+        return;
+    }
+    let engine = requested_engine(payload);
+    let Some(messages) = payload["messages"].as_array_mut() else { return };
+    for message in messages {
+        let Some(parts) = message["content"].as_array_mut() else { continue };
+        for part in parts {
+            if part["type"] != "file" {
+                continue;
+            }
+            let name =
+                part["file"]["filename"].as_str().unwrap_or("document.pdf").to_string();
+            let data = part["file"]["file_data"].as_str().unwrap_or("").to_string();
+            let text = match parse_one_file(app, &data, engine, cfg, ctx).await {
+                Ok(markdown) => format!("[file {name}]\n{markdown}"),
+                Err(why) => {
+                    warn!(file = %name, error = %why, "file-parser could not read a file");
+                    format!("[file {name}: {why}]")
+                }
+            };
+            *part = json!({"type": "text", "text": text});
+        }
+    }
+}
+
+/// One file's Markdown, from `kv` when these bytes have been parsed before.
+async fn parse_one_file(
+    app: &SharedApp,
+    file_data: &str,
+    engine: pdf::Engine,
+    cfg: &crate::config::FileParserConfig,
+    ctx: &ClientContext,
+) -> Result<String, String> {
+    let bytes = file_bytes(app, file_data).await?;
+    // The magic bytes, not the declared media type: poppler is the only
+    // parser here, and a client's label is not evidence.
+    if !bytes.starts_with(b"%PDF") {
+        return Err("not a PDF".to_string());
+    }
+    let key = format!("file_parse:{}", pdf::sha256_hex(&bytes));
+    if let Ok(Some(cached)) = app.state.kv_get(&key) {
+        return Ok(cached);
+    }
+    let markdown =
+        pdf::pdf_to_markdown(app, &bytes, engine, cfg.ocr_model.as_deref(), cfg.max_pages, ctx)
+            .await?;
+    // No TTL: the same bytes parse to the same text forever, and a client
+    // resends its whole history every turn.
+    if let Err(e) = app.state.kv_set(&key, &markdown) {
+        warn!(error = %e, "file-parser could not cache a parse");
+    }
+    Ok(markdown)
+}
+
+/// `file_data` is a base64 data URL or a URL to fetch.
+async fn file_bytes(app: &SharedApp, file_data: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    if let Some((_, b64)) =
+        file_data.strip_prefix("data:").and_then(|rest| rest.split_once(";base64,"))
+    {
+        // Checked before decoding: the encoding is 4 characters per 3 bytes,
+        // so an oversize file is refused without ever being materialised.
+        if b64.len() / 4 * 3 > MAX_FILE_BYTES {
+            return Err("file is too large".to_string());
+        }
+        return base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("unreadable base64: {e}"));
+    }
+    if file_data.starts_with("https://") || file_data.starts_with("http://") {
+        let resp = app
+            .http
+            .get(file_data)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("cannot fetch the file: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("fetch failed: {}", resp.status().as_u16()));
+        }
+        if resp.content_length().is_some_and(|n| n > MAX_FILE_BYTES as u64) {
+            return Err("file is too large".to_string());
+        }
+        let bytes = resp.bytes().await.map_err(|e| format!("cannot read the file: {e}"))?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err("file is too large".to_string());
+        }
+        return Ok(bytes.to_vec());
+    }
+    Err("file_data must be a data URL or an https URL".to_string())
+}
+
+/// The engine the client asked for on its `file-parser` entry. Config has no
+/// say here: the engine is about one document, not the daemon.
+fn requested_engine(payload: &Value) -> pdf::Engine {
+    if !request_plugins(payload).iter().any(|id| id == FILE_PARSER) {
+        return pdf::Engine::Auto;
+    }
+    let asked = payload["plugins"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|e| e["id"] == FILE_PARSER))
+        .and_then(|entry| entry["pdf"]["engine"].as_str())
+        .unwrap_or_default();
+    pdf::Engine::from_name(asked)
 }
 
 /// Whether this turn's answer gets `response-healing`.
@@ -503,6 +626,9 @@ async fn handle_chat_inner(
             "request body must be a JSON object",
         );
     }
+    // Before anything reads the transcript: a PDF a client attached becomes
+    // the text every candidate, every translator and the tool loop then see.
+    parse_file_parts(&mut payload, &app, &ctx).await;
     let requested = payload["model"]
         .as_str()
         .filter(|m| !m.is_empty())
@@ -9798,6 +9924,140 @@ mod tests {
             "an entry with no id is skipped, never a 400"
         );
         assert!(request_plugins(&json!({"messages": []})).is_empty());
+    }
+
+    /// The two-page fixture media::pdf is tested on: page 1 typeset, page 2
+    /// empty.
+    const PDF: &[u8] = include_bytes!("../tests/fixtures/hello.pdf");
+
+    fn pdf_data_url() -> String {
+        use base64::Engine as _;
+        format!(
+            "data:application/pdf;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(PDF)
+        )
+    }
+
+    /// An upstream that answers anything and keeps every body it was sent.
+    async fn recording_upstream(seen: Arc<std::sync::Mutex<Vec<Value>>>) -> String {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/c",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body);
+                    axum::Json(json!({"id": "x", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"}]}))
+                }
+            }),
+        );
+        mock_server(router).await
+    }
+
+    fn pdf_request(file_data: &str, filename: &str) -> Value {
+        json!({"model": "p/m", "messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"filename": filename, "file_data": file_data}},
+            {"type": "text", "text": "summarise"},
+        ]}]})
+    }
+
+    fn first_part(body: &Value) -> Value {
+        body["messages"][0]["content"][0].clone()
+    }
+
+    /// The model never sees a file part: it sees the document as text, under
+    /// the name the client gave it. The second turn of a conversation resends
+    /// the same history, so the parse is read from kv instead of run again —
+    /// proved here by leaving a different text under the key.
+    #[tokio::test]
+    async fn file_parser_swaps_a_pdf_part_and_caches_the_parse() {
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let base = recording_upstream(seen.clone()).await;
+        let app = test_app(
+            &format!("[server]\n[providers.p]\nbase_url = \"{base}/c\"\nmodels = [\"m\"]\n"),
+            "file_parser_swap",
+        );
+
+        let payload = pdf_request(&pdf_data_url(), "hello.pdf");
+        handle_chat(app.clone(), ClientFormat::Openai, payload.clone(), ClientContext::default())
+            .await;
+        let sent = first_part(&seen.lock().unwrap()[0]);
+        assert_eq!(sent["type"], "text", "{sent}");
+        let text = sent["text"].as_str().unwrap();
+        assert!(text.starts_with("[file hello.pdf]\n"), "{text}");
+        assert!(text.contains("Hello, pxy."), "{text}");
+        assert!(text.contains("[page 2: no text]"), "{text}");
+
+        let key = format!("file_parse:{}", crate::media::pdf::sha256_hex(PDF));
+        app.state.kv_set(&key, "## Page 1\n\nread from kv").unwrap();
+        handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let again = first_part(&seen.lock().unwrap()[1]);
+        assert!(
+            again["text"].as_str().unwrap().contains("read from kv"),
+            "the same bytes must not be parsed twice: {again}"
+        );
+    }
+
+    /// A file pxy cannot read is one line the model can act on, and the turn
+    /// goes on: dropping the part would have the model answer about a
+    /// document it was never given.
+    #[tokio::test]
+    async fn file_parser_reports_what_it_cannot_parse() {
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let base = recording_upstream(seen.clone()).await;
+        let app = test_app(
+            &format!("[server]\n[providers.p]\nbase_url = \"{base}/c\"\nmodels = [\"m\"]\n"),
+            "file_parser_errors",
+        );
+        let ctx = ClientContext::default();
+
+        let cases = [
+            ("data:text/plain;base64,aGkK", "notes.txt", "not a PDF"),
+            (
+                &format!("data:application/pdf;base64,{}", "A".repeat(70 * 1024 * 1024)),
+                "huge.pdf",
+                "file is too large",
+            ),
+            // Port 1 is never listening: a fetch that cannot happen at all.
+            ("https://127.0.0.1:1/gone.pdf", "gone.pdf", "cannot fetch the file"),
+            ("ftp://e.test/x.pdf", "odd.pdf", "data URL or an https URL"),
+        ];
+        for (i, (data, name, reason)) in cases.iter().enumerate() {
+            handle_chat(app.clone(), ClientFormat::Openai, pdf_request(data, name), ctx.clone())
+                .await;
+            let sent = first_part(&seen.lock().unwrap()[i]);
+            let text = sent["text"].as_str().unwrap_or_default();
+            assert!(text.starts_with(&format!("[file {name}: ")), "{text}");
+            assert!(text.contains(reason), "{text}");
+        }
+    }
+
+    /// `enabled = false` is the way out: the part reaches the upstream as the
+    /// client sent it.
+    #[tokio::test]
+    async fn file_parser_disabled_leaves_the_part_alone() {
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let base = recording_upstream(seen.clone()).await;
+        let app = test_app(
+            &format!(
+                "[server]\n[plugins.file_parser]\nenabled = false\n\
+                 [providers.p]\nbase_url = \"{base}/c\"\nmodels = [\"m\"]\n"
+            ),
+            "file_parser_off",
+        );
+
+        handle_chat(
+            app,
+            ClientFormat::Openai,
+            pdf_request(&pdf_data_url(), "hello.pdf"),
+            ClientContext::default(),
+        )
+        .await;
+        let sent = first_part(&seen.lock().unwrap()[0]);
+        assert_eq!(sent["type"], "file", "{sent}");
+        assert_eq!(sent["file"]["filename"], "hello.pdf");
     }
 
     /// pi's openai-completions client sends OpenAI's newest dialect for a

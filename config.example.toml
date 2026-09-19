@@ -119,6 +119,18 @@ max_tool_calls = 10
 # Nothing in the response says healing happened.
 response_healing = true
 
+[plugins.file_parser]
+# A PDF a client attaches is parsed by pxy and reaches the model as text, so
+# every model reads documents, not just the ones with a file API. On unless
+# you turn it off — the alternative is the model never seeing the file.
+# poppler-utils must be installed.
+enabled = true
+# Pages poppler finds blank are scanned, not typeset: this model reads them
+# back as Markdown. Without one, such a page reads `[page N: no text]`.
+ocr_model = "vision"
+# Pages past this many are dropped, with a line saying how many.
+max_pages = 20
+
 # ---------------------------------------------------------------------------
 # Groups: named failover chains. A group name is itself a routable model id.
 # Walk order is the order of `models` below.

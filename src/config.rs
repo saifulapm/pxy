@@ -109,6 +109,36 @@ pub struct PluginsConfig {
     /// unclosed, when the repair parses.
     #[serde(default)]
     pub response_healing: bool,
+    /// Parse a PDF a client attached into the text the model reads.
+    #[serde(default)]
+    pub file_parser: FileParserConfig,
+}
+
+/// The file-parser plugin (wiki:plugins). The exception to the rule above: it
+/// is on by default, because the alternative for a model that cannot read
+/// files is not the raw PDF but no document at all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileParserConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The model a scanned page is read with, a group or `provider/model`.
+    /// Without one, such a page is reported rather than sent anywhere.
+    #[serde(default)]
+    pub ocr_model: Option<String>,
+    /// Pages past this many are dropped, with a line saying how many.
+    #[serde(default = "default_max_pages")]
+    pub max_pages: u64,
+}
+
+impl Default for FileParserConfig {
+    fn default() -> Self {
+        FileParserConfig { enabled: true, ocr_model: None, max_pages: default_max_pages() }
+    }
+}
+
+fn default_max_pages() -> u64 {
+    20
 }
 
 /// Request artifact capture for translation debugging (wiki:overview). Off by
@@ -893,6 +923,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("response_heeling"), "typo must not be silent: {err}");
+    }
+
+    /// file-parser is the exception: on with no table at all, because a model
+    /// that cannot read a PDF gets the document or nothing.
+    #[test]
+    fn plugins_file_parser_is_on_by_default() {
+        let cfg: Config = toml::from_str("[server]\n").unwrap();
+        assert!(cfg.plugins.file_parser.enabled, "absent table still parses files");
+        assert_eq!(cfg.plugins.file_parser.max_pages, 20);
+        assert!(cfg.plugins.file_parser.ocr_model.is_none(), "no OCR without a model");
+
+        let cfg: Config = toml::from_str(
+            "[server]\n[plugins.file_parser]\nenabled = false\nocr_model = \"vision\"\nmax_pages = 3\n",
+        )
+        .unwrap();
+        assert!(!cfg.plugins.file_parser.enabled);
+        assert_eq!(cfg.plugins.file_parser.ocr_model.as_deref(), Some("vision"));
+        assert_eq!(cfg.plugins.file_parser.max_pages, 3);
+
+        let err = toml::from_str::<Config>("[server]\n[plugins.file_parser]\nmax_page = 3\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_page"), "typo must not be silent: {err}");
     }
 
     /// `vision` is an assertion about image input, made only from a real
