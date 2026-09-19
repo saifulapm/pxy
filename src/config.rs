@@ -228,6 +228,10 @@ pub struct ServerToolsConfig {
     /// absence serves the tool anonymously.
     #[serde(default)]
     pub context7: Option<Context7Config>,
+    /// What else Jev is used for once a `[media] systemone` chain exists
+    /// (wiki:jev). The `verify` tool needs nothing here; re-ranking is opt-in.
+    #[serde(default)]
+    pub jev: JevConfig,
 }
 
 /// `[server_tools.context7]`: the key find_docs sends as a bearer token.
@@ -235,6 +239,29 @@ pub struct ServerToolsConfig {
 #[serde(deny_unknown_fields)]
 pub struct Context7Config {
     pub api_key: SecretRef,
+}
+
+/// `[server_tools.jev]`: Jev's use outside the `verify` tool.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JevConfig {
+    /// Score every web_search hit against the query and re-rank. Off by
+    /// default: it costs one extra Jev call per search.
+    #[serde(default)]
+    pub rerank_web_search: bool,
+    /// Drop a hit scoring under this.
+    #[serde(default = "default_rerank_min")]
+    pub rerank_min: f64,
+}
+
+fn default_rerank_min() -> f64 {
+    0.3
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self { rerank_web_search: false, rerank_min: default_rerank_min() }
+    }
 }
 
 impl Default for ServerToolsConfig {
@@ -246,6 +273,7 @@ impl Default for ServerToolsConfig {
             fusion_analyst: None,
             defaults: BTreeMap::new(),
             context7: None,
+            jev: JevConfig::default(),
         }
     }
 }
@@ -989,6 +1017,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("api_ky"), "typo must not be silent: {err}");
+    }
+
+    /// `[server_tools.jev]` is what Jev does beyond the `verify` tool.
+    /// Re-ranking costs an extra call per search, so it is opt-in.
+    #[test]
+    fn jev_reranking_is_off_until_it_is_asked_for() {
+        let cfg: Config = toml::from_str("[server]\n").unwrap();
+        assert!(!cfg.server_tools.jev.rerank_web_search, "no table means no re-ranking");
+        assert_eq!(cfg.server_tools.jev.rerank_min, 0.3);
+
+        let cfg: Config = toml::from_str(
+            "[server]\n[server_tools.jev]\nrerank_web_search = true\nrerank_min = 0.55\n",
+        )
+        .unwrap();
+        assert!(cfg.server_tools.jev.rerank_web_search);
+        assert_eq!(cfg.server_tools.jev.rerank_min, 0.55);
+
+        // A half-filled table keeps the other default.
+        let cfg: Config =
+            toml::from_str("[server]\n[server_tools.jev]\nrerank_web_search = true\n").unwrap();
+        assert_eq!(cfg.server_tools.jev.rerank_min, 0.3);
+
+        let err = toml::from_str::<Config>("[server]\n[server_tools.jev]\nrerank_mn = 0.5\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rerank_mn"), "typo must not be silent: {err}");
     }
 
     /// Jev's three gateways, each on its own non-chat route, with `[media]

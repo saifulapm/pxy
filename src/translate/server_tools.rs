@@ -30,6 +30,7 @@ pub enum Tool {
     DescribeImage,
     Memory,
     FindDocs,
+    Verify,
 }
 
 impl Tool {
@@ -50,6 +51,7 @@ impl Tool {
             Tool::DescribeImage,
             Tool::Memory,
             Tool::FindDocs,
+            Tool::Verify,
         ]
     }
 
@@ -69,6 +71,7 @@ impl Tool {
             Tool::DescribeImage => "describe_image",
             Tool::Memory => "memory",
             Tool::FindDocs => "find_docs",
+            Tool::Verify => "verify",
         }
     }
 
@@ -97,6 +100,7 @@ impl Tool {
             Tool::DescribeImage => run_describe_image(ctx, args).await,
             Tool::Memory => run_memory(ctx, args),
             Tool::FindDocs => run_find_docs(ctx, args).await,
+            Tool::Verify => run_verify(ctx, args).await,
         }
     }
 
@@ -134,6 +138,11 @@ impl Tool {
             // Context7 answers without an account, so the key is optional and
             // there is nothing to configure before the tool can be served.
             Tool::FindDocs => true,
+            // Jev rides whichever gateways the config lists; no chain, no tool.
+            Tool::Verify => {
+                !crate::media::resolve_chain(&app.cfg, crate::media::Capability::SystemOne, "")
+                    .is_empty()
+            }
         }
     }
 
@@ -542,6 +551,7 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "pxy:memory" | "memory_20250818" => Some(Tool::Memory),
         // pxy's own, like describe_image: OpenRouter has no docs tool.
         "pxy:find_docs" => Some(Tool::FindDocs),
+        "pxy:verify" => Some(Tool::Verify),
         // Anthropic names the matcher in the type. Only the regex one is pxy's;
         // `tool_search_tool_bm25*` falls through to `None` and is unservable,
         // because pxy would otherwise answer a BM25 search with regex results.
@@ -881,6 +891,32 @@ pub fn tool_def(tool: Tool, params: &Value) -> Value {
                 },
             },
         }),
+        Tool::Verify => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::Verify),
+                "description": "Check one claim against one passage of evidence. Answers \
+                    supported, contradicted, unsupported or uncertain, with calibrated \
+                    probabilities. Use it on a fact you are about to assert from a page \
+                    you fetched or a snippet you searched. The verdict is evidence to \
+                    weigh, not a ruling: it is right between 68% and 91% of the time.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "claim": {
+                            "type": "string",
+                            "description": "The single statement to check, in one sentence."
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "description": "The passage to check it against — a fetched page, \
+                                a search snippet, a quoted paragraph. Not your own reasoning."
+                        },
+                    },
+                    "required": ["claim", "evidence"],
+                },
+            },
+        }),
     }
 }
 
@@ -1009,6 +1045,65 @@ async fn run_find_docs(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
             "Documentation for {id} (context7), topic \"{query}\":\n{text}\nSource: context7:{id}"
         ),
         client: render(&id),
+    })
+}
+
+/// Jev's verdict on one claim against one passage (wiki:jev). One choice
+/// question, three options; the confidence it reports is the whole reason the
+/// tool exists, so a confidence under the declaration's `abstain_below` is
+/// answered `uncertain` rather than passed off as a verdict.
+async fn run_verify(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let arg = |key: &str| args[key].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let claim = arg("claim").ok_or("verify call without a claim")?;
+    let evidence = arg("evidence").ok_or("verify call without evidence")?;
+    let abstain_below = ctx.params["abstain_below"].as_f64().unwrap_or(0.5);
+
+    let questions = json!({"support": {
+        "type": "choice",
+        "instructions": "Does the evidence support the claim?",
+        "criteria": {
+            "supported": "The evidence states or directly implies the claim",
+            "contradicted": "The evidence states the opposite of the claim",
+            "unsupported": "The evidence does not address the claim",
+        },
+    }});
+    let state = json!({"claim": claim, "evidence": evidence});
+
+    let answered = crate::media::systemone::ask(ctx.app, "auto", state, questions).await;
+    let body = match answered {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(%claim, error = %e, "verify failed");
+            return Ok(Ran {
+                model_output: json!({"status": "error", "error": e}).to_string(),
+                client: ClientRender {
+                    blocks: Vec::new(),
+                    marker: json!({"id": ctx.call_id, "verdict": "error"}),
+                },
+            });
+        }
+    };
+
+    let answer = &body["answers"]["support"];
+    let confidence = answer["confidence"].as_f64().unwrap_or(0.0);
+    let verdict = match answer["choice"].as_str() {
+        Some(choice) if confidence >= abstain_below => choice,
+        _ => "uncertain",
+    };
+    info!(%claim, %verdict, confidence, "verify served");
+    Ok(Ran {
+        model_output: json!({
+            "status": "ok",
+            "verdict": verdict,
+            "probabilities": answer["probabilities"],
+            "confidence": confidence,
+            "model": body["model"],
+        })
+        .to_string(),
+        client: ClientRender {
+            blocks: Vec::new(),
+            marker: json!({"id": ctx.call_id, "verdict": verdict}),
+        },
     })
 }
 
@@ -3391,6 +3486,157 @@ mod tests {
     }
 
     /// A minimal app for the executor tests, mirroring `router`'s test app.
+    /// A call pxy cannot shape is unserved: Jev is asked nothing at all.
+    #[tokio::test]
+    async fn verify_without_a_claim_or_evidence_is_unserved() {
+        let app = mock_app("[server]", "verify_unserved");
+        let ctx = ToolCtx::new(&app, "call_1");
+        for args in [
+            json!({"evidence": "the page says so"}),
+            json!({"claim": "axum 0.8 renamed the path syntax"}),
+            json!({"claim": "  ", "evidence": "the page says so"}),
+        ] {
+            assert!(Tool::Verify.execute(&ctx, &args).await.is_err(), "{args}");
+        }
+    }
+
+    /// One choice question over `{claim, evidence}`, and the verdict the model
+    /// reads is Jev's own choice with its probabilities kept.
+    #[tokio::test]
+    async fn verify_asks_one_choice_question_and_reports_the_verdict() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let addr = jev_upstream(seen.clone(), "supported", 0.82).await;
+        let app = mock_app(&jev_cfg(&addr), "verify_ok");
+        let ctx = ToolCtx::new(&app, "call_1");
+
+        let ran = Tool::Verify
+            .execute(
+                &ctx,
+                &json!({"claim": "axum 0.8 uses {id} in paths",
+                        "evidence": "In 0.8 the path syntax changed from :id to {id}."}),
+            )
+            .await
+            .unwrap();
+
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(sent["state"]["claim"], "axum 0.8 uses {id} in paths");
+        assert_eq!(
+            sent["state"]["evidence"],
+            "In 0.8 the path syntax changed from :id to {id}."
+        );
+        let q = &sent["questions"]["support"];
+        assert_eq!(sent["questions"].as_object().unwrap().len(), 1, "one question: {sent}");
+        assert_eq!(q["type"], "choice");
+        assert_eq!(q["instructions"], "Does the evidence support the claim?");
+        assert_eq!(q["criteria"]["supported"], "The evidence states or directly implies the claim");
+        assert_eq!(q["criteria"]["contradicted"], "The evidence states the opposite of the claim");
+        assert_eq!(q["criteria"]["unsupported"], "The evidence does not address the claim");
+
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "ok");
+        assert_eq!(out["verdict"], "supported");
+        assert_eq!(out["confidence"], 0.82);
+        assert_eq!(out["probabilities"]["supported"], 0.9);
+        assert_eq!(out["model"], "typesafe/jev-1.13", "the model comes off the answer");
+        assert!(ran.client.blocks.is_empty(), "verify is served silently");
+        assert_eq!(ran.client.marker, json!({"id": "call_1", "verdict": "supported"}));
+    }
+
+    /// A confidence under `abstain_below` is not a verdict: Jev is right
+    /// between 68% and 91% of the time, so an unsure answer says so and keeps
+    /// the probabilities for the model to weigh.
+    #[tokio::test]
+    async fn verify_abstains_under_the_declarations_threshold() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let addr = jev_upstream(seen.clone(), "contradicted", 0.41).await;
+        let app = mock_app(&jev_cfg(&addr), "verify_abstain");
+        let args = json!({"claim": "c", "evidence": "e"});
+
+        // Default threshold 0.5: 0.41 does not clear it.
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::Verify.execute(&ctx, &args).await.unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["verdict"], "uncertain");
+        assert_eq!(out["probabilities"]["contradicted"], 0.9, "the probabilities are kept");
+        assert_eq!(ran.client.marker["verdict"], "uncertain");
+
+        // The declaration can lower the bar; the same answer is a verdict then.
+        let ctx = ToolCtx { params: json!({"abstain_below": 0.4}), ..ToolCtx::new(&app, "call_2") };
+        let ran = Tool::Verify.execute(&ctx, &args).await.unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["verdict"], "contradicted");
+    }
+
+    /// A chain that is down is reported to the model, not to the client as a
+    /// failed turn.
+    #[tokio::test]
+    async fn verify_reports_a_dead_chain_to_the_model() {
+        let app = mock_app("[server]", "verify_nochain");
+        let ctx = ToolCtx::new(&app, "call_1");
+        let ran = Tool::Verify
+            .execute(&ctx, &json!({"claim": "c", "evidence": "e"}))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&ran.model_output).unwrap();
+        assert_eq!(out["status"], "error");
+        assert_eq!(ran.client.marker["verdict"], "error");
+    }
+
+    /// No `[media] systemone` chain, no tool: it is never offered.
+    #[test]
+    fn verify_is_servable_only_behind_a_systemone_chain() {
+        let bare = mock_app("[server]", "verify_servable_no");
+        assert!(!Tool::Verify.servable(&bare));
+        let wired = mock_app(&jev_cfg("127.0.0.1:1"), "verify_servable_yes");
+        assert!(Tool::Verify.servable(&wired));
+    }
+
+    fn jev_cfg(addr: &str) -> String {
+        format!(
+            r#"
+            [server]
+            [providers.openrouter]
+            [providers.openrouter.media]
+            systemone_url = "http://{addr}/decisions"
+            systemone_models = ["typesafe/jev-1.13"]
+            [media]
+            systemone = "openrouter/typesafe/jev-1.13"
+            "#
+        )
+    }
+
+    /// A Jev gateway answering one choice question, recording what it was asked.
+    async fn jev_upstream(
+        sink: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        choice: &'static str,
+        confidence: f64,
+    ) -> String {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/decisions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    axum::Json(json!({
+                        "model": "typesafe/jev-1.13",
+                        "answers": {"support": {
+                            "type": "choice",
+                            "choice": choice,
+                            "probabilities": {choice: 0.9},
+                            "confidence": confidence,
+                        }},
+                        "usage": {"input_tokens": 120, "output_tokens": 0},
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        addr.to_string()
+    }
+
     fn mock_app(cfg_toml: &str, name: &str) -> std::sync::Arc<App> {
         let cfg: crate::config::Config = toml::from_str(cfg_toml).unwrap();
         let catalog = crate::catalog::Catalog::from_config(&cfg);
