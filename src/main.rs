@@ -4,6 +4,7 @@ mod config;
 mod diagnose;
 mod launch;
 mod media;
+mod memory;
 mod providers;
 mod refresh;
 mod router;
