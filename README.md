@@ -83,10 +83,10 @@ Server tools work on models that never learned them. A client declares one
 by its type (`pxy:web_search`, or OpenRouter's `openrouter:web_search`), pxy
 offers the model a plain function, runs the call itself, and feeds the result
 back into the same streamed turn. Claude Code gets the `server_tool_use`
-blocks it expects. Eleven tools are served: web_search, web_fetch, datetime,
+blocks it expects. Twelve tools are served: web_search, web_fetch, datetime,
 search_models, image_generation, advisor, subagent, fusion, tool_search,
-describe_image and memory. Each takes the parameters OpenRouter documents for
-it, bar the last two, which are pxy's own and take pxy's. A client with more tools
+describe_image, memory and find_docs. Each takes the parameters OpenRouter
+documents for it, bar the last three, which are pxy's own and take pxy's. A client with more tools
 than one turn can afford marks the spare ones `defer_loading` and declares
 tool_search: pxy keeps them out of the upstream body, and the model gets back
 the ones it asks for by searching. A model that cannot take an image at all is
@@ -96,7 +96,11 @@ describe_image, which asks a model that can see. memory gives the model a
 directory it keeps between conversations, under
 `~/.local/share/pxy/memory/<store>/`, and the same six commands Anthropic's
 memory tool uses; each agent gets its own store unless the config points two
-at one. The `[server_tools]` table in
+at one. find_docs is how a model stops guessing at an API it half remembers:
+it names a library and a topic, and pxy fetches that topic's snippets from
+Context7, whose free tier needs no account at all. Both halves of the lookup
+are cached for a week, so the same question twice costs one call. The
+`[server_tools]` table in
 `config.toml` decides which are served, how many tool-call steps one turn
 may take, and, through `[server_tools.defaults.<tool>]`, which ride every
 client turn without the harness declaring them.

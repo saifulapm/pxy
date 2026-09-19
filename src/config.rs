@@ -1330,6 +1330,37 @@ mod tests {
         assert_eq!(keys, vec!["store", "read_only"], "{block}");
     }
 
+    /// find_docs' one declaration parameter and Context7's optional key are
+    /// both copied out of the example config, so both blocks have to be in it.
+    #[test]
+    fn find_docs_defaults_and_the_context7_key_are_in_the_example() {
+        let cfg: Config =
+            toml::from_str("[server]\n[server_tools.defaults.find_docs]\nmax_tokens = 6000\n")
+                .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server_tools.defaults["find_docs"]["max_tokens"].as_integer(), Some(6000));
+
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+                .unwrap();
+        let block = src
+            .split("# [server_tools.defaults.find_docs]")
+            .nth(1)
+            .expect("the example config shows the defaults block");
+        assert!(
+            block.lines().nth(1).is_some_and(|l| l.contains("max_tokens")),
+            "the one parameter is there to copy: {block}"
+        );
+        let block = src
+            .split("# [server_tools.context7]")
+            .nth(1)
+            .expect("the example config shows where the key goes");
+        assert!(
+            block.lines().nth(1).is_some_and(|l| l.contains("api_key") && l.contains("pass")),
+            "a pass entry is what a key looks like everywhere else here: {block}"
+        );
+    }
+
     #[test]
     fn server_tools_section_overrides_the_defaults() {
         let cfg: Config = toml::from_str(

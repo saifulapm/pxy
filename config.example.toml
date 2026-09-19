@@ -111,6 +111,20 @@ max_tool_calls = 10
 # store = "shared"
 # read_only = false
 
+# find_docs reads a library's current documentation out of Context7, so a
+# model writes against the API as it is now instead of as it was in training.
+# `max_tokens` is how much one call may read back (default 4000, capped at
+# 20000); a call may ask for less, never more.
+# [server_tools.defaults.find_docs]
+# max_tokens = 4000
+
+# Context7 answers without an account, so find_docs needs nothing here. A key
+# (context7.com, free tier 1,000 calls a month) only raises the per-IP cap;
+# pxy sends it as a bearer token when it resolves, and answers anonymously
+# when there is no table at all. Every answer is cached for a week either way.
+# [server_tools.context7]
+# api_key = { pass = "api/context7" }
+
 # ---------------------------------------------------------------------------
 # Plugins: request-time transforms, with no model call and no tool loop. A
 # client turns one on for a single request with `plugins: [{"id": "..."}]`;
