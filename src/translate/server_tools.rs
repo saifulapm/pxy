@@ -28,6 +28,7 @@ pub enum Tool {
     Fusion,
     ToolSearch,
     DescribeImage,
+    Memory,
 }
 
 impl Tool {
@@ -46,6 +47,7 @@ impl Tool {
             Tool::Fusion,
             Tool::ToolSearch,
             Tool::DescribeImage,
+            Tool::Memory,
         ]
     }
 
@@ -63,6 +65,7 @@ impl Tool {
             Tool::Fusion => "fusion",
             Tool::ToolSearch => "tool_search",
             Tool::DescribeImage => "describe_image",
+            Tool::Memory => "memory",
         }
     }
 
@@ -89,6 +92,7 @@ impl Tool {
             Tool::Fusion => run_fusion(ctx, args).await,
             Tool::ToolSearch => run_tool_search(ctx, args),
             Tool::DescribeImage => run_describe_image(ctx, args).await,
+            Tool::Memory => run_memory(ctx, args),
         }
     }
 
@@ -121,6 +125,8 @@ impl Tool {
             // Its vision model is named on the declaration, and a declaration
             // that names none is an error the calling model reads.
             Tool::DescribeImage => true,
+            // A directory under the data dir, made on first use.
+            Tool::Memory => true,
         }
     }
 
@@ -524,6 +530,9 @@ pub fn from_type(ty: &str) -> Option<Tool> {
         "openrouter:tool_search" | "pxy:tool_search" | "tool_search" => Some(Tool::ToolSearch),
         // pxy's own; OpenRouter has no equivalent, so there is one spelling.
         "pxy:describe_image" => Some(Tool::DescribeImage),
+        // Anthropic's native memory entry is dated; pxy serves the one command
+        // set that date names.
+        "pxy:memory" | "memory_20250818" => Some(Tool::Memory),
         // Anthropic names the matcher in the type. Only the regex one is pxy's;
         // `tool_search_tool_bm25*` falls through to `None` and is unservable,
         // because pxy would otherwise answer a BM25 search with regex results.
@@ -778,7 +787,113 @@ pub fn tool_def(tool: Tool, params: &Value) -> Value {
                 },
             },
         }),
+        Tool::Memory => json!({
+            "type": "function",
+            "function": {
+                "name": function_name(Tool::Memory),
+                "description": "Your memory directory, which survives between \
+                    conversations. Every path starts with /memories.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "enum": ["view", "create", "str_replace", "insert", "delete", "rename"],
+                            "description": "view a directory or a file, create a file \
+                                (overwriting it), str_replace or insert in one, delete a \
+                                path, or rename one."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The path the command acts on, under /memories."
+                        },
+                        "view_range": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "view: the first and last line to show, 1-based; \
+                                -1 as the last means the end of the file."
+                        },
+                        "file_text": {"type": "string", "description": "create: the whole file."},
+                        "old_str": {
+                            "type": "string",
+                            "description": "str_replace: the text to replace, which must \
+                                appear exactly once."
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "str_replace: what replaces it. Omit to delete \
+                                old_str."
+                        },
+                        "insert_line": {
+                            "type": "integer",
+                            "description": "insert: the line to insert after; 0 inserts \
+                                before the first line."
+                        },
+                        "insert_text": {"type": "string", "description": "insert: the text."},
+                        "old_path": {"type": "string", "description": "rename: the path now."},
+                        "new_path": {"type": "string", "description": "rename: the path after."},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }),
     }
+}
+
+/// Anthropic injects this into the system prompt whenever the memory tool is
+/// declared, and a model trained on the tool expects to read it; pxy appends
+/// it verbatim (wiki:memory-tool).
+pub const MEMORY_PROTOCOL: &str = "IMPORTANT: ALWAYS VIEW YOUR MEMORY DIRECTORY BEFORE DOING ANYTHING ELSE.\n\
+MEMORY PROTOCOL:\n\
+1. Use the `view` command of your `memory` tool to check for earlier progress.\n\
+2. ... (work on the task) ...\n   \
+- As you make progress, record status / progress / thoughts etc in your memory.\n\
+ASSUME INTERRUPTION: Your context window might be reset at any moment, so you risk losing any progress that is not recorded in your memory directory.";
+
+/// The directory one memory call works in: the declaration's `store`, else the
+/// client's agent, else `default`. `Err` is an unserved call — pxy will not
+/// guess at a name it cannot put on disk.
+fn memory_root(ctx: &ToolCtx<'_>) -> Result<std::path::PathBuf, String> {
+    let named = ctx.params["store"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| ctx.agent.as_deref().filter(|s| !s.is_empty()))
+        .unwrap_or("default");
+    let store = named.to_ascii_lowercase();
+    let usable = !store.is_empty()
+        && store.len() <= 64
+        && store.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !usable {
+        return Err(format!("unusable memory store name '{named}'"));
+    }
+    Ok(crate::config::data_dir().join("memory").join(store))
+}
+
+/// Run one memory command against the turn's store. The store answers the
+/// model on both arms — a refusal is its own `Error: ` sentence, not the
+/// loop's JSON — so only a store pxy cannot name leaves the call unserved.
+fn run_memory(ctx: &ToolCtx<'_>, args: &Value) -> Result<Ran, String> {
+    let root = memory_root(ctx)?;
+    let read_only = ctx.params["read_only"].as_bool().unwrap_or(false);
+    let store = crate::memory::MemoryStore::open(root);
+    let model_output = match store.run(args, read_only) {
+        Ok(out) => out,
+        Err(out) => out,
+    };
+    // No documented Anthropic result block, so the round is served silently on
+    // every dialect; the marker is all the client transcript records.
+    let path = args["path"].as_str().or_else(|| args["old_path"].as_str()).unwrap_or("");
+    Ok(Ran {
+        model_output,
+        client: ClientRender {
+            blocks: Vec::new(),
+            marker: json!({
+                "id": ctx.call_id,
+                "command": args["command"].as_str().unwrap_or(""),
+                "path": path,
+            }),
+        },
+    })
 }
 
 /// A declaration's `engine`: `auto` (or absent) walks the configured pool;
@@ -1556,6 +1671,79 @@ mod tests {
         ] {
             assert_eq!(from_type(ty), Some(Tool::WebSearch), "{ty}");
         }
+    }
+
+    /// Anthropic names the memory tool by date, and a client that declares it
+    /// natively must reach the same executor as `pxy:memory`.
+    #[test]
+    fn from_type_maps_both_memory_spellings() {
+        assert_eq!(from_type("pxy:memory"), Some(Tool::Memory));
+        assert_eq!(from_type("memory_20250818"), Some(Tool::Memory));
+    }
+
+    /// A store name from the declaration beats the agent, which beats
+    /// `default`; a name pxy cannot put on disk leaves the call unserved
+    /// rather than landing somewhere it was not asked to write.
+    #[test]
+    fn memory_store_resolves_from_the_declaration_then_the_agent_then_default() {
+        let app = mock_app("[server]", "memory_store_name");
+        let under = |name: &str| crate::config::data_dir().join("memory").join(name);
+
+        let ctx = ToolCtx::new(&app, "call_1");
+        assert_eq!(memory_root(&ctx), Ok(under("default")));
+
+        let agent = ToolCtx { agent: Some("Claude".into()), ..ToolCtx::new(&app, "call_1") };
+        assert_eq!(memory_root(&agent), Ok(under("claude")), "lowercased");
+
+        let declared = ToolCtx {
+            params: json!({"store": "shared"}),
+            agent: Some("claude".into()),
+            ..ToolCtx::new(&app, "call_1")
+        };
+        assert_eq!(memory_root(&declared), Ok(under("shared")));
+
+        for bad in ["../escape", "a b", &"x".repeat(65)] {
+            let ctx = ToolCtx { params: json!({"store": bad}), ..ToolCtx::new(&app, "call_1") };
+            assert!(memory_root(&ctx).is_err(), "{bad}");
+        }
+    }
+
+    /// The round is served silently: the model reads the store's own string,
+    /// the client transcript gets a marker and no block at all.
+    #[tokio::test]
+    async fn memory_is_served_silently_and_keeps_what_it_wrote() {
+        let app = mock_app("[server]", "memory_served");
+        let store = format!("pxy-test-served-{}", std::process::id());
+        let root = crate::config::data_dir().join("memory").join(&store);
+        let _ = std::fs::remove_dir_all(&root);
+        let ctx = ToolCtx { params: json!({"store": store}), ..ToolCtx::new(&app, "call_1") };
+
+        let created = Tool::Memory
+            .execute(&ctx, &json!({"command": "create", "path": "/memories/n.md", "file_text": "kept\n"}))
+            .await
+            .unwrap();
+        assert_eq!(created.model_output, "File created successfully at: /memories/n.md");
+        assert!(created.client.blocks.is_empty(), "memory has no Anthropic block");
+        assert_eq!(
+            created.client.marker,
+            json!({"id": "call_1", "command": "create", "path": "/memories/n.md"})
+        );
+
+        let viewed = Tool::Memory
+            .execute(&ctx, &json!({"command": "view", "path": "/memories/n.md"}))
+            .await
+            .unwrap();
+        assert!(viewed.model_output.ends_with("\n     1\tkept"), "{}", viewed.model_output);
+
+        let read_only =
+            ToolCtx { params: json!({"store": store, "read_only": true}), ..ToolCtx::new(&app, "call_2") };
+        let refused = Tool::Memory
+            .execute(&read_only, &json!({"command": "delete", "path": "/memories/n.md"}))
+            .await
+            .unwrap();
+        assert_eq!(refused.model_output, "Error: memory is read-only");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

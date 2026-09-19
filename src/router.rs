@@ -1501,6 +1501,15 @@ async fn try_candidate_inner(
         }
     }
 
+    // Anthropic's API injects a memory protocol into the system prompt
+    // whenever the memory tool is declared, and a model trained on the tool
+    // waits to be told to read its directory first. Only here is it known that
+    // the reserved function actually survived on the body, and it goes in
+    // before the loop copies the body, so a continuation carries it too.
+    if servable.contains(&server_tools::Tool::Memory) {
+        append_system_text(&mut body, server_tools::MEMORY_PROTOCOL);
+    }
+
     // force_stream: the upstream misbehaves without `stream: true` on this
     // model — or a served web_search needs the stream machinery — so stream
     // upstream regardless and re-assemble JSON for a non-streaming client.
@@ -2964,6 +2973,27 @@ fn reserved_function_in_body(body: &Value, tool: server_tools::Tool) -> bool {
     body["tools"]
         .as_array()
         .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == name.as_str()))
+}
+
+/// Append a paragraph to an OpenAI-format body's system message, making one
+/// when the request carried none. Appended unconditionally: a client that
+/// already sent the same text gets it twice rather than have pxy guess at
+/// which of two near-identical paragraphs the model should read.
+fn append_system_text(body: &mut Value, text: &str) {
+    let existing = body["messages"].as_array().and_then(|messages| {
+        messages
+            .iter()
+            .position(|m| matches!(m["role"].as_str(), Some("system" | "developer")))
+    });
+    let Some(messages) = body["messages"].as_array_mut() else { return };
+    match existing {
+        Some(at) => match &mut messages[at]["content"] {
+            Value::String(content) => content.push_str(&format!("\n\n{text}")),
+            Value::Array(parts) => parts.push(json!({"type": "text", "text": text})),
+            content => *content = json!(text),
+        },
+        None => messages.insert(0, json!({"role": "system", "content": text})),
+    }
 }
 
 /// Swap declared served-tool entries in an OpenAI-format body for the reserved
@@ -4905,6 +4935,94 @@ mod tests {
         let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
         let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// One memory turn: the upstream calls `pxy_memory` once with `args`, then
+    /// answers. Returns the bodies pxy sent it.
+    async fn memory_turn(
+        store: &str,
+        name: &'static str,
+        system: Option<&str>,
+        args: &str,
+    ) -> Vec<Value> {
+        let first = calls_sse(&[("call_1", "pxy_memory", args)]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, seen) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            name,
+        );
+        let mut messages = vec![json!({"role": "user", "content": "remember this"})];
+        if let Some(system) = system {
+            messages.insert(0, json!({"role": "system", "content": system}));
+        }
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": messages,
+            "tools": [{"type": "pxy:memory", "parameters": {"store": store}}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let seen = seen.lock().unwrap();
+        seen.clone()
+    }
+
+    /// The memory tool is a directory, not a transcript: a second request
+    /// reads what the first wrote. Both turns carry the protocol paragraph,
+    /// once per body — the replay copies the body pxy already appended to, so
+    /// a continuation must not stack a second copy.
+    #[tokio::test]
+    async fn memory_keeps_a_file_across_two_requests_and_appends_the_protocol_once() {
+        let store = format!("pxy-test-router-{}", std::process::id());
+        let root = crate::config::data_dir().join("memory").join(&store);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let wrote = memory_turn(
+            &store,
+            "memory_write",
+            None,
+            r#"{"command":"create","path":"/memories/n.md","file_text":"kept\n"}"#,
+        )
+        .await;
+        let result = last_message(&wrote[1]);
+        assert_eq!(result, "File created successfully at: /memories/n.md", "{}", wrote[1]);
+        assert_eq!(wrote[0]["messages"][0]["role"], "system", "{}", wrote[0]);
+        assert_eq!(wrote[0]["messages"][0]["content"], server_tools::MEMORY_PROTOCOL);
+
+        let read = memory_turn(
+            &store,
+            "memory_read",
+            Some("be brief"),
+            r#"{"command":"view","path":"/memories/n.md"}"#,
+        )
+        .await;
+        assert!(last_message(&read[1]).ends_with("\n     1\tkept"), "{}", read[1]);
+        for body in &read {
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            assert_eq!(
+                system,
+                format!("be brief\n\n{}", server_tools::MEMORY_PROTOCOL),
+                "the client's own system message keeps its text and gains one copy"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `role: "tool"` result the replay carries for the last served call.
+    fn last_message(body: &Value) -> String {
+        let msgs = body["messages"].as_array().unwrap();
+        msgs[msgs.len() - 1]["content"].as_str().unwrap().to_string()
     }
 
     /// A reserved call pxy could not run — arguments that are not JSON here —
