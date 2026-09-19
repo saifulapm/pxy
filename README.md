@@ -104,9 +104,13 @@ key, so it never reaches an upstream, and an id pxy has not implemented is
 ignored rather than refused. The one that exists is `response-healing`. Ask a
 model for JSON and it will hand you a Markdown fence, a preamble or a trailing
 comma often enough to matter, and `JSON.parse` fails on all three. Healing
-scans from the first brace to the close that matches it, quotes bare keys,
-drops trailing commas and closes what was left open — and replaces the answer
-only when the repair parses, so an answer truncated by `max_tokens` reaches the
+takes the value the model put at the start of a line, rebuilds it up to its
+matching close, quotes bare keys, drops trailing commas and closes what was
+left open. Starting a line is what tells the answer apart from the bracketed
+runs that fill prose: a `[1]` citation marker or a list inside a sentence
+parses perfectly well on its own, and serving one of those would be silent,
+since nothing in the response says a heal happened. The answer is replaced
+only when the repair parses, so one truncated by `max_tokens` reaches the
 client as the model left it. Streaming turns and Anthropic clients are never
 healed.
 

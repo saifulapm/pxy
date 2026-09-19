@@ -1,4 +1,6 @@
-//! JSON repair for the `response-healing` plugin (see [plugins](plugins.md)).
+//! JSON repair for the `response-healing` plugin (the page is wiki:plugins;
+//! rustdoc would read a `plugins.md` link as an intra-doc one and warn, since
+//! the repo carries no such file).
 //!
 //! A model asked for JSON answers with JSON wrapped in a Markdown fence, or
 //! prefaced by a sentence, or with a trailing comma its training data was full
@@ -8,56 +10,75 @@
 //! truncation mid-token, say) reaches the client exactly as the upstream sent
 //! it.
 
-/// Candidate starts tried before the search gives up. Each one costs a scan of
-/// everything after it, so an unbounded search is quadratic in the length of
-/// the answer — and a preamble carrying more bracket runs than this before the
-/// real value is not a case worth serving.
+/// Candidate starts tried from each of the two ranks below. Every one costs a
+/// scan of the text after it, so an unbounded search is quadratic in the
+/// length of the answer. The cap is applied per rank, after ranking, so it
+/// bites on the runs in prose and never on the value itself.
 const MAX_CANDIDATES: usize = 64;
 
 /// Repair a JSON answer wrapped in prose, a fence or its own mistakes.
 ///
 /// Every `{` or `[` in the text starts a candidate, rebuilt up to the close
 /// that matches it while quoting bare keys, dropping trailing commas, and
-/// closing whatever strings and containers were left open. The candidate that
-/// parses and accounts for the most of the text wins, which drops a fence, a
-/// preamble and any commentary after the value in one move.
+/// closing whatever strings and containers were left open. Picking the right
+/// candidate is the whole problem: a model's prose is full of runs that parse
+/// on their own, and serving one of those instead of the answer is silent,
+/// because nothing in the response says a heal happened.
 ///
-/// Reach, not position, is what picks the winner. A model's prose is full of
-/// runs that parse on their own — a `[1]` citation marker, a bare `[]`, a
-/// short list — and taking the first bracket would serve one of those as the
-/// answer; taking the last that parses would lose the value to a bracket in
-/// the trailing commentary.
+/// Where a candidate sits decides it, never how big it is. A model puts its
+/// answer at the start of a line — alone, inside a fence, or after a preamble
+/// that ended with a newline — while a `[1]` citation marker, a bare `[]` or a
+/// list in a sentence sits partway into one. So the earliest candidate that
+/// starts a line and parses is the answer, whether the prose around it is
+/// longer or shorter. Only when nothing starts a line does reach decide, and
+/// there it is measured to the same origin for every candidate.
 ///
 /// `None` when nothing parses, and `None` when the winner is just the input
 /// again, so a caller can treat `Some` as "this needed healing and the healed
 /// form is valid".
 pub fn heal_json(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
-    let starts = chars
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| **c == '{' || **c == '[')
-        .map(|(i, _)| i)
-        .take(MAX_CANDIDATES);
-
-    let mut best: Option<(usize, String)> = None;
-    for start in starts {
-        let (candidate, consumed) = rebuild(&chars[start..]);
-        if serde_json::from_str::<serde_json::Value>(&candidate).is_err() {
-            continue;
+    let (mut opens_line, mut mid_line) = (Vec::new(), Vec::new());
+    // True while nothing but whitespace has been seen since the last newline.
+    let mut fresh = true;
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '{' || *c == '[' {
+            if fresh { &mut opens_line } else { &mut mid_line }.push(i);
         }
-        if best.as_ref().is_none_or(|(reach, _)| consumed > *reach) {
-            best = Some((consumed, candidate));
-        }
-        // This one ran to the end of the text, and a later start has less text
-        // left to reach, so nothing after it can win.
-        if start + consumed == chars.len() {
-            break;
+        match c {
+            '\n' => fresh = true,
+            c if c.is_whitespace() => {}
+            _ => fresh = false,
         }
     }
 
-    let (_, healed) = best?;
+    let mut healed = None;
+    for start in opens_line.into_iter().take(MAX_CANDIDATES) {
+        let (candidate, _) = rebuild(&chars[start..]);
+        if parses(&candidate) {
+            healed = Some(candidate);
+            break;
+        }
+    }
+    if healed.is_none() {
+        // Nothing on a line of its own: the furthest into the text a candidate
+        // reaches is the best evidence left of which one is the value.
+        let mut furthest = 0;
+        for start in mid_line.into_iter().take(MAX_CANDIDATES) {
+            let (candidate, consumed) = rebuild(&chars[start..]);
+            if parses(&candidate) && start + consumed > furthest {
+                furthest = start + consumed;
+                healed = Some(candidate);
+            }
+        }
+    }
+
+    let healed = healed?;
     (healed != text.trim()).then_some(healed)
+}
+
+fn parses(candidate: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(candidate).is_ok()
 }
 
 /// Copy `src` up to the close that matches its first container, repairing as
@@ -167,7 +188,7 @@ fn rebuild(src: &[char]) -> (String, usize) {
 mod tests {
     use super::heal_json;
 
-    /// The five shapes [plugins](plugins.md) documents, each with the exact
+    /// The five shapes wiki:plugins documents, each with the exact
     /// text a client must end up able to parse.
     #[test]
     fn the_documented_shapes_heal() {
@@ -228,10 +249,28 @@ mod tests {
             heal_json("Options [] were empty, so:\n[{\"id\": 7}]").as_deref(),
             Some("[{\"id\": 7}]")
         );
-        // The winner is the longest reach, not the last one that parses: a
-        // bracket in the trailing commentary must not displace the value.
+        // A trailing run must not displace the value whatever its length, and
+        // a preamble's run must not win by being the longer of the two: the
+        // deciding fact is where each one sits, never how big it is.
         assert_eq!(
             heal_json("{\"a\": 1}\n\nHope that helps [1]").as_deref(),
+            Some("{\"a\": 1}")
+        );
+        assert_eq!(
+            heal_json("{\"ok\": true}\n\nNotes: [\"alpha\", \"beta\", \"gamma\", \"delta\"]")
+                .as_deref(),
+            Some("{\"ok\": true}"),
+            "a long trailing list must not displace a short value"
+        );
+        assert_eq!(
+            heal_json("The keys [\"a\", \"b\", \"c\"] are covered below:\n{\"a\": 1}").as_deref(),
+            Some("{\"a\": 1}"),
+            "a long preamble list must not displace a short value"
+        );
+        // With no candidate on a line of its own, reach is all there is to go
+        // on, and it still has to pass over the citation.
+        assert_eq!(
+            heal_json("See [1]: the value is {\"a\": 1}.").as_deref(),
             Some("{\"a\": 1}")
         );
     }
