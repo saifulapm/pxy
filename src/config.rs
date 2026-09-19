@@ -223,6 +223,18 @@ pub struct ServerToolsConfig {
     /// Anthropic upstream) is dropped, never refused.
     #[serde(default)]
     pub defaults: BTreeMap<String, toml::Value>,
+    /// find_docs' Context7 account (wiki:find-docs). Context7 needs no key at
+    /// all; one only raises the per-IP cap, so the table is optional and its
+    /// absence serves the tool anonymously.
+    #[serde(default)]
+    pub context7: Option<Context7Config>,
+}
+
+/// `[server_tools.context7]`: the key find_docs sends as a bearer token.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Context7Config {
+    pub api_key: SecretRef,
 }
 
 impl Default for ServerToolsConfig {
@@ -233,6 +245,7 @@ impl Default for ServerToolsConfig {
             fusion_panel: Vec::new(),
             fusion_analyst: None,
             defaults: BTreeMap::new(),
+            context7: None,
         }
     }
 }
@@ -946,6 +959,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_page"), "typo must not be silent: {err}");
+    }
+
+    /// Context7 serves find_docs without a key; the table only raises the cap,
+    /// so its absence is not a misconfiguration.
+    #[test]
+    fn context7_key_is_optional() {
+        let cfg: Config = toml::from_str("[server]\n").unwrap();
+        assert!(cfg.server_tools.context7.is_none(), "no table means anonymous");
+
+        let cfg: Config = toml::from_str(
+            "[server]\n[server_tools.context7]\napi_key = { pass = \"api/context7\" }\n",
+        )
+        .unwrap();
+        let key = &cfg.server_tools.context7.as_ref().unwrap().api_key;
+        assert!(matches!(key, SecretRef::Pass { pass } if pass == "api/context7"));
+
+        let err = toml::from_str::<Config>("[server]\n[server_tools.context7]\napi_ky = \"x\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("api_ky"), "typo must not be silent: {err}");
     }
 
     /// `vision` is an assertion about image input, made only from a real

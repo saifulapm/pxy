@@ -2,6 +2,7 @@ mod catalog;
 mod capture;
 mod config;
 mod diagnose;
+mod docs;
 mod launch;
 mod media;
 mod memory;
