@@ -262,6 +262,15 @@ fn convert_message_content(content: &Value) -> Value {
                     "type": "image_url",
                     "image_url": {"url": p["image_url"].as_str().unwrap_or("")},
                 })),
+                // The file-parser plugin replaces this part with the text it
+                // parsed out of the file.
+                Some("input_file") => Some(json!({
+                    "type": "file",
+                    "file": {
+                        "filename": p["filename"].as_str().unwrap_or("document.pdf"),
+                        "file_data": p["file_data"].as_str().unwrap_or(""),
+                    },
+                })),
                 _ => None,
             }
         })
@@ -929,6 +938,25 @@ mod tests {
         assert_eq!(msgs.len(), 1, "{out}");
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"], "hello");
+    }
+
+    /// An `input_file` item carries the file to the file-parser plugin as a
+    /// chat file part.
+    #[test]
+    fn input_file_becomes_a_file_part() {
+        let out = request(&json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_file", "filename": "report.pdf",
+                 "file_data": "data:application/pdf;base64,JVBERi0="},
+                {"type": "input_text", "text": "summarise"}
+            ]}
+        ]}));
+        let parts = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "{out}");
+        assert_eq!(parts[0]["type"], "file");
+        assert_eq!(parts[0]["file"]["filename"], "report.pdf");
+        assert_eq!(parts[0]["file"]["file_data"], "data:application/pdf;base64,JVBERi0=");
+        assert_eq!(parts[1]["type"], "text");
     }
 
     #[test]

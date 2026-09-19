@@ -216,7 +216,29 @@ fn push_user_turn(messages: &mut Vec<Value>, blocks: &[Value]) {
                 };
                 parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
             }
-            _ => {} // document, cache markers etc: dropped for openai upstreams
+            // A PDF document rides on as a file part for the file-parser
+            // plugin to replace; any other media type stays dropped.
+            Some("document") => {
+                let src = &block["source"];
+                let file_data = match src["type"].as_str() {
+                    Some("url") => src["url"].as_str().unwrap_or("").to_string(),
+                    Some("base64") if src["media_type"] == "application/pdf" => format!(
+                        "data:application/pdf;base64,{}",
+                        src["data"].as_str().unwrap_or("")
+                    ),
+                    _ => continue,
+                };
+                let filename = block["title"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| file_data.rsplit('/').next().filter(|s| s.ends_with(".pdf")))
+                    .unwrap_or("document.pdf")
+                    .to_string();
+                parts.push(json!({"type": "file", "file": {
+                    "filename": filename, "file_data": file_data,
+                }}));
+            }
+            _ => {} // cache markers etc: dropped for openai upstreams
         }
     }
     if !parts.is_empty() {
@@ -955,6 +977,33 @@ mod tests {
         let content = tool["content"].as_str().unwrap();
         assert!(content.contains("[image omitted]"), "{content}");
         assert!(content.contains("the chart"), "{content}");
+    }
+
+    /// A PDF `document` block carries the file to the file-parser plugin as a
+    /// chat file part; a document of another media type is still dropped.
+    #[test]
+    fn document_blocks_become_file_parts() {
+        let req = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "title": "report.pdf", "source":
+                    {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+                {"type": "document", "source":
+                    {"type": "url", "url": "https://example.com/paper.pdf"}},
+                {"type": "document", "source":
+                    {"type": "base64", "media_type": "text/plain", "data": "aGk="}},
+                {"type": "text", "text": "summarise"}
+            ]}]
+        });
+        let out = request(&req, false);
+        let parts = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3, "{out}");
+        assert_eq!(parts[0]["type"], "file");
+        assert_eq!(parts[0]["file"]["filename"], "report.pdf");
+        assert_eq!(parts[0]["file"]["file_data"], "data:application/pdf;base64,JVBERi0=");
+        assert_eq!(parts[1]["file"]["filename"], "paper.pdf");
+        assert_eq!(parts[1]["file"]["file_data"], "https://example.com/paper.pdf");
+        assert_eq!(parts[2]["type"], "text");
     }
 
     #[test]
