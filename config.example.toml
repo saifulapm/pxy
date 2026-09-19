@@ -101,6 +101,15 @@ max_tool_calls = 10
 # [server_tools.defaults.describe_image]
 # model = "beta/model-large"
 # ocr_model = "jina/jina-ocr-v1"
+# memory is a directory the model reads and writes across conversations,
+# under ~/.local/share/pxy/memory/<store>/. `store` names it; leave it out and
+# each agent gets its own, named after itself, so claude and codex keep
+# separate notes. Point two agents at one store to have them share. With
+# `read_only` the model may view the directory and nothing else, which is the
+# answer to a model that has read something it should not have.
+# [server_tools.defaults.memory]
+# store = "shared"
+# read_only = false
 
 # ---------------------------------------------------------------------------
 # Plugins: request-time transforms, with no model call and no tool loop. A

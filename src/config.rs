@@ -1263,6 +1263,40 @@ mod tests {
         }
     }
 
+    /// memory's two parameters are the whole of its declaration, and the
+    /// example config is where they are copied from.
+    #[test]
+    fn memory_defaults_take_a_store_and_read_only() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [server_tools.defaults.memory]
+            store = "shared"
+            read_only = true
+            "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server_tools.defaults["memory"]["store"].as_str(), Some("shared"));
+        assert_eq!(cfg.server_tools.defaults["memory"]["read_only"].as_bool(), Some(true));
+
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+                .unwrap();
+        let block = src
+            .split("# [server_tools.defaults.memory]")
+            .nth(1)
+            .expect("the example config shows the block");
+        let keys: Vec<&str> = block
+            .lines()
+            .skip(1)
+            .take_while(|l| l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(key, _)| key.trim_matches(['#', ' ']))
+            .collect();
+        assert_eq!(keys, vec!["store", "read_only"], "{block}");
+    }
+
     #[test]
     fn server_tools_section_overrides_the_defaults() {
         let cfg: Config = toml::from_str(
