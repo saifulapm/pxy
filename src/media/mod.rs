@@ -11,6 +11,7 @@ pub mod images;
 pub mod pdf;
 pub mod rerank;
 pub mod search;
+pub mod systemone;
 pub mod video;
 
 use axum::Json;
@@ -29,6 +30,7 @@ pub enum Capability {
     Speech,
     Rerank,
     Video,
+    SystemOne,
 }
 
 impl Capability {
@@ -39,6 +41,7 @@ impl Capability {
             Capability::Speech => &m.speech_models,
             Capability::Rerank => &m.rerank_models,
             Capability::Video => &m.video_models,
+            Capability::SystemOne => &m.systemone_models,
         }
     }
 
@@ -50,6 +53,7 @@ impl Capability {
             Capability::Speech => m.speech_url.as_deref(),
             Capability::Rerank => m.rerank_url.as_deref(),
             Capability::Video => m.video_url.as_deref(),
+            Capability::SystemOne => m.systemone_url.as_deref(),
         };
         specific.or(m.run_url.as_deref())
     }
@@ -61,6 +65,7 @@ impl Capability {
             Capability::Speech => &cfg.media.speech,
             Capability::Rerank => &cfg.media.rerank,
             Capability::Video => &cfg.media.video,
+            Capability::SystemOne => &cfg.media.systemone,
         };
         chain.as_ref().map(|c| c.as_slice()).unwrap_or_default()
     }
@@ -72,6 +77,7 @@ impl Capability {
             Capability::Speech => "speech",
             Capability::Rerank => "rerank",
             Capability::Video => "video",
+            Capability::SystemOne => "systemone",
         }
     }
 }

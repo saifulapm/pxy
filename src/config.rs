@@ -312,6 +312,8 @@ pub struct MediaDefaults {
     pub speech: Option<ModelChain>,
     pub rerank: Option<ModelChain>,
     pub video: Option<ModelChain>,
+    /// Jev's chain: the gateways that serve Typesafe's System One model.
+    pub systemone: Option<ModelChain>,
 }
 
 /// One model id or an ordered failover chain (first healthy wins). A bare
@@ -795,6 +797,10 @@ pub struct MediaConfig {
     pub video_status_url: Option<String>,
     #[serde(default)]
     pub video_models: Vec<String>,
+    /// Typesafe System One (Jev), reached through a gateway's own route.
+    pub systemone_url: Option<String>,
+    #[serde(default)]
+    pub systemone_models: Vec<String>,
     /// Media-only daily request cap, counted separately from chat usage.
     /// Billing safety for providers where overage costs money (cloudflare).
     pub daily_requests: Option<u64>,
@@ -819,6 +825,10 @@ pub enum MediaKind {
     /// Meta: images are plain OpenAI shape, but ASR takes a `request` JSON
     /// part beside the `audio` bytes and answers `{transcript}`.
     Meta,
+    /// Vercel's AI SDK evaluation protocol: the model id rides an
+    /// `ai-model-id` header and the answers come back in the SDK's own
+    /// spelling, not Typesafe's.
+    Vercel,
 }
 
 #[cfg(test)]
@@ -979,6 +989,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("api_ky"), "typo must not be silent: {err}");
+    }
+
+    /// Jev's three gateways, each on its own non-chat route, with `[media]
+    /// systemone` the failover chain across them.
+    #[test]
+    fn systemone_chain_spans_the_three_gateways() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            [providers.vercel]
+            [providers.vercel.media]
+            kind = "vercel"
+            systemone_url = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
+            systemone_models = ["typesafe-ai/jev"]
+            [providers.openrouter]
+            [providers.openrouter.media]
+            systemone_url = "https://openrouter.ai/api/alpha/decisions"
+            systemone_models = ["typesafe/jev-1.13"]
+            [providers.cloudflare]
+            [providers.cloudflare.media]
+            kind = "cloudflare"
+            systemone_url = "https://api.cloudflare.com/client/v4/accounts/abc/ai/run"
+            systemone_models = ["typesafe/jev"]
+            [media]
+            systemone = ["vercel/typesafe-ai/jev", "openrouter/typesafe/jev-1.13",
+                         "cloudflare/typesafe/jev"]
+            "#,
+        )
+        .unwrap();
+        let vercel = cfg.providers["vercel"].media.as_ref().unwrap();
+        assert_eq!(vercel.kind, MediaKind::Vercel);
+        assert_eq!(vercel.systemone_models, ["typesafe-ai/jev"]);
+        let openrouter = cfg.providers["openrouter"].media.as_ref().unwrap();
+        assert_eq!(openrouter.kind, MediaKind::Openai, "no kind means Typesafe's own shape");
+        assert_eq!(cfg.media.systemone.as_ref().unwrap().as_slice().len(), 3);
+
+        // No chain at all is the default: `verify` is then unservable.
+        let bare: Config = toml::from_str("[server]\n").unwrap();
+        assert!(bare.media.systemone.is_none());
     }
 
     /// `vision` is an assertion about image input, made only from a real

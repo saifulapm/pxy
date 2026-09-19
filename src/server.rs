@@ -42,6 +42,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/v1/audio/transcriptions", post(crate::media::audio::transcriptions))
         .route("/v1/audio/speech", post(crate::media::audio::speech))
         .route("/v1/rerank", post(crate::media::rerank::rerank))
+        .route("/v1/systemone", post(crate::media::systemone::systemone))
         .route("/v1/videos/generations", post(crate::media::video::generations))
         .route(
             "/v1/search",

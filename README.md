@@ -76,8 +76,10 @@ Chat in both dialects, streaming included, at `POST /v1/chat/completions` and
 `GET /v1/models` and `/healthz` round it out.
 
 Non-chat work runs through `pxy search`, `fetch`, `transcribe`, `say`, `image`
-and `video`, or the matching `/v1/...` endpoints. Media usage is counted on its
-own, so it never eats a chat budget.
+and `video`, or the matching `/v1/...` endpoints. `POST /v1/systemone` is one
+more: Typesafe's Jev answers typed questions about a state with calibrated
+probabilities, reached through whichever gateway in the `[media] systemone`
+chain is up. Media usage is counted on its own, so it never eats a chat budget.
 
 Server tools work on models that never learned them. A client declares one
 by its type (`pxy:web_search`, or OpenRouter's `openrouter:web_search`), pxy

@@ -448,6 +448,26 @@ image_models = ["image-one"]
 transcription_url = "https://api.kappa.example/v1/asr/transcribe"
 transcription_models = ["stt-one"]
 
+# Typesafe's System One model (Jev) answers typed questions about a state with
+# calibrated probabilities. It needs no Typesafe key: three gateways serve it,
+# each on its own non-chat route, and `[media] systemone` is the failover chain
+# across them. These URLs are the real ones — the whole point of the example is
+# that they are hard to find. Add the block to a provider you already hold a key
+# for.
+[providers.vercel.media]
+kind = "vercel"
+systemone_url = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
+systemone_models = ["typesafe-ai/jev"]
+
+[providers.openrouter.media]
+systemone_url = "https://openrouter.ai/api/alpha/decisions"
+systemone_models = ["typesafe/jev-1.13"]
+
+[providers.cloudflare.media]
+kind = "cloudflare"
+systemone_url = "https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run"
+systemone_models = ["typesafe/jev"]
+
 # The remaining media kinds, as copy-paste fragments for a provider you already
 # have:
 #
@@ -458,6 +478,7 @@ transcription_models = ["stt-one"]
 #   kind = "agnes"      OpenAI-ish images + async video job
 #   kind = "dashscope"  Alibaba multimodal-generation on one URL
 #   kind = "meta"       OpenAI images, ASR with a `request` part
+#   kind = "vercel"     the AI SDK evaluation protocol (Jev, id in a header)
 
 # ---------------------------------------------------------------------------
 # Search and fetch: ordered service-provider pools, first healthy wins, with
@@ -498,3 +519,4 @@ transcription = "delta/stt-one"
 speech = ["gamma/tts-one", "zeta/tts-one"]
 rerank = "eta/rerank-one"
 video = "theta/video-one"
+systemone = ["vercel/typesafe-ai/jev", "openrouter/typesafe/jev-1.13", "cloudflare/typesafe/jev"]
