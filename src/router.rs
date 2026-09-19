@@ -84,6 +84,23 @@ pub enum Outcome {
 /// Relayed upstream response headers, in wire order.
 pub type Headers = Vec<(String, String)>;
 
+impl Outcome {
+    fn headers_mut(&mut self) -> &mut Headers {
+        match self {
+            Outcome::Json { headers, .. } | Outcome::Stream { headers, .. } => headers,
+        }
+    }
+}
+
+/// A header value the wire accepts: visible ASCII and space, bounded. Skip
+/// reasons can carry upstream error text, which is neither.
+fn header_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .take(1024)
+        .collect()
+}
+
 /// Everything classification and passthrough need about a failed upstream
 /// response, taken from that one response so they cannot drift apart.
 struct UpstreamError {
@@ -126,8 +143,9 @@ fn forwardable_headers(h: &reqwest::header::HeaderMap) -> Headers {
         "date",
         // pxy writes its own on the response it builds.
         "content-type",
-        // pxy owns this one; an upstream value would name the wrong hop.
+        // pxy owns these; an upstream value would name the wrong hop.
         "x-pxy-provider",
+        "x-pxy-skipped",
         // These describe pxy's connection to the UPSTREAM host, not the
         // loopback one pxy is answering on, so relaying them is at best noise
         // and at worst misleading: a session cookie for the upstream handed to
@@ -797,7 +815,7 @@ async fn handle_chat_inner(
             match try_candidate(&app, cand, client_format, &payload, stream, input_estimate, &ctx, multi)
                 .await
             {
-                AttemptResult::Done(outcome) => {
+                AttemptResult::Done(mut outcome) => {
                     // A real success repairs the model's failure-rate record.
                     app.state.model_result(&cand.state_provider(), &cand.model.id, true);
                     // ...and rebinds the conversation's session affinity,
@@ -806,6 +824,14 @@ async fn handle_chat_inner(
                         if !pinned_ids.contains(&cand.full_id()) {
                             app.state.session_set(key, &cand.full_id());
                         }
+                    }
+                    // Who was passed over on the way here, and why. The log
+                    // has it too, but the client is where "why did the cheap
+                    // model not answer" gets asked.
+                    if !skipped.is_empty() {
+                        outcome
+                            .headers_mut()
+                            .push(("x-pxy-skipped".into(), header_safe(&skipped.join("; "))));
                     }
                     return outcome;
                 }
@@ -5925,8 +5951,13 @@ mod tests {
         let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
             .await;
         match out {
-            Outcome::Stream { provider, body, .. } => {
+            Outcome::Stream { provider, body, headers } => {
                 assert_eq!(provider, "b/m");
+                let skipped = headers.iter().find(|(k, _)| k == "x-pxy-skipped").map(|(_, v)| v);
+                assert!(
+                    skipped.is_some_and(|v| v.starts_with("a/m: ")),
+                    "the passed-over candidate is named on the response: {headers:?}"
+                );
                 let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
                 let text = String::from_utf8_lossy(&bytes);
                 assert!(text.contains("hello"), "held first chunk must reach the client: {text}");
