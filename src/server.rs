@@ -24,6 +24,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // chmods anything that already exists.
     unsafe { libc::umask(0o077) };
     let state = PxyState::open(&crate::config::data_dir().join("state.sqlite"))?;
+    state.configure_stats(&cfg.stats);
     let catalog = Catalog::from_config(&cfg);
     let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))

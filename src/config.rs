@@ -102,6 +102,34 @@ pub struct Config {
     /// every request; a client can still ask for one per request.
     #[serde(default)]
     pub plugins: PluginsConfig,
+    /// Per-attempt accounting behind `pxy stats` (`[stats]`). On by default:
+    /// the rows are what makes latency, error rates and per-tool cost
+    /// answerable at all, and they cost one insert per upstream leg.
+    #[serde(default)]
+    pub stats: StatsConfig,
+}
+
+/// Per-attempt stats recording (wiki:state). Routing never reads these rows;
+/// they exist so `pxy stats` can answer what happened, and they age out on
+/// their own.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Retention: rows older than this many days are swept on write.
+    #[serde(default = "default_stats_retain_days")]
+    pub retain_days: u64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self { enabled: true, retain_days: default_stats_retain_days() }
+    }
+}
+
+fn default_stats_retain_days() -> u64 {
+    90
 }
 
 /// Request-time transforms in OpenRouter's `plugins` vocabulary

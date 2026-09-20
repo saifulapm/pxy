@@ -743,6 +743,7 @@ mod tests {
             capture: Default::default(),
             server_tools: Default::default(),
             plugins: Default::default(),
+            stats: Default::default(),
         };
         let discovered = BTreeMap::from([(
             "p".to_string(),

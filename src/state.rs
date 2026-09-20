@@ -30,6 +30,11 @@ pub struct State {
     /// single error ever crossed the per-error cooldown ladder. In-memory
     /// only — persistent cooldowns already cover the decisive failures.
     model_health: Mutex<HashMap<String, ModelHealth>>,
+    /// What `[stats]` asked for. Set once by the daemon at startup; a CLI
+    /// reader never writes rows, so the default stands there.
+    stats: Mutex<crate::config::StatsConfig>,
+    /// Epoch ms of the last retention sweep, so it is not per leg.
+    stats_swept: Mutex<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +70,71 @@ pub struct UsageRow {
     pub requests: u64,
     pub tokens: u64,
 }
+
+/// One upstream HTTP leg, as `pxy stats` reads it back. A leg is what
+/// `record_request`/`record_tokens` already count: a server-tool continuation
+/// and a re-send of a dead stream are each their own. Routing never reads
+/// these rows — they answer questions, they do not steer anything.
+#[derive(Debug, Clone, Default)]
+pub struct AttemptRow {
+    /// Epoch ms at the start of the leg.
+    pub ts: i64,
+    /// LOCAL calendar date, as `model_usage` writes it.
+    pub day: String,
+    /// "chat", "embed" or "media".
+    pub kind: String,
+    pub agent: String,
+    /// The group, alias or model id the client asked for.
+    pub requested: String,
+    /// Bare wire name; a multi-account provider's account is its own column so
+    /// no consumer ever sees a `#` key.
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    /// Position in the candidate walk, 0 for the first choice.
+    pub step: i64,
+    /// 0 for a client turn, 1 for a meta-tool's sub-request.
+    pub depth: i64,
+    pub stream: bool,
+    /// "ok", "refused", "http", "network", "timeout", "dead" or "disconnect".
+    pub outcome: String,
+    /// HTTP status, 0 when there was none.
+    pub status: u16,
+    pub error: String,
+    /// Whole-leg wall time.
+    pub ms: i64,
+    /// To the first committed stream event, or to response headers when the
+    /// leg was not streamed. 0 when unknown.
+    pub ttfb_ms: i64,
+    /// Billed input, INCLUDING cache traffic — the same number the quota
+    /// windows count. `cache_read` and `cache_write` break it down.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: u64,
+    /// Server-tool calls this leg closed on.
+    pub tool_calls: i64,
+}
+
+/// One executed server-tool call.
+#[derive(Debug, Clone, Default)]
+pub struct ToolRunRow {
+    pub ts: i64,
+    pub day: String,
+    pub agent: String,
+    /// The tool's canonical name ("web_search", "memory", …).
+    pub tool: String,
+    pub ok: bool,
+    pub ms: i64,
+    pub error: String,
+    /// A short tool-specific note (hit count, library id), or empty.
+    pub detail: String,
+}
+
+/// How often the retention sweep may run. Deleting by an indexed timestamp is
+/// cheap, but not once per upstream leg.
+const STATS_PRUNE_INTERVAL_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone)]
 pub struct ModelUsageRow {
@@ -119,6 +189,44 @@ impl State {
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (day, agent, provider, model)
             );
+            CREATE TABLE IF NOT EXISTS attempts (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                requested TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                account TEXT NOT NULL,
+                model TEXT NOT NULL,
+                step INTEGER NOT NULL,
+                depth INTEGER NOT NULL,
+                stream INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                status INTEGER NOT NULL,
+                error TEXT NOT NULL,
+                ms INTEGER NOT NULL,
+                ttfb_ms INTEGER NOT NULL,
+                input INTEGER NOT NULL,
+                output INTEGER NOT NULL,
+                cache_read INTEGER NOT NULL,
+                cache_write INTEGER NOT NULL,
+                reasoning INTEGER NOT NULL,
+                tool_calls INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS attempts_ts ON attempts (ts);
+            CREATE TABLE IF NOT EXISTS tool_runs (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                ms INTEGER NOT NULL,
+                error TEXT NOT NULL,
+                detail TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS tool_runs_ts ON tool_runs (ts);
             CREATE TABLE IF NOT EXISTS kv (
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
@@ -170,7 +278,168 @@ impl State {
             rpm: Mutex::new(HashMap::new()),
             tpm: Mutex::new(HashMap::new()),
             model_health: Mutex::new(HashMap::new()),
+            stats: Mutex::new(crate::config::StatsConfig::default()),
+            stats_swept: Mutex::new(0),
         })
+    }
+
+    // ---- stats rows (wiki:state) ----
+
+    /// Adopt the config's `[stats]` settings. The daemon calls this once at
+    /// startup; without it the defaults (on, 90 days) apply.
+    pub fn configure_stats(&self, cfg: &crate::config::StatsConfig) {
+        *self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.clone();
+    }
+
+    /// Record one upstream leg. Best-effort in the same way capture is: a
+    /// write that fails is a lost report, never a failed request.
+    pub fn record_attempt(&self, row: &AttemptRow) {
+        let Some(retain_days) = self.stats_retention() else { return };
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = db.execute(
+            "INSERT INTO attempts (ts, day, kind, agent, requested, provider, account, model,
+                 step, depth, stream, outcome, status, error, ms, ttfb_ms,
+                 input, output, cache_read, cache_write, reasoning, tool_calls)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18, ?19, ?20, ?21, ?22)",
+            rusqlite::params![
+                row.ts,
+                row.day,
+                row.kind,
+                row.agent,
+                row.requested,
+                row.provider,
+                row.account,
+                row.model,
+                row.step,
+                row.depth,
+                row.stream as i64,
+                row.outcome,
+                row.status as i64,
+                row.error,
+                row.ms,
+                row.ttfb_ms,
+                row.input as i64,
+                row.output as i64,
+                row.cache_read as i64,
+                row.cache_write as i64,
+                row.reasoning as i64,
+                row.tool_calls,
+            ],
+        ) {
+            tracing::warn!(error = %e, "recording an attempt failed");
+        }
+        self.sweep_stats(&db, retain_days);
+    }
+
+    /// Record one executed server-tool call. Best-effort, as above.
+    pub fn record_tool_run(&self, row: &ToolRunRow) {
+        let Some(retain_days) = self.stats_retention() else { return };
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = db.execute(
+            "INSERT INTO tool_runs (ts, day, agent, tool, ok, ms, error, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                row.ts,
+                row.day,
+                row.agent,
+                row.tool,
+                row.ok as i64,
+                row.ms,
+                row.error,
+                row.detail,
+            ],
+        ) {
+            tracing::warn!(error = %e, "recording a tool run failed");
+        }
+        self.sweep_stats(&db, retain_days);
+    }
+
+    /// Every attempt at or after `since_ms`, oldest first.
+    pub fn attempts_since(&self, since_ms: i64) -> Result<Vec<AttemptRow>> {
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt = db.prepare(
+            "SELECT ts, day, kind, agent, requested, provider, account, model, step, depth,
+                    stream, outcome, status, error, ms, ttfb_ms, input, output,
+                    cache_read, cache_write, reasoning, tool_calls
+             FROM attempts WHERE ts >= ?1 ORDER BY ts, id",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok(AttemptRow {
+                ts: r.get(0)?,
+                day: r.get(1)?,
+                kind: r.get(2)?,
+                agent: r.get(3)?,
+                requested: r.get(4)?,
+                provider: r.get(5)?,
+                account: r.get(6)?,
+                model: r.get(7)?,
+                step: r.get(8)?,
+                depth: r.get(9)?,
+                stream: r.get::<_, i64>(10)? != 0,
+                outcome: r.get(11)?,
+                status: r.get::<_, i64>(12)? as u16,
+                error: r.get(13)?,
+                ms: r.get(14)?,
+                ttfb_ms: r.get(15)?,
+                input: r.get::<_, i64>(16)? as u64,
+                output: r.get::<_, i64>(17)? as u64,
+                cache_read: r.get::<_, i64>(18)? as u64,
+                cache_write: r.get::<_, i64>(19)? as u64,
+                reasoning: r.get::<_, i64>(20)? as u64,
+                tool_calls: r.get(21)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every tool run at or after `since_ms`, oldest first.
+    pub fn tool_runs_since(&self, since_ms: i64) -> Result<Vec<ToolRunRow>> {
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt = db.prepare(
+            "SELECT ts, day, agent, tool, ok, ms, error, detail
+             FROM tool_runs WHERE ts >= ?1 ORDER BY ts, id",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok(ToolRunRow {
+                ts: r.get(0)?,
+                day: r.get(1)?,
+                agent: r.get(2)?,
+                tool: r.get(3)?,
+                ok: r.get::<_, i64>(4)? != 0,
+                ms: r.get(5)?,
+                error: r.get(6)?,
+                detail: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// `Some(retain_days)` when stats recording is on, `None` when `[stats]
+    /// enabled = false` — which stops the writes and leaves the reads alone.
+    fn stats_retention(&self) -> Option<u64> {
+        let cfg = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cfg.enabled.then_some(cfg.retain_days)
+    }
+
+    /// Drop rows past the retention window, at most once an hour. Called with
+    /// the db lock already held, best-effort: a failed sweep is retried at the
+    /// next interval.
+    fn sweep_stats(&self, db: &Connection, retain_days: u64) {
+        let now = epoch_ms();
+        {
+            let mut last = self.stats_swept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *last != 0 && now.saturating_sub(*last) < STATS_PRUNE_INTERVAL_MS {
+                return;
+            }
+            *last = now;
+        }
+        let cutoff = now.saturating_sub(retain_days.saturating_mul(86_400_000)) as i64;
+        for table in ["attempts", "tool_runs"] {
+            if let Err(e) = db.execute(&format!("DELETE FROM {table} WHERE ts < ?1"), [cutoff]) {
+                tracing::warn!(table, error = %e, "sweeping old stats rows failed");
+            }
+        }
     }
 
     // ---- usage ----
@@ -645,6 +914,109 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pxy-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         State::open(&dir.join("s.sqlite")).unwrap()
+    }
+
+    fn attempt(model: &str, ts: i64) -> AttemptRow {
+        AttemptRow {
+            ts,
+            day: "2026-09-20".into(),
+            kind: "chat".into(),
+            agent: "claude".into(),
+            requested: "aaa".into(),
+            provider: "zenmux".into(),
+            model: model.into(),
+            outcome: "ok".into(),
+            ms: 1200,
+            ttfb_ms: 300,
+            input: 900,
+            output: 40,
+            cache_read: 700,
+            ..AttemptRow::default()
+        }
+    }
+
+    #[test]
+    fn attempt_rows_round_trip() {
+        let s = state("attempts");
+        let now = epoch_ms() as i64;
+        s.record_attempt(&attempt("glm-5.3", now - 1000));
+        s.record_attempt(&AttemptRow {
+            outcome: "http".into(),
+            status: 429,
+            error: "rate limited".into(),
+            ..attempt("qwen3-coder", now)
+        });
+        let rows = s.attempts_since(0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].model, "glm-5.3", "oldest first: {rows:?}");
+        assert_eq!((rows[0].input, rows[0].cache_read, rows[0].ttfb_ms), (900, 700, 300));
+        assert_eq!((rows[1].status, rows[1].outcome.as_str()), (429, "http"));
+        assert_eq!(s.attempts_since(now).unwrap().len(), 1, "since filters by ts");
+    }
+
+    #[test]
+    fn tool_run_rows_round_trip() {
+        let s = state("tool_runs");
+        let now = epoch_ms() as i64;
+        s.record_tool_run(&ToolRunRow {
+            ts: now,
+            day: "2026-09-20".into(),
+            agent: "codex".into(),
+            tool: "web_search".into(),
+            ok: false,
+            ms: 1800,
+            error: "brave: 429".into(),
+            detail: String::new(),
+        });
+        let rows = s.tool_runs_since(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].tool.as_str(), rows[0].ok, rows[0].ms), ("web_search", false, 1800));
+    }
+
+    #[test]
+    fn stats_writes_stop_when_disabled() {
+        let s = state("stats_off");
+        s.configure_stats(&crate::config::StatsConfig { enabled: false, retain_days: 90 });
+        s.record_attempt(&attempt("m", epoch_ms() as i64));
+        assert!(s.attempts_since(0).unwrap().is_empty(), "disabled means nothing is written");
+    }
+
+    #[test]
+    fn retention_drops_rows_past_the_window() {
+        let dir = std::env::temp_dir().join(format!("pxy-test-{}-stats_prune", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("s.sqlite");
+        let now = epoch_ms() as i64;
+        let old = now - 3 * 86_400_000;
+
+        // Seed both tables past the window...
+        let seed = State::open(&path).unwrap();
+        seed.record_attempt(&attempt("old", old));
+        seed.record_tool_run(&ToolRunRow {
+            ts: old,
+            day: "2026-09-17".into(),
+            agent: "claude".into(),
+            tool: "memory".into(),
+            ok: true,
+            ms: 3,
+            error: String::new(),
+            detail: String::new(),
+        });
+        drop(seed);
+
+        // ...and the next write of a State that has never swept sweeps them.
+        let s = State::open(&path).unwrap();
+        s.configure_stats(&crate::config::StatsConfig { enabled: true, retain_days: 1 });
+        s.record_attempt(&attempt("new", now));
+        let rows = s.attempts_since(0).unwrap();
+        assert_eq!(rows.len(), 1, "the 3-day-old attempt is past a 1-day window: {rows:?}");
+        assert_eq!(rows[0].model, "new");
+        assert!(s.tool_runs_since(0).unwrap().is_empty(), "tool runs age out the same way");
+
+        // ...and only then: the sweep is hourly, so the next write leaves an
+        // old row alone rather than scanning again.
+        s.record_attempt(&attempt("old-again", old));
+        assert_eq!(s.attempts_since(0).unwrap().len(), 2, "the sweep must not run per write");
     }
 
     #[test]
