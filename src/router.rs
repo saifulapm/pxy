@@ -1866,6 +1866,14 @@ async fn try_candidate_inner(
             fwd_headers.clone(),
             ctx.responses,
             responses_upstream,
+            Resend {
+                url: prepared.url.clone(),
+                headers: upstream_headers.clone(),
+                body: body.clone(),
+                responses_upstream,
+                timeout: Duration::from_secs(provider_cfg.timeout_secs),
+                left: MAX_RETRIES,
+            },
         )
         .await
         {
@@ -2617,6 +2625,22 @@ enum StreamKind {
     ToOpenai(openai_to_anthropic::StreamState),
 }
 
+/// The attempt's own request, kept so a stream that died having produced no
+/// answer can be sent again inside the client turn already open. Same
+/// candidate, same body: a truncation is transient, and walking to a
+/// different candidate mid-stream would mean hoisting the whole walk in here.
+struct Resend {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Value,
+    responses_upstream: bool,
+    timeout: Duration,
+    /// Re-sends left. `MAX_RETRIES`, deliberately not opencode's five
+    /// (`RETRY_MAX_RETRIES`): each one re-reads the whole prompt, where
+    /// theirs retries a request the provider never billed.
+    left: u32,
+}
+
 struct StreamCtx {
     parser: SseParser,
     kind: StreamKind,
@@ -2667,6 +2691,8 @@ struct StreamCtx {
     /// moment it commits, which reasoning is enough to do; this is how
     /// `finish()` tells a short answer from a turn that produced nothing.
     produced_output: bool,
+    /// This attempt's request, for `resend()`.
+    resend: Resend,
 }
 
 /// litellm's rule (streaming_handler.raise_on_model_repetition, default 100):
@@ -3869,6 +3895,71 @@ impl StreamCtx {
         }
     }
 
+    /// Send this attempt again, in place, when the stream died having
+    /// produced no answer. The client turn stays open: the reasoning it was
+    /// already shown stands, and the new attempt's events follow it in the
+    /// same turn. `None` means this is not that case — the turn was closed
+    /// by the upstream, or it answered, or the re-sends are spent — and the
+    /// caller closes the turn as it did before.
+    async fn resend(&mut self) -> Option<Bytes> {
+        if self.client_done || self.produced_output || self.resend.left == 0 {
+            return None;
+        }
+        self.resend.left -= 1;
+        // The dead attempt is a failure whether or not the re-send saves the
+        // turn, or a leg that truncates half the time would look healthy
+        // every time pxy covered for it.
+        self.app.state.model_result(&self.state_provider, &self.model, false);
+
+        let url = self.resend.url.clone();
+        let responses_wire = self.resend.responses_upstream;
+        let timeout = self.resend.timeout;
+        let mut req = self.app.http.post(&url).header("content-type", "application/json");
+        for (k, v) in &self.resend.headers {
+            req = req.header(k, v);
+        }
+        let wire_body;
+        let send_body: &Value = if responses_wire {
+            wire_body = responses_upstream::request(&self.resend.body);
+            &wire_body
+        } else {
+            &self.resend.body
+        };
+        let resp = match tokio::time::timeout(timeout, req.json(send_body).send()).await {
+            Ok(Ok(r)) if r.status().is_success() => r,
+            // Nothing to splice in. The turn ends the way it would have
+            // without this path at all, which the caller does next.
+            Ok(Ok(r)) => {
+                warn!(status = r.status().as_u16(), "re-send of a dead stream failed");
+                return None;
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "re-send of a dead stream failed");
+                return None;
+            }
+            Err(_) => {
+                warn!(secs = timeout.as_secs(), "re-send of a dead stream: no response");
+                return None;
+            }
+        };
+        warn!(
+            provider = %self.provider,
+            model = %self.model,
+            left = self.resend.left,
+            "stream died with no answer; sending the attempt again"
+        );
+        self.upstream = if responses_wire {
+            responses_upstream::chat_stream(resp.bytes_stream().boxed())
+        } else {
+            resp.bytes_stream().boxed()
+        };
+        self.parser = SseParser::new();
+        record_request(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model);
+        // The client stream stays open; the next read comes off the new
+        // upstream. Nothing to hand it right now.
+        Some(Bytes::new())
+    }
+
     fn finish(&mut self) -> Bytes {
         let out = match &mut self.kind {
             StreamKind::ToAnthropic(state) => {
@@ -4098,6 +4189,7 @@ async fn stream_outcome(
     fwd_headers: Headers,
     responses_client: bool,
     responses_upstream: bool,
+    resend: Resend,
 ) -> Result<Outcome, StreamFailure> {
     let kind = match (client_format, upstream_format) {
         (ClientFormat::Openai, WireFormat::Openai) => StreamKind::OpenaiPass,
@@ -4150,6 +4242,7 @@ async fn stream_outcome(
         terminated: false,
         repeat: RepeatGuard::default(),
         produced_output: false,
+        resend,
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
@@ -4217,6 +4310,11 @@ async fn stream_outcome(
             }
             Ok(Some(Err(e))) => {
                 warn!(provider = %ctx.provider, error = %e, "upstream stream error");
+                // A connection that drops mid-turn is the same loss as an
+                // EOF, so it gets the same second chance.
+                if let Some(blocks) = ctx.resend().await {
+                    return Some((Ok(blocks), ctx));
+                }
                 ctx.done = true;
                 let tail = ctx.finish();
                 Some((Ok(tail), ctx))
@@ -4225,6 +4323,13 @@ async fn stream_outcome(
                 // A queued server call swaps in a fresh upstream response and
                 // keeps the same client stream going.
                 if let Some(blocks) = ctx.continue_after_server_calls().await {
+                    return Some((Ok(blocks), ctx));
+                }
+                // EOF with nothing answered: the same swap, for the same
+                // reason. Not on the stall arm above — that one has already
+                // waited timeout_secs, and re-sending would make the client
+                // wait it out again.
+                if let Some(blocks) = ctx.resend().await {
                     return Some((Ok(blocks), ctx));
                 }
                 ctx.done = true;
@@ -5232,6 +5337,12 @@ mod tests {
         out.push_str("data: [DONE]\n\n");
         out
     }
+
+    /// A turn that thought and then simply stopped: no answer, no finish
+    /// reason, no `[DONE]`. The reasoning is enough to commit the stream,
+    /// which is what made this shape invisible before.
+    const THOUGHT_THEN_NOTHING: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"weighing it up\"}}]}\n\n";
 
     const ANSWER_SSE: &str = concat!(
         "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\n",
@@ -6676,6 +6787,87 @@ mod tests {
             app.state.model_result("p", "m", false);
         }
         assert!(app.state.model_unhealthy("p", "m"), "an output-free truncation is a failed attempt");
+    }
+
+    /// An upstream stream that ends after its reasoning, with no answer and
+    /// no finish reason. The client turn is already committed, so it cannot
+    /// be failed over — it is sent again in place instead, and the client
+    /// reads one turn: the reasoning it was already shown, then the answer.
+    #[tokio::test]
+    async fn an_output_free_truncation_is_sent_again() {
+        let (base, seen) =
+            scripted_upstream(vec![(200, THOUGHT_THEN_NOTHING), (200, ANSWER_SSE)]).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "output_free_resend",
+        );
+
+        let payload = json!({"model": "p/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("weighing it up"), "the reasoning stays: {text}");
+                assert!(text.contains("done"), "the re-send's answer must follow it: {text}");
+                assert_eq!(
+                    text.matches("\"finish_reason\":\"stop\"").count(),
+                    1,
+                    "one terminal reason, the upstream's own: {text}"
+                );
+                assert_eq!(text.matches("[DONE]").count(), 1, "exactly one terminator: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        assert_eq!(seen.lock().unwrap().len(), 2, "the same request, sent twice");
+    }
+
+    /// The cap. A leg that dies empty every time is not chased forever:
+    /// MAX_RETRIES re-sends spend it, and the turn then closes with the
+    /// synthesized stop it would have had all along.
+    #[tokio::test]
+    async fn an_endlessly_dying_leg_still_closes_the_turn() {
+        // One step, and `scripted_upstream` repeats its last past the script.
+        let (base, seen) = scripted_upstream(vec![(200, THOUGHT_THEN_NOTHING)]).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "resend_cap",
+        );
+
+        let payload = json!({"model": "p/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("\"finish_reason\":\"stop\""), "the turn must close: {text}");
+                assert_eq!(text.matches("[DONE]").count(), 1, "exactly one terminator: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1 + MAX_RETRIES as usize,
+            "the first attempt and MAX_RETRIES re-sends, no more"
+        );
     }
 
     /// The same hole with a `[DONE]` and no `finish_reason` before it: some
