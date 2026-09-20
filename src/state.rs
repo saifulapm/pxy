@@ -169,6 +169,17 @@ impl State {
         // "database is locked" abort instead of a few-ms wait.
         db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
+        // WAL's default (`synchronous = FULL`) fsyncs every commit, and one
+        // request commits nine times through a single connection mutex: on
+        // btrfs that measured 4.5ms for one request and ~30ms with eight in
+        // flight, most of it spent waiting on the disk. NORMAL fsyncs at
+        // checkpoints instead — 0.75ms and 3.5ms for the same work. In WAL
+        // mode it cannot corrupt the database and it is durable across an
+        // application crash; a power cut or kernel panic can roll back the
+        // newest commits, which here means a few seconds of quota counts, the
+        // newest stats rows, or a cooldown pxy would re-learn on its next
+        // failure. That is the right trade for traffic metadata.
+        db.pragma_update(None, "synchronous", "NORMAL")?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS usage (
                 provider TEXT NOT NULL,
@@ -933,6 +944,18 @@ mod tests {
             cache_read: 700,
             ..AttemptRow::default()
         }
+    }
+
+    /// The durability setting is a measured decision, not a default that
+    /// drifted in: FULL fsyncs every one of the nine commits a request makes.
+    #[test]
+    fn the_db_opens_in_wal_at_synchronous_normal() {
+        let s = state("pragmas");
+        let db = s.db.lock().unwrap();
+        let journal: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0)).unwrap();
+        let sync: i64 = db.pragma_query_value(None, "synchronous", |r| r.get(0)).unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(sync, 1, "1 is NORMAL; 2 (FULL) fsyncs every commit");
     }
 
     #[test]
