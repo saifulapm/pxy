@@ -359,8 +359,10 @@ impl StreamState {
                 if let Some(id) = payload["message"]["id"].as_str() {
                     self.message_id = id.to_string();
                 }
-                self.usage.input =
-                    TokenUsage::from_anthropic(&payload["message"]["usage"]).input;
+                let start = TokenUsage::from_anthropic(&payload["message"]["usage"]);
+                self.usage.input = start.input;
+                self.usage.cache_read = start.cache_read;
+                self.usage.cache_write = start.cache_write;
                 self.chunk(json!({"role": "assistant", "content": ""}), None)
             }
             "content_block_start" => {
@@ -420,7 +422,10 @@ impl StreamState {
                 // input_tokens appears; message_start alone billed those
                 // turns as zero input.
                 if payload["usage"]["input_tokens"].is_u64() {
-                    self.usage.input = TokenUsage::from_anthropic(&payload["usage"]).input;
+                    let u = TokenUsage::from_anthropic(&payload["usage"]);
+                    self.usage.input = u.input;
+                    self.usage.cache_read = u.cache_read;
+                    self.usage.cache_write = u.cache_write;
                 }
                 let finish = map_stop_reason(payload["delta"]["stop_reason"].as_str());
                 self.finished = true;

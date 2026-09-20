@@ -4433,7 +4433,7 @@ pub fn record_embedding_usage(app: &App, provider: &str, tokens: u64) {
         provider,
         provider,
         "",
-        TokenUsage { input: tokens, output: 0 },
+        TokenUsage { input: tokens, ..TokenUsage::default() },
         true,
     );
 }

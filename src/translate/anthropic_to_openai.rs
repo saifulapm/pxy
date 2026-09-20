@@ -509,13 +509,7 @@ impl StreamState {
         }
 
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
-            let u = TokenUsage::from_openai(usage);
-            if u.input > 0 {
-                self.usage.input = u.input;
-            }
-            if u.output > 0 {
-                self.usage.output = u.output;
-            }
+            self.usage.merge(TokenUsage::from_openai(usage));
         }
 
         let choice = &chunk["choices"][0];

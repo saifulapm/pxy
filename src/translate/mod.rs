@@ -15,10 +15,24 @@ pub mod tool_text;
 pub mod web_search;
 
 /// Token usage extracted from a response, in provider-neutral terms.
+///
+/// `input` is what every quota budget is built on, so it always means "input
+/// the provider billed", cache traffic included. The three fields under it are
+/// a BREAKDOWN of that number and are never subtracted from it: on Anthropic
+/// the cache pair are components of `input`, on OpenAI `cache_read` is the
+/// already-included cached part of `prompt_tokens`. Either way
+/// `cache_read <= input`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
+    /// Input served from a prompt cache.
+    pub cache_read: u64,
+    /// Input written INTO a prompt cache (Anthropic only; OpenAI caches
+    /// implicitly and reports no such number).
+    pub cache_write: u64,
+    /// Output spent on reasoning, where the upstream says so.
+    pub reasoning: u64,
 }
 
 impl TokenUsage {
@@ -26,17 +40,46 @@ impl TokenUsage {
         Self {
             input: usage["prompt_tokens"].as_u64().unwrap_or(0),
             output: usage["completion_tokens"].as_u64().unwrap_or(0),
+            cache_read: usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+            cache_write: 0,
+            reasoning: usage["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0),
         }
     }
+    /// Adopt what a later usage report actually carried. A stream chunk that
+    /// omits a number reads as zero, and a zero must never erase what an
+    /// earlier chunk already said.
+    pub fn merge(&mut self, u: TokenUsage) {
+        if u.input > 0 {
+            self.input = u.input;
+        }
+        if u.output > 0 {
+            self.output = u.output;
+        }
+        if u.cache_read > 0 {
+            self.cache_read = u.cache_read;
+        }
+        if u.cache_write > 0 {
+            self.cache_write = u.cache_write;
+        }
+        if u.reasoning > 0 {
+            self.reasoning = u.reasoning;
+        }
+    }
+
     pub fn from_anthropic(usage: &serde_json::Value) -> Self {
         // Anthropic's `input_tokens` EXCLUDES cache traffic; the cache fields
         // are where most real input lands on cached agent sessions. Leaving
         // them out silently under-counts every quota budget.
+        let cache_write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
         Self {
-            input: usage["input_tokens"].as_u64().unwrap_or(0)
-                + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
-                + usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+            input: usage["input_tokens"].as_u64().unwrap_or(0) + cache_write + cache_read,
             output: usage["output_tokens"].as_u64().unwrap_or(0),
+            cache_read,
+            cache_write,
+            reasoning: 0,
         }
     }
 }
@@ -323,6 +366,29 @@ mod usage_tests {
         // Absent cache fields (non-caching upstreams) change nothing.
         let plain = TokenUsage::from_anthropic(&json!({"input_tokens": 7, "output_tokens": 3}));
         assert_eq!(plain.input, 7);
+    }
+
+    #[test]
+    fn cache_and_reasoning_break_input_down_without_changing_it() {
+        let a = TokenUsage::from_anthropic(&json!({
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 2000,
+            "cache_read_input_tokens": 30000,
+            "output_tokens": 50,
+        }));
+        assert_eq!(a.input, 32010, "the breakdown is never subtracted from input");
+        assert_eq!((a.cache_read, a.cache_write), (30000, 2000));
+
+        // OpenAI's prompt_tokens already includes the cached part, so
+        // cache_read is a subset of input rather than a component of it.
+        let o = TokenUsage::from_openai(&json!({
+            "prompt_tokens": 1200,
+            "completion_tokens": 300,
+            "prompt_tokens_details": {"cached_tokens": 1024},
+            "completion_tokens_details": {"reasoning_tokens": 250},
+        }));
+        assert_eq!((o.input, o.output), (1200, 300));
+        assert_eq!((o.cache_read, o.cache_write, o.reasoning), (1024, 0, 250));
     }
 
     #[test]
