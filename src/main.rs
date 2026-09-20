@@ -12,6 +12,7 @@ mod router;
 mod secrets;
 mod server;
 mod state;
+mod stats;
 mod translate;
 mod usage;
 
@@ -88,6 +89,30 @@ enum Command {
         /// repeatable. Model-usage rows are never filtered.
         #[arg(long = "provider")]
         providers: Vec<String>,
+    },
+    /// Report what pxy did: tokens, latency, errors and server-tool calls
+    Stats {
+        /// Window: 24h, 90m, 7d, 2w, today, month or all
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Report one dimension only: model, provider, agent, group, day, tool
+        #[arg(long)]
+        by: Option<String>,
+        /// Only legs on this provider
+        #[arg(long)]
+        provider: Option<String>,
+        /// Only legs from this agent ("claude", "codex", …, "other")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only legs on this model (a bare id or "provider/model")
+        #[arg(long)]
+        model: Option<String>,
+        /// List the failures themselves instead of the tables
+        #[arg(long)]
+        errors: bool,
+        /// Emit one JSON object instead of the tables
+        #[arg(long)]
+        json: bool,
     },
     /// Discover live provider catalogs; report drift and optionally regenerate
     Refresh {
@@ -207,6 +232,18 @@ fn main() -> Result<()> {
             let cfg = config::Config::load(&cfg_path)?;
             route(&cfg, group.as_deref(), model.as_deref(), clear)
         }
+        Command::Stats { since, by, provider, agent, model, errors, json } => stats(
+            &since,
+            stats::Filter {
+                since_ms: 0,
+                by,
+                provider,
+                agent,
+                model,
+                errors,
+            },
+            json,
+        ),
         Command::Refresh { generate } => {
             let cfg = config::Config::load(&cfg_path)?;
             let secrets = secrets::Secrets::new();
@@ -258,6 +295,22 @@ fn main() -> Result<()> {
             captures(&cfg, clean, json)
         }
     }
+}
+
+/// `pxy stats` — the per-leg rows the daemon writes, aggregated over a window.
+/// Reads the daemon's sqlite directly, so it works with the daemon down.
+fn stats(since: &str, mut filter: stats::Filter, json: bool) -> Result<()> {
+    use std::io::Write;
+    filter.since_ms = stats::parse_since(since, jiff::Zoned::now())?;
+    let st = state::State::open(&config::data_dir().join("state.sqlite"))?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if json {
+        let _ = writeln!(out, "{}", stats::summary_json(&st, filter.since_ms));
+        return Ok(());
+    }
+    let _ = write!(out, "{}", stats::report(&st, &filter, since)?);
+    Ok(())
 }
 
 /// `pxy captures [--clean] [--json]` — inspect or clear the capture dir.
