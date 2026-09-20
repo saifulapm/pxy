@@ -195,12 +195,30 @@ pub async fn run_chain<'a>(
         );
     }
     let mut last: Option<Response> = None;
-    for r in &chain {
+    for (step, r) in chain.iter().enumerate() {
         if let Some(gate) = preflight(app, r) {
             last = Some(gate);
             continue;
         }
-        match attempt(r).await {
+        let started = std::time::Instant::now();
+        let outcome = attempt(r).await;
+        let status = match &outcome {
+            Attempt::Ok(resp) | Attempt::Retryable(resp) | Attempt::Fatal(resp) => {
+                resp.status().as_u16()
+            }
+        };
+        record_attempt(
+            app,
+            "media",
+            &r.provider,
+            &r.model,
+            requested,
+            step,
+            started,
+            status,
+            "",
+        );
+        match outcome {
             Attempt::Ok(resp) => return resp,
             // Multi-candidate carve-out mirroring chat's classify_error:
             // media model lists churn too, and one delisted id must not kill
@@ -273,6 +291,46 @@ pub fn network_failure(app: &App, r: &Resolved<'_>, e: impl std::fmt::Display) -
     app.state
         .set_cooldown(&media_key(&r.provider), None, None, true, "network error");
     Attempt::Retryable(error_response(StatusCode::BAD_GATEWAY, format!("network: {e}")))
+}
+
+/// Record one media or service leg for `pxy stats` (wiki:state). Media
+/// traffic carries no agent and no token counts at this layer; what it does
+/// carry is who was called with what, how long it took, and whether it worked.
+/// A candidate stopped by `preflight` never reaches the wire, so it is not a
+/// leg and gets no row.
+pub fn record_attempt(
+    app: &App,
+    kind: &str,
+    provider: &str,
+    model: &str,
+    requested: &str,
+    step: usize,
+    started: std::time::Instant,
+    status: u16,
+    error: &str,
+) {
+    let outcome = match (status, error.is_empty()) {
+        // A status of its own is the better report; a walk that never got one
+        // has only the error text.
+        (400.., _) => "http",
+        (0, false) => "failed",
+        _ => "ok",
+    };
+    app.state.record_attempt(&crate::state::AttemptRow {
+        ts: jiff::Timestamp::now().as_millisecond(),
+        day: jiff::Zoned::now().date().to_string(),
+        kind: kind.to_string(),
+        agent: "other".into(),
+        requested: requested.to_string(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        step: step as i64,
+        outcome: outcome.to_string(),
+        status,
+        error: error.chars().take(200).collect(),
+        ms: (started.elapsed().as_millis() as i64).max(1),
+        ..crate::state::AttemptRow::default()
+    });
 }
 
 /// Usage/cooldown key for media traffic: isolated from the chat counters so
@@ -547,6 +605,23 @@ mod tests {
         // The failed model cooled down in the media pool scope only.
         assert!(app.state.cooldown(&media_key("a"), "ma").is_some());
         assert!(app.state.cooldown("a", "ma").is_none(), "chat scope untouched");
+
+        // Both attempts reached the wire, so both are stats rows: the 500 and
+        // the answer, in chain order.
+        let rows = app.state.attempts_since(0).unwrap();
+        assert_eq!(rows.len(), 2, "one row per media attempt: {rows:?}");
+        assert_eq!(
+            (rows[0].provider.as_str(), rows[0].model.as_str(), rows[0].outcome.as_str(), rows[0].status),
+            ("a", "ma", "http", 500),
+            "{rows:?}"
+        );
+        assert_eq!(
+            (rows[1].provider.as_str(), rows[1].outcome.as_str(), rows[1].step),
+            ("b", "ok", 1),
+            "{rows:?}"
+        );
+        assert!(rows.iter().all(|r| r.kind == "media" && r.requested == "auto"), "{rows:?}");
+        assert!(rows.iter().all(|r| r.ms > 0), "a media leg is timed: {rows:?}");
     }
 
     #[tokio::test]

@@ -71,7 +71,7 @@ pub(crate) async fn run_search(
     // punished: another provider may still find something, and if none does
     // the query legitimately has no results.
     let mut empty_from: Option<String> = None;
-    for p in &app.cfg.search.providers {
+    for (step, p) in app.cfg.search.providers.iter().enumerate() {
         if only.is_some_and(|o| o != p.name) {
             continue;
         }
@@ -79,7 +79,20 @@ pub(crate) async fn run_search(
         // Count the query up front: an upstream 200 consumed quota even if
         // we fail to read the body.
         super::record(app, &key);
-        match search_one(app, p, query, n).await {
+        let started = std::time::Instant::now();
+        let attempt = search_one(app, p, query, n).await;
+        super::record_attempt(
+            app,
+            "media",
+            &p.name,
+            "search",
+            only.unwrap_or("auto"),
+            step,
+            started,
+            0,
+            &attempt.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        );
+        match attempt {
             Ok(results) => {
                 app.state.clear_cooldown(&key, "");
                 if results.is_empty() {
@@ -223,13 +236,26 @@ pub(crate) async fn run_fetch(
     only: Option<&str>,
 ) -> Result<(String, String), String> {
     let mut errors: Vec<String> = Vec::new();
-    for p in &app.cfg.fetch.providers {
+    for (step, p) in app.cfg.fetch.providers.iter().enumerate() {
         if only.is_some_and(|o| o != p.name) {
             continue;
         }
         let Some(key) = service_ready(app, "fetch", p) else { continue };
         super::record(app, &key);
-        match fetch_one(app, p, url).await {
+        let started = std::time::Instant::now();
+        let attempt = fetch_one(app, p, url).await;
+        super::record_attempt(
+            app,
+            "media",
+            &p.name,
+            "fetch",
+            only.unwrap_or("auto"),
+            step,
+            started,
+            0,
+            &attempt.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        );
+        match attempt {
             Ok(content) => {
                 app.state.clear_cooldown(&key, "");
                 return Ok((p.name.clone(), content));

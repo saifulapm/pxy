@@ -468,9 +468,16 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
     for (k, v) in &headers {
         req = req.header(k, v);
     }
+    let started = std::time::Instant::now();
+    let leg = |status: u16, error: &str| {
+        crate::media::record_attempt(
+            &app, "embed", &prov_name, &model_id, &requested, 0, started, status, error,
+        );
+    };
     let resp = match req.json(&payload).send().await {
         Ok(r) => r,
         Err(e) => {
+            leg(0, &format!("network: {e}"));
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": {"message": format!("network: {e}"), "type": "api_error"}})),
@@ -486,6 +493,7 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
     let body: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
+            leg(0, &format!("bad upstream json: {e}"));
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": {"message": format!("bad upstream json: {e}"), "type": "api_error"}})),
@@ -493,6 +501,7 @@ async fn embeddings(State(app): State<SharedApp>, Json(mut payload): Json<Value>
                 .into_response();
         }
     };
+    leg(status.as_u16(), "");
 
     if status.is_success() {
         let tokens = body["usage"]["prompt_tokens"]
@@ -1094,6 +1103,10 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         root.insert("cooldowns".into(), Value::Array(cooldowns));
         root.insert("providers".into(), Value::Object(json_providers));
         root.insert("modelUsage".into(), Value::Array(model_usage));
+        // The per-leg view of the same traffic: what answered, how fast, and
+        // what failed, over the last day (wiki:state).
+        let day_ago = now.as_millisecond() - 86_400_000;
+        root.insert("stats".into(), crate::stats::summary_json(&state, day_ago));
         if remote {
             root.insert("remote".into(), Value::Object(json_remote));
         }
