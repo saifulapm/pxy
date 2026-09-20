@@ -16,6 +16,7 @@ use crate::config::{Config, ErrorAction, ServerToolsConfig, WireFormat};
 use crate::media::pdf;
 use crate::secrets::Secrets;
 use crate::state::State;
+use crate::stats::human_tokens;
 use crate::translate::server_tools;
 use crate::translate::sse::{SseEvent, SseParser};
 use crate::translate::tool_search;
@@ -689,6 +690,11 @@ async fn handle_chat_inner(
     if is_usage_magic(&payload) {
         return usage_outcome(usage_report(&app), client_format, stream);
     }
+    // ...and "@@stats", optionally with a window ("@@stats 7d"), with the
+    // report `pxy stats` prints.
+    if let Some(window) = stats_magic(&payload) {
+        return usage_outcome(stats_report(&app, &window), client_format, stream);
+    }
 
     // Session affinity key (group walks only): keeps a conversation on its
     // last winning candidate for prompt-cache locality.
@@ -1003,33 +1009,57 @@ async fn handle_chat_inner(
 /// True when the LAST user message is exactly the magic token. Works from
 /// inside any agent: type "@@usage" (or "@@pxy-usage"), get the report.
 fn is_usage_magic(payload: &Value) -> bool {
-    // The magic message must be the FINAL message: an assistant-final
-    // continuation whose previous user turn was "@@usage" is a real
-    // request, not a report query.
-    let Some(last) = payload["messages"]
-        .as_array()
-        .and_then(|m| m.last())
-        .filter(|m| m["role"] == "user")
-    else {
-        return false;
-    };
-    let text = match &last["content"] {
-        Value::String(s) => s.trim(),
-        Value::Array(parts) if parts.len() == 1 => {
-            parts[0]["text"].as_str().unwrap_or("").trim()
-        }
-        _ => return false,
-    };
+    let Some(text) = last_user_text(payload) else { return false };
     text == "@@usage" || text == "@@pxy-usage"
 }
 
-fn human_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.0}k", n as f64 / 1e3)
-    } else {
-        n.to_string()
+/// The text of the FINAL user message, when there is one. It has to be the
+/// last: an assistant-final continuation whose previous user turn was "@@usage"
+/// is a real request, not a report query.
+fn last_user_text(payload: &Value) -> Option<String> {
+    let last = payload["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .filter(|m| m["role"] == "user")?;
+    let text = match &last["content"] {
+        Value::String(s) => s.trim(),
+        Value::Array(parts) if parts.len() == 1 => parts[0]["text"].as_str().unwrap_or("").trim(),
+        _ => return None,
+    };
+    Some(text.to_string())
+}
+
+/// The window a final user message of "@@stats" asks about — "@@stats 7d",
+/// or the command's own default when it names none.
+fn stats_magic(payload: &Value) -> Option<String> {
+    let text = last_user_text(payload)?;
+    let rest = text
+        .strip_prefix("@@stats")
+        .or_else(|| text.strip_prefix("@@pxy-stats"))?
+        .trim()
+        .to_string();
+    Some(if rest.is_empty() { "24h".to_string() } else { rest })
+}
+
+/// The `pxy stats` report, rendered for an agent to read in-band.
+fn stats_report(app: &App, window: &str) -> String {
+    let report = crate::stats::parse_since(window, jiff::Zoned::now()).and_then(|since_ms| {
+        crate::stats::report(
+            &app.state,
+            &crate::stats::Filter {
+                since_ms,
+                by: None,
+                provider: None,
+                agent: None,
+                model: None,
+                errors: false,
+            },
+            window,
+        )
+    });
+    match report {
+        Ok(text) => text,
+        Err(e) => format!("pxy stats: {e:#}"),
     }
 }
 
@@ -3031,10 +3061,13 @@ async fn serve_calls(
         let Some(tool) = server_tools::Tool::from_function_name(&call.name) else {
             continue;
         };
+        let started = std::time::Instant::now();
         let args = match serde_json::from_str::<Value>(&call.args) {
             Ok(args) => args,
             Err(e) => {
-                let (output, render) = error(format!("arguments are not valid JSON: {e}"));
+                let message = format!("arguments are not valid JSON: {e}");
+                record_tool_run(app, tool, &loop_.agent, started, Err(&message), None);
+                let (output, render) = error(message);
                 record(call, output, render);
                 continue;
             }
@@ -3050,10 +3083,13 @@ async fn serve_calls(
         ctx.transcript = loop_.body["messages"].as_array().cloned().unwrap_or_default();
         match tool.execute(&ctx, &args).await {
             Ok(ran) => {
-                batch_hits += ran.client.marker["hits"].as_u64().unwrap_or(0);
+                let hits = ran.client.marker["hits"].as_u64();
+                record_tool_run(app, tool, &loop_.agent, started, Ok(()), hits);
+                batch_hits += hits.unwrap_or(0);
                 record(call, ran.model_output, ran.client)
             }
             Err(e) => {
+                record_tool_run(app, tool, &loop_.agent, started, Err(&e), None);
                 let (output, render) = error(e);
                 record(call, output, render);
             }
@@ -3069,6 +3105,30 @@ async fn serve_calls(
         record(call, output, render);
     }
     (!tool_calls.is_empty()).then_some(Served { tool_calls, tool_results, renders })
+}
+
+/// Record one served call for `pxy stats`. A call that could not be served at
+/// all — unusable arguments, a missing executor — is a failure; a tool that
+/// ran and reported its own failure inside the answer it gave the model reads
+/// here as a call that happened, which is what the leg's own row says too.
+fn record_tool_run(
+    app: &App,
+    tool: server_tools::Tool,
+    agent: &str,
+    started: std::time::Instant,
+    result: Result<(), &str>,
+    hits: Option<u64>,
+) {
+    app.state.record_tool_run(&crate::state::ToolRunRow {
+        ts: Timestamp::now().as_millisecond(),
+        day: jiff::Zoned::now().date().to_string(),
+        agent: agent_label(agent).to_string(),
+        tool: tool.name().to_string(),
+        ok: result.is_ok(),
+        ms: (started.elapsed().as_millis() as i64).max(1),
+        error: result.err().map(|e| truncate(e, 200)).unwrap_or_default(),
+        detail: hits.map(|h| format!("{h} hits")).unwrap_or_default(),
+    });
 }
 
 /// Take every reserved function out of a replay body once the budget is
@@ -3841,6 +3901,10 @@ impl StreamCtx {
             strip_reserved_functions(&mut search.body);
         }
         let counts = search.server_tool_use();
+        // The leg about to be closed is the one that asked for these calls.
+        if let Some(leg) = self.leg.as_mut() {
+            leg.row.tool_calls = served.tool_calls.len() as i64;
+        }
 
         // Same rule as the first call: the total timeout must not span the
         // body, or the answer after a tool call dies at timeout_secs with a
@@ -5997,6 +6061,88 @@ mod tests {
         assert_eq!((ok.depth, ok.stream), (0, true), "{ok:?}");
         assert_eq!((ok.input, ok.output, ok.cache_read), (1200, 30, 1000), "{ok:?}");
         assert!(ok.ms > 0 && ok.ttfb_ms > 0, "a leg is timed: {ok:?}");
+    }
+
+    /// Each served call is its own row, and the leg that closed on them says
+    /// how many it closed on.
+    #[tokio::test]
+    async fn served_calls_are_recorded_with_their_tool_and_time() {
+        let first = calls_sse(&[
+            ("call_1", "pxy_datetime", "{}"),
+            ("call_2", "pxy_datetime", "not json"),
+        ]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, _) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "stats_tool_runs",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what time is it?"}],
+            "tools": [{"type": "pxy:datetime"}],
+        });
+        let ctx = ClientContext { agent: Some("codex".into()), ..ClientContext::default() };
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+
+        let runs = app.state.tool_runs_since(0).unwrap();
+        assert_eq!(runs.len(), 2, "one row per served call: {runs:?}");
+        assert!(runs.iter().all(|r| r.tool == "datetime" && r.agent == "codex"), "{runs:?}");
+        assert!(runs[0].ok && runs[0].error.is_empty(), "the answerable call ran: {runs:?}");
+        assert!(!runs[1].ok && !runs[1].error.is_empty(), "unusable arguments are a failure: {runs:?}");
+        assert!(runs.iter().all(|r| r.ms > 0), "a run is timed: {runs:?}");
+
+        let rows = app.state.attempts_since(0).unwrap();
+        assert_eq!(rows[0].tool_calls, 2, "the leg says what it closed on: {rows:?}");
+        assert_eq!(rows[1].tool_calls, 0, "...and the continuation closed on none: {rows:?}");
+    }
+
+    /// `@@stats` answers from the rows, locally, without touching a provider.
+    #[tokio::test]
+    async fn stats_magic_answers_locally() {
+        let app = test_app(
+            r#"
+            [server]
+            [providers.p]
+            base_url = "http://127.0.0.1:1/never"
+            models = ["m"]
+            "#,
+            "stats_magic",
+        );
+        app.state.record_attempt(&crate::state::AttemptRow {
+            ts: Timestamp::now().as_millisecond(),
+            day: "2026-09-20".into(),
+            kind: "chat".into(),
+            agent: "claude".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            outcome: "ok".into(),
+            ms: 500,
+            input: 1234,
+            output: 7,
+            ..crate::state::AttemptRow::default()
+        });
+        let payload = json!({
+            "model": "p/m",
+            "messages": [{"role": "user", "content": "@@stats"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Json { status, body, .. } = out else { panic!("expected json") };
+        assert_eq!(status, 200);
+        let text = body["choices"][0]["message"]["content"].as_str().unwrap_or_default();
+        assert!(text.contains("pxy stats"), "{text}");
+        assert!(text.contains("p/m"), "the model table is in there: {text}");
     }
 
     /// A served-tool continuation is a second upstream call, so it is a second
