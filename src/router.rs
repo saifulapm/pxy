@@ -1463,7 +1463,11 @@ async fn try_candidate(
             AttemptResult::Done(_) => leg.finish("ok", 200, ""),
             AttemptResult::Refused(_) => leg.finish("refused", 200, ""),
             AttemptResult::Skip(reason) => leg.finish(skip_outcome(reason), 0, reason),
-            AttemptResult::SkipRaw { reason, status, .. } => leg.finish("http", *status, reason),
+            // The upstream's own message, not the JSON it came wrapped in:
+            // this text is read in a table, where a raw body is unreadable.
+            AttemptResult::SkipRaw { status, body, .. } => {
+                leg.finish("http", *status, &error_summary(body))
+            }
             // The real tokenizer overruled our estimate: a 400 that says the
             // request, not the model, is the problem.
             AttemptResult::SkipContextWindow(reason) => leg.finish("context", 400, reason),

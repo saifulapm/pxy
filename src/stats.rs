@@ -119,7 +119,11 @@ impl Agg {
             return;
         }
         self.latencies.push(r.ms);
-        self.gen_ms += (r.ms - r.ttfb_ms).max(0);
+        // Time spent generating: for a stream that is everything after the
+        // first byte, but a non-streamed leg returns its headers and its
+        // whole answer together, so subtracting the wait there leaves a
+        // millisecond or two and a throughput in the thousands.
+        self.gen_ms += if r.stream { (r.ms - r.ttfb_ms).max(0) } else { r.ms };
         self.gen_output += r.output;
     }
 
@@ -490,6 +494,8 @@ pub fn summary_json(state: &State, filter: &Filter) -> Value {
 mod tests {
     use super::*;
 
+    /// Streamed by default: that is the shape almost every agent turn takes,
+    /// and the throughput maths differs for the other one.
     fn row(model: &str, outcome: &str, ms: i64, output: u64) -> AttemptRow {
         AttemptRow {
             ts: 1_700_000_000_000,
@@ -500,6 +506,7 @@ mod tests {
             provider: "p".into(),
             model: model.into(),
             outcome: outcome.into(),
+            stream: true,
             ms,
             ttfb_ms: 100,
             input: 1000,
@@ -551,6 +558,17 @@ mod tests {
         // A truncated turn did answer, so it is not an error.
         a.add(&row("m", "truncated", 300, 5));
         assert_eq!(a.errors, 1);
+
+        // A non-streamed leg hands over its headers and its whole answer at
+        // once, so all of its time is generation time: 20 tokens in 2s is 10
+        // a second, not the thousands that subtracting the wait would give.
+        let mut plain = Agg::default();
+        plain.add(&AttemptRow {
+            stream: false,
+            ttfb_ms: 1990,
+            ..row("m", "ok", 2000, 20)
+        });
+        assert_eq!(plain.tokens_per_second(), Some(10.0));
     }
 
     /// `--json` narrows by the same filter the tables do — the desktop panels
