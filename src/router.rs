@@ -2662,6 +2662,11 @@ struct StreamCtx {
     /// Same-delta counter: a model stuck emitting one chunk forever is cut
     /// off before it spends the whole window.
     repeat: RepeatGuard,
+    /// The turn has produced an answer — text or a tool call, never
+    /// reasoning alone. A committed stream is recorded as a success the
+    /// moment it commits, which reasoning is enough to do; this is how
+    /// `finish()` tells a short answer from a turn that produced nothing.
+    produced_output: bool,
 }
 
 /// litellm's rule (streaming_handler.raise_on_model_repetition, default 100):
@@ -3531,6 +3536,16 @@ impl StreamCtx {
         let events = self.parser.feed(bytes);
         let anthropic_upstream =
             matches!(self.kind, StreamKind::AnthropicPass | StreamKind::ToOpenai(_));
+        // Before the repeat guard, which can end the turn through finish().
+        // A Responses upstream is already chat chunks by the time it gets
+        // here (`responses_upstream::chat_stream` wraps it at the wire).
+        let upstream_format =
+            if anthropic_upstream { WireFormat::Anthropic } else { WireFormat::Openai };
+        if !self.produced_output
+            && events.iter().any(|e| stream_event_output(&e.data, upstream_format))
+        {
+            self.produced_output = true;
+        }
         // A looping model is ended like a stalled one: the turn the client
         // has so far is terminated cleanly, and the model sits out a while
         // so the next request does not pay to rediscover it.
@@ -3888,9 +3903,18 @@ impl StreamCtx {
                     warn!(
                         provider = %self.provider,
                         model = %self.model,
+                        produced_output = self.produced_output,
                         output_tokens = self.usage.output,
                         "upstream stream ended with no finish reason; closing the turn as stop"
                     );
+                    // A turn that produced nothing is a failed attempt, not
+                    // the success its commit recorded, so a leg that keeps
+                    // dying this way trips `model_unhealthy`. No cooldown:
+                    // at the measured rate that would bench a leg working
+                    // nineteen times in twenty.
+                    if !self.produced_output {
+                        self.app.state.model_result(&self.state_provider, &self.model, false);
+                    }
                     s.push_str(openai_terminator());
                     self.client_done = true;
                 }
@@ -3952,16 +3976,48 @@ fn stream_event_commits(data: &str, upstream: WireFormat) -> bool {
         }
         WireFormat::Openai | WireFormat::Responses => {
             let choice = &v["choices"][0];
-            let carries = |v: &Value| match v {
-                Value::Null => false,
-                Value::String(s) => !s.is_empty(),
-                Value::Array(a) => !a.is_empty(),
-                _ => true,
-            };
             !choice["finish_reason"].is_null()
                 || ["content", "reasoning_content", "reasoning", "tool_calls"]
                     .iter()
-                    .any(|k| carries(&choice["delta"][*k]))
+                    .any(|k| delta_carries(&choice["delta"][*k]))
+        }
+    }
+}
+
+/// A delta field with something in it. Absent, empty string and empty array
+/// all announce a field without filling it.
+fn delta_carries(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => true,
+    }
+}
+
+/// True when this event carries the turn's ANSWER: text, or a tool call.
+///
+/// The narrow half of `stream_event_commits`. Reasoning commits a stream —
+/// the client must see it live — but it is not an answer, so a turn that
+/// thought and then died produced nothing usable and cannot stand as the
+/// success its commit recorded. A terminal reason is not an answer either:
+/// it closes a turn rather than filling it.
+fn stream_event_output(data: &str, upstream: WireFormat) -> bool {
+    let trimmed = data.trim();
+    if trimmed == "[DONE]" {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(trimmed) else { return false };
+    match upstream {
+        // `content_block_delta` also carries thinking and its signature, so
+        // the delta's own type is what separates an answer from a thought.
+        WireFormat::Anthropic => {
+            v["type"] == "content_block_delta"
+                && matches!(v["delta"]["type"].as_str(), Some("text_delta" | "input_json_delta"))
+        }
+        WireFormat::Openai | WireFormat::Responses => {
+            let delta = &v["choices"][0]["delta"];
+            ["content", "tool_calls"].iter().any(|k| delta_carries(&delta[*k]))
         }
     }
 }
@@ -4093,6 +4149,7 @@ async fn stream_outcome(
         client_done: false,
         terminated: false,
         repeat: RepeatGuard::default(),
+        produced_output: false,
     };
 
     // Pre-commit read: hold processed client bytes until the upstream yields
@@ -6531,7 +6588,8 @@ mod tests {
 
         let payload = json!({"model": "p/m", "stream": true,
             "messages": [{"role": "user", "content": "hi"}]});
-        let out = handle_chat(app, ClientFormat::Openai, payload, ClientContext::default()).await;
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
         match out {
             Outcome::Stream { body, .. } => {
                 let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
@@ -6542,6 +6600,82 @@ mod tests {
             }
             Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
         }
+        // A death AFTER real output stays the success the commit recorded:
+        // the client got an answer, short or not, and judging it is its call.
+        // Three failures beside that one attempt is four, one short of the
+        // rule's minimum — had the death counted, five would trip it.
+        for _ in 0..3 {
+            app.state.model_result("p", "m", false);
+        }
+        assert!(!app.state.model_unhealthy("p", "m"), "a death after output is not a failed attempt");
+    }
+
+    /// A turn that only ever thought: the upstream streams reasoning and then
+    /// EOFs, before any answer and before a finish reason. pxy still closes
+    /// the turn, because a Chat Completions client reads a missing reason as
+    /// a protocol error — but the attempt produced nothing the client can
+    /// use, so it must not stand as the success the commit recorded.
+    /// Measured on opencode-go/muse-spark-1.3-contributor, 2 turns in 45.
+    #[tokio::test]
+    async fn reasoning_only_truncation_counts_as_a_failure() {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/think",
+            post(|| async {
+                let stream = futures_util::stream::unfold(0u8, |n| async move {
+                    match n {
+                        0 => Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from(
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"weighing it up\"}}]}\n\n",
+                            )),
+                            1,
+                        )),
+                        // Let the reasoning commit the stream before the body
+                        // ends: the commit is what makes this case invisible.
+                        _ => {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            None
+                        }
+                    }
+                });
+                axum::http::Response::builder()
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/think"
+                models = ["m"]
+                "#
+            ),
+            "reasoning_only_truncation",
+        );
+
+        let payload = json!({"model": "p/m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        match out {
+            Outcome::Stream { body, .. } => {
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("weighing it up"), "the reasoning must still reach the client: {text}");
+                assert!(text.contains("\"finish_reason\":\"stop\""), "pxy must close the turn: {text}");
+            }
+            Outcome::Json { status, body, .. } => panic!("expected stream, got {status}: {body}"),
+        }
+        // The commit recorded one attempt and the empty death records a
+        // failure beside it. Three more failures make five attempts, four of
+        // them failed; counted as a success it would be four and stay quiet.
+        for _ in 0..3 {
+            app.state.model_result("p", "m", false);
+        }
+        assert!(app.state.model_unhealthy("p", "m"), "an output-free truncation is a failed attempt");
     }
 
     /// The same hole with a `[DONE]` and no `finish_reason` before it: some
