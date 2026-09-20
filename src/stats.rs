@@ -331,10 +331,13 @@ fn errors_section(rows: &[AttemptRow], now_ms: i64) -> String {
     let mut map: std::collections::HashMap<String, (u64, i64, String)> =
         std::collections::HashMap::new();
     for r in rows.iter().filter(|r| is_error(r)) {
-        let reason = if r.status > 0 {
-            format!("{} {}", r.status, first_line(&r.error))
-        } else {
-            format!("{}: {}", r.outcome, first_line(&r.error))
+        let text = first_line(&r.error);
+        // Upstream reasons often open with the status themselves; saying it
+        // twice reads as a typo.
+        let reason = match r.status {
+            0 => format!("{}: {text}", r.outcome),
+            s if text.starts_with(&s.to_string()) => text,
+            s => format!("{s} {text}"),
         };
         let e = map.entry(reason).or_insert((0, 0, String::new()));
         e.0 += 1;
