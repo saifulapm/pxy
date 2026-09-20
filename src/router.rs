@@ -785,7 +785,7 @@ async fn handle_chat_inner(
         skipped.clear();
         refusals = 0;
         let mut saw_rpm_limit = false;
-        for cand in &candidates {
+        for (step, cand) in candidates.iter().enumerate() {
             if fallback_only_quota && cand.model.free != Some(true) && !quota_only {
                 skipped.push(format!(
                     "{}: paid reserve held (prior failure was not quota exhaustion)",
@@ -820,8 +820,19 @@ async fn handle_chat_inner(
                 continue;
             }
 
-            match try_candidate(&app, cand, client_format, &payload, stream, input_estimate, &ctx, multi)
-                .await
+            match try_candidate(
+                &app,
+                cand,
+                client_format,
+                &payload,
+                stream,
+                input_estimate,
+                &ctx,
+                multi,
+                &requested,
+                step,
+            )
+            .await
             {
                 AttemptResult::Done(mut outcome) => {
                     // A real success repairs the model's failure-rate record.
@@ -1394,6 +1405,7 @@ enum AttemptResult {
 
 /// Wrapper owning this attempt's capture transaction: artifacts share one id
 /// and, under `on_error`, are written only when the attempt fails.
+#[allow(clippy::too_many_arguments)]
 async fn try_candidate(
     app: &SharedApp,
     cand: &Candidate,
@@ -1403,22 +1415,47 @@ async fn try_candidate(
     input_estimate: u64,
     ctx: &ClientContext,
     multi: bool,
+    requested: &str,
+    step: usize,
 ) -> AttemptResult {
     let mut cap = crate::capture::Txn::new(&app.cfg);
+    // The leg's stats row travels with the attempt. A committed stream takes
+    // it out of the slot (its outcome is only known when the stream ends);
+    // everything else is closed right here, by what the attempt returned.
+    let mut leg = Some(Leg::begin(app, cand, ctx, requested, step, stream));
     let result = try_candidate_inner(
-        app, &mut cap, cand, client_format, payload, stream, input_estimate, ctx, multi,
+        app, &mut cap, &mut leg, cand, client_format, payload, stream, input_estimate, ctx, multi,
     )
     .await;
     cap.finish(matches!(result, AttemptResult::Done(_)));
+    if let Some(mut leg) = leg {
+        match &result {
+            AttemptResult::Done(_) => leg.finish("ok", 200, ""),
+            AttemptResult::Refused(_) => leg.finish("refused", 200, ""),
+            AttemptResult::Skip(reason) => leg.finish(skip_outcome(reason), 0, reason),
+            AttemptResult::SkipRaw { reason, status, .. } => leg.finish("http", *status, reason),
+            // The real tokenizer overruled our estimate: a 400 that says the
+            // request, not the model, is the problem.
+            AttemptResult::SkipContextWindow(reason) => leg.finish("context", 400, reason),
+            AttemptResult::Fatal(outcome) => {
+                let status = match outcome {
+                    Outcome::Json { status, .. } => *status,
+                    Outcome::Stream { .. } => 200,
+                };
+                leg.finish("http", status, "");
+            }
+        }
+    }
     result
 }
 
-// The 9th argument is this attempt's capture transaction; threading a context
+// The 10th argument is this attempt's capture transaction; threading a context
 // struct through this ~600-line function would be churn for a lint.
 #[allow(clippy::too_many_arguments)]
 async fn try_candidate_inner(
     app: &SharedApp,
     cap: &mut crate::capture::Txn,
+    leg: &mut Option<Leg>,
     cand: &Candidate,
     client_format: ClientFormat,
     payload: &Value,
@@ -1817,6 +1854,14 @@ async fn try_candidate_inner(
     };
 
     let status = resp.status().as_u16();
+    // A leg the stream machinery takes over stamps its first byte there, which
+    // is when the model actually began answering; for every other leg the
+    // response headers are as close as this gets.
+    if let Some(leg) = leg.as_mut()
+        && (status >= 400 || !(stream || search.is_some()))
+    {
+        leg.stamp_ttfb();
+    }
     // Captured before the body is consumed; relayed on success, on a raw error
     // passthrough, and on the terminal error of an exhausted single-candidate
     // walk — `retry-after` and the rate-limit families are what the client's
@@ -1853,6 +1898,7 @@ async fn try_candidate_inner(
         match stream_outcome(
             app.clone(),
             agent,
+            leg,
             cand,
             client_format,
             upstream_format,
@@ -2006,6 +2052,9 @@ async fn try_candidate_inner(
             WireFormat::Anthropic => TokenUsage::from_anthropic(&upstream_body["usage"]),
         };
         record_tokens(app, agent, &cand.state_provider(), &cand.provider, &cand.model.id, usage);
+        if let Some(leg) = leg.as_mut() {
+            leg.set_usage(usage);
+        }
         let client_body = match (client_format, upstream_format) {
             (ClientFormat::Openai, WireFormat::Openai) => {
                 let mut b = upstream_body;
@@ -2650,6 +2699,10 @@ struct StreamCtx {
     /// extracts text-embedded tool calls (free models emit them as prose).
     tooltext: Option<ToolTextFilter>,
     usage: TokenUsage,
+    /// This leg's stats row, once the stream has committed to the client.
+    /// Before that the caller still owns it, so a stream that dies before its
+    /// first event is closed by the failover path instead.
+    leg: Option<Leg>,
     agent: String,
     /// Bare provider name: logs and model_usage.
     provider: String,
@@ -3550,6 +3603,12 @@ impl Drop for StreamCtx {
             return; // finish() ran and already recorded
         }
         record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, self.usage);
+        // The leg's own Drop would write it as a disconnect anyway; doing it
+        // here carries the usage the tap did see.
+        if let Some(leg) = self.leg.as_mut() {
+            leg.set_usage(self.usage);
+            leg.finish("disconnect", 0, "");
+        }
     }
 }
 
@@ -3594,13 +3653,7 @@ impl StreamCtx {
                     if ev.data.contains("\"usage\"") {
                         if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
                             if v["usage"].is_object() {
-                                let u = TokenUsage::from_openai(&v["usage"]);
-                                if u.input > 0 {
-                                    usage.input = u.input;
-                                }
-                                if u.output > 0 {
-                                    usage.output = u.output;
-                                }
+                                usage.merge(TokenUsage::from_openai(&v["usage"]));
                             }
                         }
                     }
@@ -3843,6 +3896,10 @@ impl StreamCtx {
                 // Bank what the first call spent before the second overwrites it.
                 let spent = state.take_usage();
                 record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, spent);
+                if let Some(leg) = self.leg.as_mut() {
+                    leg.set_usage(spent);
+                    leg.next("ok", 200, "");
+                }
                 // The call that asked for the search finished with `tool_calls`;
                 // the turn hasn't, and the continuation sets its own reason.
                 state.clear_finish_reason();
@@ -3865,6 +3922,10 @@ impl StreamCtx {
             _ => {
                 let spent = std::mem::take(&mut self.usage);
                 record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, spent);
+                if let Some(leg) = self.leg.as_mut() {
+                    leg.set_usage(spent);
+                    leg.next("ok", 200, "");
+                }
                 if self.responses_client {
                     // An error result pxy wrote itself has no marker.
                     for (name, render) in served.renders.iter().filter(|(_, r)| !r.marker.is_null()) {
@@ -3955,12 +4016,20 @@ impl StreamCtx {
         };
         self.parser = SseParser::new();
         record_request(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model);
+        // The attempt that died is its own leg, and it died with no answer.
+        if let Some(leg) = self.leg.as_mut() {
+            leg.set_usage(self.usage);
+            leg.next("dead", 0, "stream died with no answer; sent again");
+        }
         // The client stream stays open; the next read comes off the new
         // upstream. Nothing to hand it right now.
         Some(Bytes::new())
     }
 
     fn finish(&mut self) -> Bytes {
+        // Read before the arms below synthesize a terminator of their own:
+        // this says whether the UPSTREAM ended the turn.
+        let upstream_closed = self.client_done;
         let out = match &mut self.kind {
             StreamKind::ToAnthropic(state) => {
                 let mut s = String::new();
@@ -4014,6 +4083,17 @@ impl StreamCtx {
             StreamKind::AnthropicPass => Bytes::new(),
         };
         record_tokens(&self.app, &self.agent, &self.state_provider, &self.provider, &self.model, self.usage);
+        if let Some(leg) = self.leg.as_mut() {
+            leg.set_usage(self.usage);
+            // A turn the upstream never terminated is not the clean stop the
+            // client was handed: say which of the two it was.
+            let outcome = match (upstream_closed, self.produced_output) {
+                (true, _) => "ok",
+                (false, true) => "truncated",
+                (false, false) => "dead",
+            };
+            leg.finish(outcome, 200, "");
+        }
         out
     }
 }
@@ -4178,6 +4258,7 @@ const HEADERS_COOLDOWN: Duration = Duration::from_secs(60);
 async fn stream_outcome(
     app: SharedApp,
     agent: &str,
+    leg: &mut Option<Leg>,
     cand: &Candidate,
     client_format: ClientFormat,
     upstream_format: WireFormat,
@@ -4224,6 +4305,7 @@ async fn stream_outcome(
         think: parse_think.then(ThinkFilter::new),
         tooltext: tool_names.map(ToolTextFilter::new),
         usage: TokenUsage::default(),
+        leg: None,
         agent: agent.to_string(),
         provider: cand.provider.clone(),
         state_provider: cand.state_provider(),
@@ -4263,6 +4345,12 @@ async fn stream_outcome(
         };
         match next {
             Some(Ok(bytes)) => {
+                // The upstream has begun answering. The leg is still the
+                // caller's here, so a stream that dies before it commits is
+                // closed by whatever the caller makes of the failure.
+                if let Some(leg) = leg.as_mut() {
+                    leg.stamp_ttfb();
+                }
                 let events = sniff.feed(&bytes);
                 let out = ctx.process(&bytes);
                 if !out.is_empty() {
@@ -4287,6 +4375,19 @@ async fn stream_outcome(
         }
     }
     info!(candidate = %cand.full_id(), stream = true, "routed");
+    // Committed: from here the leg's outcome is only known when the stream
+    // ends, so it moves into the stream's own state.
+    ctx.leg = leg.take();
+    // ...unless the committing event was the refusal itself, which ends the
+    // turn. Closing the leg now is what makes it read as a refusal whether the
+    // caller hands this stream to the client or walks on and drops it.
+    if refused {
+        let usage = ctx.usage;
+        if let Some(leg) = ctx.leg.as_mut() {
+            leg.set_usage(usage);
+            leg.finish("refused", 200, "");
+        }
+    }
 
     let head = futures_util::stream::iter(held.into_iter().map(Ok::<Bytes, std::io::Error>));
     let rest = futures_util::stream::unfold(ctx, |mut ctx| async move {
@@ -4305,6 +4406,11 @@ async fn stream_outcome(
                 Some((Ok(tail), ctx))
             }
             Ok(Some(Ok(bytes))) => {
+                // No-op except on the first bytes of a continuation or a
+                // re-send, whose own leg has not been stamped yet.
+                if let Some(leg) = ctx.leg.as_mut() {
+                    leg.stamp_ttfb();
+                }
                 let out = ctx.process(&bytes);
                 Some((Ok::<Bytes, std::io::Error>(out), ctx))
             }
@@ -4403,6 +4509,130 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// One upstream leg's stats row in the making (wiki:state). A leg is born
+/// where its request is counted and written where its tokens are banked —
+/// `record_request` and `record_tokens` — so a server-tool continuation and a
+/// re-send of a dead stream are each their own row, exactly as they are their
+/// own upstream call. Nothing reads these rows but `pxy stats`.
+///
+/// Dropped unwritten means the client walked away mid-turn, which is a real
+/// outcome and is recorded as one.
+struct Leg {
+    app: SharedApp,
+    row: crate::state::AttemptRow,
+    started: std::time::Instant,
+    written: bool,
+}
+
+impl Leg {
+    fn begin(
+        app: &SharedApp,
+        cand: &Candidate,
+        ctx: &ClientContext,
+        requested: &str,
+        step: usize,
+        stream: bool,
+    ) -> Self {
+        Self {
+            app: app.clone(),
+            row: crate::state::AttemptRow {
+                ts: Timestamp::now().as_millisecond(),
+                day: jiff::Zoned::now().date().to_string(),
+                kind: "chat".into(),
+                agent: agent_label(ctx.agent.as_deref().unwrap_or("")).to_string(),
+                requested: requested.to_string(),
+                provider: cand.provider.clone(),
+                account: cand.account.clone().unwrap_or_default(),
+                model: cand.model.id.clone(),
+                step: step as i64,
+                depth: ctx.tool_depth as i64,
+                stream,
+                ..crate::state::AttemptRow::default()
+            },
+            started: std::time::Instant::now(),
+            written: false,
+        }
+    }
+
+    /// Time to the upstream's first byte, stamped once per leg.
+    fn stamp_ttfb(&mut self) {
+        if self.row.ttfb_ms == 0 {
+            self.row.ttfb_ms = self.elapsed_ms().max(1);
+        }
+    }
+
+    fn set_usage(&mut self, usage: TokenUsage) {
+        self.row.input = usage.input;
+        self.row.output = usage.output;
+        self.row.cache_read = usage.cache_read;
+        self.row.cache_write = usage.cache_write;
+        self.row.reasoning = usage.reasoning;
+    }
+
+    fn elapsed_ms(&self) -> i64 {
+        self.started.elapsed().as_millis() as i64
+    }
+
+    /// Write the row. Idempotent: the first call wins, so the Drop net below
+    /// only fires for a leg nobody closed.
+    fn finish(&mut self, outcome: &str, status: u16, error: &str) {
+        if self.written {
+            return;
+        }
+        self.written = true;
+        // A leg that reached the wire took time, so the floor is 1ms: a zero
+        // in either timing column means "never measured", not "instant".
+        self.row.ms = self.elapsed_ms().max(1);
+        self.row.outcome = outcome.to_string();
+        self.row.status = status;
+        self.row.error = truncate(error, 200);
+        self.app.state.record_attempt(&self.row);
+    }
+
+    /// Close this leg and open the next one on the same candidate: a
+    /// continuation and a re-send are new upstream calls, counted as such.
+    fn next(&mut self, outcome: &str, status: u16, error: &str) {
+        self.finish(outcome, status, error);
+        self.started = std::time::Instant::now();
+        self.written = false;
+        self.row.ts = Timestamp::now().as_millisecond();
+        self.row.day = jiff::Zoned::now().date().to_string();
+        self.row.ms = 0;
+        self.row.ttfb_ms = 0;
+        self.row.status = 0;
+        self.row.error.clear();
+        self.row.outcome.clear();
+        self.row.tool_calls = 0;
+        self.set_usage(TokenUsage::default());
+    }
+}
+
+impl Drop for Leg {
+    fn drop(&mut self) {
+        self.finish("disconnect", 0, "");
+    }
+}
+
+/// How a failover reason reads as an outcome. Every one of these strings is
+/// built in this file, a few lines from where the attempt failed.
+fn skip_outcome(reason: &str) -> &'static str {
+    if reason.starts_with("network") {
+        "network"
+    } else if reason.starts_with("no response after") {
+        "timeout"
+    } else {
+        // stream died before its first event, an unreadable body, a 200 that
+        // was not JSON: the upstream answered with nothing usable.
+        "dead"
+    }
+}
+
+/// The agent a row bills to. Empty means a client that sent no `x-pxy-agent`
+/// and no launch-suffixed key, which `model_usage` already calls "other".
+fn agent_label(agent: &str) -> &str {
+    if agent.is_empty() { "other" } else { agent }
+}
+
 /// `state_provider` scopes the usage windows (per account for multi-account
 /// providers); `provider` stays the bare wire name for model_usage — the
 /// desktop panel and usage-scan consumers group by it.
@@ -4478,7 +4708,7 @@ fn record_usage_inner(
         }
     }
     if !model.is_empty() {
-        let agent = if agent.is_empty() { "other" } else { agent };
+        let agent = agent_label(agent);
         if let Err(e) =
             app.state.record_model_usage(agent, provider, model, request, usage.input, usage.output)
         {
@@ -5699,6 +5929,109 @@ mod tests {
             text.contains("\"server_tool_use\":{\"datetime_requests\":2}"),
             "the usage chunk must carry the counts: {text}"
         );
+    }
+
+    /// An answer that reports a cached prompt, so the breakdown is visible.
+    const CACHED_ANSWER_SSE: &str = concat!(
+        "data: {\"id\":\"c9\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":30,",
+        "\"prompt_tokens_details\":{\"cached_tokens\":1000}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// A walk that fell over onto its second candidate leaves one row per leg
+    /// that reached the wire: the 429 and the answer, in walk order, with the
+    /// token breakdown on the one that produced tokens.
+    #[tokio::test]
+    async fn every_leg_that_reached_the_wire_is_one_stats_row() {
+        let (base, _) = scripted_upstream(vec![
+            (429, "{\"error\":{\"message\":\"slow down\"}}"),
+            (200, CACHED_ANSWER_SSE),
+        ])
+        .await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/m"
+                models = ["m"]
+                [providers.b]
+                base_url = "{base}/m"
+                models = ["m"]
+                [groups.pair]
+                models = ["a/m", "b/m"]
+                "#
+            ),
+            "stats_legs",
+        );
+        let payload = json!({
+            "model": "pair",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let ctx = ClientContext { agent: Some("claude".into()), ..ClientContext::default() };
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ctx).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+
+        let rows = app.state.attempts_since(0).unwrap();
+        assert_eq!(rows.len(), 2, "one row per leg, in walk order: {rows:?}");
+        let failed = &rows[0];
+        assert_eq!(
+            (failed.provider.as_str(), failed.step, failed.outcome.as_str(), failed.status),
+            ("a", 0, "http", 429),
+            "{failed:?}"
+        );
+        assert!(!failed.error.is_empty(), "a failed leg says why: {failed:?}");
+        assert_eq!((failed.input, failed.output), (0, 0), "nothing was billed: {failed:?}");
+
+        let ok = &rows[1];
+        assert_eq!(
+            (ok.provider.as_str(), ok.model.as_str(), ok.step, ok.outcome.as_str()),
+            ("b", "m", 1, "ok"),
+            "{ok:?}"
+        );
+        assert_eq!((ok.kind.as_str(), ok.agent.as_str(), ok.requested.as_str()), ("chat", "claude", "pair"));
+        assert_eq!((ok.depth, ok.stream), (0, true), "{ok:?}");
+        assert_eq!((ok.input, ok.output, ok.cache_read), (1200, 30, 1000), "{ok:?}");
+        assert!(ok.ms > 0 && ok.ttfb_ms > 0, "a leg is timed: {ok:?}");
+    }
+
+    /// A served-tool continuation is a second upstream call, so it is a second
+    /// row — the same rule `record_request` already follows.
+    #[tokio::test]
+    async fn a_served_tool_continuation_is_its_own_row() {
+        let first = calls_sse(&[("call_1", "pxy_datetime", "{}")]);
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        let (base, _) = scripted_upstream(vec![(200, first), (200, ANSWER_SSE)]).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.p]
+                base_url = "{base}/m"
+                models = ["m"]
+                "#
+            ),
+            "stats_continuation",
+        );
+        let payload = json!({
+            "model": "p/m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "what time is it?"}],
+            "tools": [{"type": "pxy:datetime"}],
+        });
+        let out =
+            handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default()).await;
+        let Outcome::Stream { body, .. } = out else { panic!("expected a stream") };
+        let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+
+        let rows = app.state.attempts_since(0).unwrap();
+        assert_eq!(rows.len(), 2, "the call and the continuation are two legs: {rows:?}");
+        assert!(rows.iter().all(|r| r.outcome == "ok" && r.provider == "p"), "{rows:?}");
+        assert_eq!(rows[1].output, 1, "the continuation banks its own usage: {rows:?}");
     }
 
     fn test_app(cfg_toml: &str, name: &str) -> SharedApp {
