@@ -156,5 +156,29 @@ read becomes a single line saying why and the turn goes on. This one needs
 `poppler-utils` on the machine: pdftotext and pdftoppm are what does the
 reading.
 
+## Stats
+
+Every upstream call pxy makes writes a row: which model answered, under which
+group the client asked, how long it took to the first byte and to the end, what
+it billed in and out, how much of the input was a cache read, and how it ended.
+Served tool calls get their own rows. `pxy stats` reads them back:
+
+```sh
+pxy stats                          # the last 24 hours
+pxy stats --since 7d --by model    # one dimension, one week
+pxy stats --since month --errors   # what failed, how often, when it last bit
+pxy stats --provider zenmux --json
+```
+
+It reads the daemon's sqlite directly, so it answers with the daemon down, and
+`@@stats` as the last message of any agent turn prints the same report in-band
+for zero tokens — as `@@usage` does for the quota counters. `pxy status --json`
+carries the last day's numbers too.
+
+A failed call is counted but kept out of the latency figures: a 429 that came
+back in 20ms is not a fast answer. Rows age out after `[stats] retain_days`
+(90), and `[stats] enabled = false` stops the recording without hiding what is
+already there.
+
 The living spec is this project's mem wiki (`mem wiki` lists the pages). Design
 history is in the git log.
