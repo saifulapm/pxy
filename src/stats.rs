@@ -24,6 +24,18 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// A whole window, narrowed by nothing.
+    pub fn since(since_ms: i64) -> Self {
+        Self {
+            since_ms,
+            by: None,
+            provider: None,
+            agent: None,
+            model: None,
+            errors: false,
+        }
+    }
+
     fn keeps(&self, r: &AttemptRow) -> bool {
         if let Some(p) = &self.provider
             && &r.provider != p
@@ -326,8 +338,16 @@ fn tools_section(runs: &[ToolRunRow]) -> String {
     out
 }
 
-/// What failed, newest first: the reason, how often, and when it last bit.
-fn errors_section(rows: &[AttemptRow], now_ms: i64) -> String {
+/// One failure reason: how often, when it last bit, and on which candidate.
+struct ErrorGroup {
+    reason: String,
+    count: u64,
+    last_ts: i64,
+    last_candidate: String,
+}
+
+/// The window's failures folded by reason, most frequent first.
+fn error_groups(rows: &[AttemptRow]) -> Vec<ErrorGroup> {
     let mut map: std::collections::HashMap<String, (u64, i64, String)> =
         std::collections::HashMap::new();
     for r in rows.iter().filter(|r| is_error(r)) {
@@ -346,19 +366,34 @@ fn errors_section(rows: &[AttemptRow], now_ms: i64) -> String {
             e.2 = format!("{}/{}", r.provider, r.model);
         }
     }
-    if map.is_empty() {
+    let mut list: Vec<ErrorGroup> = map
+        .into_iter()
+        .map(|(reason, (count, last_ts, last_candidate))| ErrorGroup {
+            reason,
+            count,
+            last_ts,
+            last_candidate,
+        })
+        .collect();
+    list.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_ts.cmp(&a.last_ts)));
+    list
+}
+
+/// What failed, most frequent first: the reason, how often, and when it last
+/// bit.
+fn errors_section(rows: &[AttemptRow], now_ms: i64) -> String {
+    let list = error_groups(rows);
+    if list.is_empty() {
         return String::new();
     }
-    let mut list: Vec<(String, (u64, i64, String))> = map.into_iter().collect();
-    list.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(b.1.1.cmp(&a.1.1)));
     let mut out = format!("\n{:<44} {:>5}  {:<22} {}\n", "error", "n", "last candidate", "last seen");
-    for (reason, (n, ts, candidate)) in list.into_iter().take(15) {
+    for e in list.into_iter().take(15) {
         out.push_str(&format!(
             "{:<44} {:>5}  {:<22} {}\n",
-            truncate(&reason, 44),
-            n,
-            truncate(&candidate, 22),
-            ago(ts, now_ms)
+            truncate(&e.reason, 44),
+            e.count,
+            truncate(&e.last_candidate, 22),
+            ago(e.last_ts, now_ms)
         ));
     }
     out
@@ -376,10 +411,21 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// The same numbers as one JSON object, for `pxy stats --json` and for the
-/// `stats` key of `pxy status --json`.
-pub fn summary_json(state: &State, since_ms: i64) -> Value {
-    let rows = state.attempts_since(since_ms).unwrap_or_default();
-    let tools = state.tool_runs_since(since_ms).unwrap_or_default();
+/// `stats` key of `pxy status --json`. Narrowed by the same filter the text
+/// report uses, so a panel can ask for one agent's slice.
+pub fn summary_json(state: &State, filter: &Filter) -> Value {
+    let rows: Vec<AttemptRow> = state
+        .attempts_since(filter.since_ms)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| filter.keeps(r))
+        .collect();
+    let tools: Vec<ToolRunRow> = state
+        .tool_runs_since(filter.since_ms)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| filter.agent.as_ref().is_none_or(|a| &r.agent == a))
+        .collect();
     let mut total = Agg::default();
     for r in &rows {
         total.add(r);
@@ -414,7 +460,7 @@ pub fn summary_json(state: &State, since_ms: i64) -> Value {
         e.2 += r.ms;
     }
     json!({
-        "since": since_ms,
+        "since": filter.since_ms,
         "legs": total.legs,
         "errors": total.errors,
         "inputTokens": total.input,
@@ -428,6 +474,14 @@ pub fn summary_json(state: &State, since_ms: i64) -> Value {
         "requested": dimension(group_by(&rows, |r| r.requested.clone())),
         "tools": tool_map.into_iter().map(|(tool, (calls, errors, ms))| json!({
             "name": tool, "calls": calls, "errors": errors, "totalMs": ms,
+        })).collect::<Vec<_>>(),
+        // Folded by reason, most frequent first: a reader wants "what keeps
+        // going wrong", not a log.
+        "topErrors": error_groups(&rows).into_iter().take(10).map(|e| json!({
+            "reason": e.reason,
+            "count": e.count,
+            "lastTs": e.last_ts,
+            "lastCandidate": e.last_candidate,
         })).collect::<Vec<_>>(),
     })
 }
@@ -497,6 +551,60 @@ mod tests {
         // A truncated turn did answer, so it is not an error.
         a.add(&row("m", "truncated", 300, 5));
         assert_eq!(a.errors, 1);
+    }
+
+    /// `--json` narrows by the same filter the tables do — the desktop panels
+    /// ask for one agent's slice and must not be handed everyone's.
+    #[test]
+    fn the_json_summary_honours_the_filter() {
+        let dir = std::env::temp_dir().join(format!("pxy-stats-{}-filter", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = State::open(&dir.join("s.sqlite")).unwrap();
+        // Inside the retention window: the fixture's own ts is years old, and
+        // the sweep that runs on the first write would drop it.
+        let now = jiff::Timestamp::now().as_millisecond();
+        st.record_attempt(&AttemptRow { ts: now, ..row("m", "ok", 500, 10) });
+        st.record_attempt(&AttemptRow { ts: now, agent: "codex".into(), ..row("m", "ok", 700, 20) });
+        st.record_attempt(&AttemptRow {
+            ts: now,
+            agent: "codex".into(),
+            outcome: "http".into(),
+            status: 429,
+            error: "429 slow down".into(),
+            ..row("m", "http", 30, 0)
+        });
+        st.record_tool_run(&crate::state::ToolRunRow {
+            ts: now,
+            agent: "codex".into(),
+            tool: "web_search".into(),
+            ok: true,
+            ms: 900,
+            ..Default::default()
+        });
+        st.record_tool_run(&crate::state::ToolRunRow {
+            ts: now,
+            agent: "claude".into(),
+            tool: "memory".into(),
+            ok: true,
+            ms: 2,
+            ..Default::default()
+        });
+
+        let all = summary_json(&st, &Filter::since(0));
+        assert_eq!(all["legs"], 3);
+        assert_eq!(all["tools"].as_array().unwrap().len(), 2);
+
+        let mut only_codex = Filter::since(0);
+        only_codex.agent = Some("codex".into());
+        let codex = summary_json(&st, &only_codex);
+        assert_eq!(codex["legs"], 2, "the claude leg is out: {codex}");
+        assert_eq!(codex["errors"], 1);
+        assert_eq!(codex["outputTokens"], 20);
+        let tools = codex["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "and so is the claude tool run: {codex}");
+        assert_eq!(tools[0]["name"], "web_search");
+        assert_eq!(codex["topErrors"][0]["reason"], "429 slow down");
+        assert_eq!(codex["topErrors"][0]["count"], 1);
     }
 
     #[test]

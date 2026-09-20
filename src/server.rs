@@ -1106,7 +1106,10 @@ pub async fn print_status(cfg: &Config, remote: bool, json_out: bool, only: &[St
         // The per-leg view of the same traffic: what answered, how fast, and
         // what failed, over the last day (wiki:state).
         let day_ago = now.as_millisecond() - 86_400_000;
-        root.insert("stats".into(), crate::stats::summary_json(&state, day_ago));
+        root.insert(
+            "stats".into(),
+            crate::stats::summary_json(&state, &crate::stats::Filter::since(day_ago)),
+        );
         if remote {
             root.insert("remote".into(), Value::Object(json_remote));
         }

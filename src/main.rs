@@ -306,7 +306,7 @@ fn stats(since: &str, mut filter: stats::Filter, json: bool) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     if json {
-        let _ = writeln!(out, "{}", stats::summary_json(&st, filter.since_ms));
+        let _ = writeln!(out, "{}", stats::summary_json(&st, &filter));
         return Ok(());
     }
     let _ = write!(out, "{}", stats::report(&st, &filter, since)?);
