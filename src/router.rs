@@ -3880,7 +3880,17 @@ impl StreamCtx {
                 }
                 // A truncated upstream never sent a terminal reason; without
                 // one the client sees a broken stream, not a short answer.
+                // Say so: the synthesized `stop` is indistinguishable from a
+                // real one downstream, so an agent whose stream died mid-turn
+                // just settles on what it had. `output_tokens = 0` means the
+                // usage chunk never arrived either, i.e. nothing was finished.
                 if !self.client_done {
+                    warn!(
+                        provider = %self.provider,
+                        model = %self.model,
+                        output_tokens = self.usage.output,
+                        "upstream stream ended with no finish reason; closing the turn as stop"
+                    );
                     s.push_str(openai_terminator());
                     self.client_done = true;
                 }
