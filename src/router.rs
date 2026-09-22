@@ -870,6 +870,14 @@ async fn handle_chat_inner(
                     app.state.model_result(&cand.state_provider(), &cand.model.id, false);
                     skipped.push(format!("{}: {reason}", cand.full_id()));
                 }
+                AttemptResult::SkipLocal(reason) => {
+                    warn!(candidate = %cand.full_id(), %reason, "failover (local)");
+                    other_failures = true;
+                    quota_only = false;
+                    // No `model_result`: nothing was asked of the model, so
+                    // its health record has nothing to learn from this.
+                    skipped.push(format!("{}: {reason}", cand.full_id()));
+                }
                 AttemptResult::SkipRaw { reason, status, body, headers } => {
                     warn!(candidate = %cand.full_id(), %reason, "failover");
                     other_failures = true;
@@ -1412,6 +1420,13 @@ enum AttemptResult {
     Done(Outcome),
     /// Retryable/skippable failure: try the next candidate.
     Skip(String),
+    /// Skip for a reason on OUR side of the wire — the request never left the
+    /// process, so it says nothing about the model. Like `Refused`, it carries
+    /// no failure-rate mark: on 2026-09-22 a gpg-agent with no usable pinentry
+    /// failed every provider's `pass show` in a single walk, and counting
+    /// those as model failures gated the whole chain out on a credential
+    /// problem that was fixed minutes later.
+    SkipLocal(String),
     /// Skip, but the upstream answered with a real error. The status and body
     /// are carried so a walk that ends with nothing better can hand the client
     /// the upstream's OWN answer instead of a synthetic one: Claude Code reads
@@ -1463,6 +1478,9 @@ async fn try_candidate(
             AttemptResult::Done(_) => leg.finish("ok", 200, ""),
             AttemptResult::Refused(_) => leg.finish("refused", 200, ""),
             AttemptResult::Skip(reason) => leg.finish(skip_outcome(reason), 0, reason),
+            // Still a failed leg for stats (the call did not happen), but
+            // named for where it broke: pxy, not the upstream.
+            AttemptResult::SkipLocal(reason) => leg.finish("local", 0, reason),
             // The upstream's own message, not the JSON it came wrapped in:
             // this text is read in a table, where a raw body is unreadable.
             AttemptResult::SkipRaw { status, body, .. } => {
@@ -1725,7 +1743,7 @@ async fn try_candidate_inner(
     let mut prepared =
         match crate::providers::prepare(&cand.provider, provider_cfg, &app.secrets, account) {
             Ok(p) => p,
-            Err(e) => return AttemptResult::Skip(format!("prepare failed: {e:#}")),
+            Err(e) => return AttemptResult::SkipLocal(format!("prepare failed: {e:#}")),
         };
     // One provider, two endpoints: a model on the Responses wire lives next to
     // the chat one (opencode-go's /zen/go/v1/{chat/completions,responses}).
@@ -7865,6 +7883,85 @@ mod tests {
         );
         // And the sibling's success was recorded — b is (still) healthy.
         assert!(!app.state.model_unhealthy("b", "m"));
+    }
+
+    /// A credential pxy cannot read is pxy's problem, not the model's: the
+    /// walk moves on, but the candidate's failure-rate record stays clean.
+    /// From 2026-09-22, when a gpg-agent with no usable pinentry failed every
+    /// `pass show` on the box — one walk marked the entire chain unhealthy on
+    /// a fault that had nothing to do with any upstream.
+    #[tokio::test]
+    async fn an_unreadable_credential_is_not_a_model_failure() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let seen = a_hits.clone();
+        let router = axum::Router::new()
+            .route(
+                "/a",
+                post(move || {
+                    let seen = seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"choices": []}))
+                    }
+                }),
+            )
+            .route(
+                "/b",
+                post(|| async {
+                    axum::Json(json!({
+                        "id": "x",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                                    "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }))
+                }),
+            );
+        let base = mock_server(router).await;
+        let app = test_app(
+            &format!(
+                r#"
+                [server]
+                [providers.a]
+                base_url = "{base}/a"
+                api_key = {{ env = "PXY_TEST_CREDENTIAL_THAT_IS_NOT_SET" }}
+                models = ["m"]
+                [providers.b]
+                base_url = "{base}/b"
+                models = ["m"]
+                [groups.free]
+                models = ["a/m", "b/m"]
+                "#
+            ),
+            "unreadable_credential",
+        );
+
+        let payload = json!({"model": "free",
+            "messages": [{"role": "user", "content": "hi"}]});
+        let out = handle_chat(app.clone(), ClientFormat::Openai, payload, ClientContext::default())
+            .await;
+        match out {
+            Outcome::Json { body, provider, .. } => {
+                assert_eq!(body["choices"][0]["message"]["content"], "ok");
+                assert_eq!(provider.as_deref(), Some("b/m"), "the walk must go on to b");
+            }
+            Outcome::Stream { .. } => panic!("expected json"),
+        }
+        assert_eq!(
+            a_hits.load(Ordering::SeqCst),
+            0,
+            "prepare failed, so nothing was ever sent to a"
+        );
+        // Four recorded failures is one short of the rule's minimum. Had the
+        // unread credential counted as a fifth, this would trip.
+        for _ in 0..4 {
+            app.state.model_result("a", "m", false);
+        }
+        assert!(
+            !app.state.model_unhealthy("a", "m"),
+            "a credential pxy could not read must not count against the model"
+        );
     }
 
     /// A body-matched error rule beats the status ladder: `skip` moves the
