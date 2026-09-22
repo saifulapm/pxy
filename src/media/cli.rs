@@ -268,10 +268,17 @@ pub async fn ask(cfg: &Config, what: AskCmd) -> Result<i32> {
                 bail!("pick needs at least two options (--option ID=DESC, or --options-file)");
             }
             if !no_escape {
+                // Strictly absence, never doubt. An escape that also meant
+                // "unsure" won on pages where the answer was plainly listed:
+                // with little state to go on, "the state does not say which"
+                // is arguable about almost anything, and it took 0.59 off a
+                // correct option sitting at 0.36. Uncertainty is what --min
+                // and --margin are for.
                 criteria.insert(
                     ESCAPE.into(),
-                    "None of the other options is the right one — the target is absent, \
-                     or the state does not say which it is."
+                    "The thing being asked for is not among the options above at \
+                     all. Choose this only when none of them is it — not when \
+                     you are unsure which one it is."
                         .into(),
                 );
             }
