@@ -857,14 +857,26 @@ impl State {
     /// two-bucket read gives the same slop as the rpm estimate.
     pub fn model_unhealthy(&self, provider: &str, model: &str) -> bool {
         let now_ms = epoch_ms();
+        let idx = now_ms / RPM_WINDOW_MS;
         let elapsed = (now_ms % RPM_WINDOW_MS) as f64 / RPM_WINDOW_MS as f64;
-        let map = self
+        let mut map = self
             .model_health
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(h) = map.get(&Self::cooldown_key(provider, Some(model))) else {
+        let Some(h) = map.get_mut(&Self::cooldown_key(provider, Some(model))) else {
             return false;
         };
+        // Roll on READ, like rpm_effective and tpm_effective. Without this the
+        // rule latches instead of sliding: `model_result` is the only other
+        // roller, the gate above stops the model being attempted, so nothing
+        // ever advances the buckets and stale counts stay at full weight
+        // forever. Seen 2026-09-22 — a gpg outage failed every provider's
+        // `pass show` in one walk, and the chain was still refusing them 37
+        // minutes later on a 60-second window, until the daemon was restarted.
+        // `get_mut` rather than `entry`: an unseen model must stay absent, not
+        // gain a row on every gate check.
+        roll(&mut h.req, idx);
+        roll(&mut h.fail, idx);
         // Blend both buckets the way rpm_effective does.
         let reqs = h.req.prev * (1.0 - elapsed) + h.req.curr;
         let fails = h.fail.prev * (1.0 - elapsed) + h.fail.curr;
@@ -1136,5 +1148,40 @@ mod tests {
         // Nothing cooling down: nothing to wait for.
         let s3 = state("recovery_none");
         assert_eq!(s3.recovery_wait("p", "m"), None);
+    }
+
+    /// The failure-rate window must SLIDE, not latch. The router gates an
+    /// unhealthy model out of the walk, so it is never attempted, so
+    /// `model_result` never runs again — if the read did not roll the buckets
+    /// itself the model would stay unhealthy until the daemon restarted.
+    /// Rewinding `bucket_index` is how a test ages the window without
+    /// sleeping a real minute.
+    #[test]
+    fn an_unhealthy_model_recovers_once_its_window_passes() {
+        let s = state("failure_rate_decay");
+        for _ in 0..5 {
+            s.model_result("p", "m", false);
+        }
+        assert!(s.model_unhealthy("p", "m"), "5/5 failures trip the rule");
+
+        // Two windows on, `roll` drops those counts: nothing recent to judge.
+        age_health(&s, "p", "m", 2);
+        assert!(!s.model_unhealthy("p", "m"), "a stale window must not gate the model");
+        // Idempotent — asking again does not resurrect them.
+        assert!(!s.model_unhealthy("p", "m"));
+
+        // The counts are genuinely gone, not merely outweighed: one fresh
+        // failure is 1/1, under MIN_FAILURE_RATE_REQUESTS, so the model stays
+        // eligible and gets its real chance to answer.
+        s.model_result("p", "m", false);
+        assert!(!s.model_unhealthy("p", "m"), "the old failures must not still be counted");
+    }
+
+    /// Rewind a model's health buckets by `windows` so they read as stale.
+    fn age_health(s: &State, provider: &str, model: &str, windows: u64) {
+        let mut map = s.model_health.lock().unwrap();
+        let h = map.get_mut(&State::cooldown_key(provider, Some(model))).unwrap();
+        h.req.bucket_index -= windows;
+        h.fail.bucket_index -= windows;
     }
 }
