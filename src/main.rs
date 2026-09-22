@@ -141,6 +141,11 @@ enum Command {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// Ask Jev a typed question about some state (System One)
+    Ask {
+        #[command(subcommand)]
+        what: media::cli::AskCmd,
+    },
     /// Transcribe an audio file (speech-to-text)
     Transcribe {
         file: std::path::PathBuf,
@@ -267,6 +272,12 @@ fn main() -> Result<()> {
         Command::Fetch { url, provider } => {
             let cfg = config::Config::load(&cfg_path)?;
             block_on_current(media::cli::fetch(&cfg, &url, provider.as_deref()))
+        }
+        // The only verb whose exit code is the answer, so it is the only one
+        // that leaves through `exit` rather than by returning to main.
+        Command::Ask { what } => {
+            let cfg = config::Config::load(&cfg_path)?;
+            std::process::exit(block_on_current(media::cli::ask(&cfg, what))?)
         }
         Command::Transcribe { file, model } => {
             let cfg = config::Config::load(&cfg_path)?;
@@ -518,7 +529,7 @@ fn route(cfg: &config::Config, group: Option<&str>, model: Option<&str>, clear: 
     Ok(())
 }
 
-fn block_on_current<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
+fn block_on_current<T, F: std::future::Future<Output = Result<T>>>(fut: F) -> Result<T> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?

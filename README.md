@@ -92,6 +92,27 @@ more. Typesafe's Jev answers typed questions about a state with calibrated
 probabilities, reached through whichever gateway in the `[media] systemone`
 chain is up. Media usage is counted on its own, so it never eats a chat budget.
 
+`pxy ask` is that endpoint as a shell verb, one subcommand per question type,
+for the times a script wants a judgement rather than an answer to print:
+
+```sh
+playwright-cli --raw snapshot | pxy ask pick "which element is the cart link" \
+  --options-file refs.json          # prints one id; a 25 KB page never has to be read
+pxy ask check "the order was placed" --state-file after.txt && ./ship
+pxy ask rate "how severe is this failure" --levels "cosmetic|degraded|blocking" \
+  --state-file report.txt
+pxy ask raw < body.json             # several questions at once, answers as JSON
+```
+
+Jev cannot abstain — it returns one of the options it was given, and a wrong
+option it was never offered an alternative to still comes back at 0.97. So the
+guards are the exit code: `pick` adds a `none_of_these` option so a missing
+target is sayable, `--min` sets the probability below which it declines to
+answer, and `--margin` declines on a near-tie that would otherwise read as
+confidence. **0** answered, **1** error, **2** `check` said no, **3**
+abstained. Both failure codes are falsy, so `pxy ask check … && act` also
+declines to act when the chain is down.
+
 Server tools work on models that never learned them. A client declares one
 by its type (`pxy:web_search`, or OpenRouter's `openrouter:web_search`), pxy
 offers the model a plain function, runs the call itself, and feeds the result
